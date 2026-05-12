@@ -154,3 +154,55 @@ class TestCheckDeleteSafeErrors:
         repo, storage = _make_repo(tmp_path, _SAFE_REPO)
         result = check_delete_safe(repo, symbol="DoesNotExist", storage_path=storage)
         assert "error" in result
+
+
+# --------------------------------------------------------------------------- #
+# Honest-hint caveat: safe_to_delete must call out missing runtime data       #
+# --------------------------------------------------------------------------- #
+
+class TestRuntimeDataCaveat:
+    def test_safe_caveats_when_no_runtime_data(self, tmp_path):
+        """A symbol with no static refs and no runtime data ingested
+        should still get the verdict, but the recommended_action must
+        say the runtime channel was empty."""
+        repo, storage = _make_repo(tmp_path, _SAFE_REPO)
+        result = check_delete_safe(repo, symbol="orphan_func", storage_path=storage)
+        assert "error" not in result
+        if result["verdict"] != "safe_to_delete":
+            import pytest
+            pytest.skip(f"verdict={result['verdict']} — caveat only applies to safe_to_delete")
+        # Static-only repo → runtime_data_present is False
+        assert result["signals"]["runtime_data_present"] is False
+        # Recommended action must surface that fact
+        action = result["recommended_action"].lower()
+        assert "static signals only" in action or "no runtime" in action
+        assert "import-trace" in action
+
+    def test_include_runtime_false_omits_caveat(self, tmp_path):
+        """When the operator explicitly opts out, the caveat shouldn't
+        fire — the signal isn't 'we didn't check,' it's 'you asked us
+        not to.'"""
+        repo, storage = _make_repo(tmp_path, _SAFE_REPO)
+        result = check_delete_safe(
+            repo, symbol="orphan_func",
+            include_runtime=False,
+            storage_path=storage,
+        )
+        assert "error" not in result
+        if result["verdict"] != "safe_to_delete":
+            import pytest
+            pytest.skip("verdict not safe_to_delete on this fixture")
+        # No caveat in the recommended action
+        assert "static signals only" not in result["recommended_action"].lower()
+        # runtime_data_present should NOT appear in signals
+        assert "runtime_data_present" not in result["signals"]
+
+    def test_runtime_data_present_surfaced_in_signals(self, tmp_path):
+        """Even when the verdict isn't safe_to_delete, the flag is on
+        the signals payload so callers can introspect."""
+        repo, storage = _make_repo(tmp_path, _SAFE_REPO)
+        result = check_delete_safe(repo, symbol="used_func", storage_path=storage)
+        assert "error" not in result
+        assert "runtime_data_present" in result["signals"]
+        # No runtime ingest done in fixture, so this must be False
+        assert result["signals"]["runtime_data_present"] is False

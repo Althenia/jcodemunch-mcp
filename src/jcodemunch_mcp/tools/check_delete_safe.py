@@ -106,6 +106,31 @@ def _runtime_hits(store: IndexStore, owner: str, name: str, symbol_id: str) -> O
         return None
 
 
+def _runtime_data_present(store: IndexStore, owner: str, name: str) -> bool:
+    """Has *any* runtime trace been ingested for this repo?
+
+    Distinct from :func:`_runtime_hits` — which conflates "no traces at
+    all" with "this particular symbol has zero hits in traces that
+    exist." This helper lets ``safe_to_delete`` verdicts caveat
+    themselves honestly when the runtime channel was simply never
+    populated.
+    """
+    try:
+        import sqlite3  # noqa: PLC0415
+        db_path = store._sqlite._db_path(owner, name)
+        if not db_path.exists():
+            return False
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        try:
+            row = conn.execute("SELECT 1 FROM runtime_calls LIMIT 1").fetchone()
+            return row is not None
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("check_delete_safe: runtime probe skipped: %s", exc, exc_info=True)
+        return False
+
+
 def _check_dead_code_conf(repo: str, target_id: str, storage_path: Optional[str]) -> float:
     """Look up find_dead_code's confidence score for this symbol."""
     try:
@@ -260,6 +285,7 @@ def check_delete_safe(
 
     # ── Signal 5: runtime evidence (Phase 7) ────────────────────────────
     runtime_hits = _runtime_hits(store, owner, name, target_id) if include_runtime else None
+    runtime_data_present = _runtime_data_present(store, owner, name) if include_runtime else False
     if runtime_hits and runtime_hits > 0:
         blockers.append({
             "kind": "runtime_observed",
@@ -317,8 +343,21 @@ def check_delete_safe(
         confidence = 0.55
 
     # ── Recommended action ─────────────────────────────────────────────
+    # Honest-hint caveat: when the verdict relies on the *absence* of
+    # runtime evidence but no traces have ever been ingested for this
+    # repo, the runtime channel can't actually prove safety — only
+    # static signals can. Surface that in the recommended_action so
+    # operators don't read "safe" as "we checked production traffic."
+    safe_action = "No callers, refs, or runtime hits found — deletion appears safe."
+    if include_runtime and not runtime_data_present:
+        safe_action = (
+            "No callers or refs found. Static signals only — no runtime traces "
+            "ingested for this repo, so production traffic was not consulted. "
+            "Run `import-trace` against representative traffic to strengthen this verdict."
+        )
+
     actions = {
-        "safe_to_delete": "No callers, refs, or runtime hits found — deletion appears safe.",
+        "safe_to_delete": safe_action,
         "test_coverage_only": "Only tests reference this symbol. Remove the tests alongside it.",
         "internal_only": "Refs exist only in the same file. Safe with local refactor.",
         "internal_uses_blocking": (
@@ -382,4 +421,6 @@ def check_delete_safe(
     }
     if runtime_hits is not None:
         result["signals"]["runtime_hits"] = runtime_hits
+    if include_runtime:
+        result["signals"]["runtime_data_present"] = runtime_data_present
     return result

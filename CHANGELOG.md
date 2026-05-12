@@ -2,6 +2,82 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.6] — 2026-05-12
+
+### Restore local-first index identity as the default ([#295](https://github.com/jgravelle/jcodemunch-mcp/pull/295), @MariusAdrian88)
+
+Reverts the v1.95 default of git-root identity. Local-folder indexing
+now defaults to path-hash identity (`local/<basename>-<hash>`) again —
+no `git` subprocess, no remote detection, works for non-git projects
+and simple local clones. Git-root identity (with monorepo subdir
+merging) becomes an explicit opt-in via the new `identity_mode: "git"`
+config knob or per-call MCP argument on `index_folder`.
+
+**No existing index is silently re-keyed.** A new `resolve_index_identity()`
+helper checks the index store *before* any config decision:
+
+- An existing `local/...` index for a path is returned as-is, even if
+  the config says `git`.
+- An existing `<owner>/<name>` git-keyed index that covers a path (via
+  its stored `git_root`) is returned as-is, even if the config says
+  `local`.
+- Explicit conflicts (`identity_mode="local"` against an existing git
+  index, or vice versa) raise `IdentityModeConflict` with a remediation
+  hint pointing at `invalidate_cache`.
+- The pathological "both forms exist" state raises
+  `IdentityModeAmbiguous` rather than silently picking one.
+
+Three duplicated identity-resolution paths (`_local_repo_id` in
+`watcher.py`, `_compute_repo_id` in `resolve_repo.py`,
+`_resolve_repo_identity` in `index_folder.py`) now all delegate to the
+central helper. The `git_root` field on each index round-trips through
+both the JSON and SQLite backends so the existing-git-index probe stays
+cheap.
+
+**New config keys** (`config.py` template):
+- `identity_mode`: `"local"` (default) or `"git"`. Per-folder override
+  via the same key with a `repo:` scope.
+- `git_root_identity`: deprecated alias — `true` is equivalent to
+  `identity_mode: "git"`. Kept for backwards compatibility.
+
+**New MCP argument** on `index_folder`:
+- `identity_mode`: `"config"` (default — consult the config),
+  `"local"`, or `"git"`.
+
+10 new tests in `tests/test_identity_mode.py` covering all four
+preservation corners, conflict guards, the ambiguous-state guard, the
+no-subprocess fast path, and config-template content. Existing
+`test_git_root_identity.py` tests now pass `identity_mode="git"`
+explicitly to reflect the opt-in shape.
+
+### `check_delete_safe`: honest-hint caveat when no runtime data is ingested
+
+Back-port of a UX pattern from the v1.6.0 sibling-parity work on
+jdatamunch-mcp's `check_column_drop_safe`. When `check_delete_safe`
+returns `safe_to_delete` *and* the operator hasn't opted out of the
+runtime channel *and* the repo has no `runtime_calls` rows ingested,
+the `recommended_action` now surfaces that fact:
+
+> *No callers or refs found. Static signals only — no runtime traces
+> ingested for this repo, so production traffic was not consulted.
+> Run `import-trace` against representative traffic to strengthen this
+> verdict.*
+
+Previously the runtime channel just didn't fire in this state, which
+made `safe_to_delete` implicitly claim coverage it couldn't actually
+prove. A new `_runtime_data_present()` probe distinguishes "no traces
+ingested" from "this symbol has zero hits in traces that exist."
+`signals.runtime_data_present` is surfaced on every response (when
+`include_runtime=True`) so callers can introspect.
+
+When the operator explicitly passes `include_runtime=False`, the
+caveat is suppressed — the signal there is "you asked us not to
+check," not "we couldn't check."
+
+3 new tests in `TestRuntimeDataCaveat`. The reverse direction
+(`check_column_drop_safe` already does this in jData v1.8.0) was the
+original source.
+
 ## [1.108.5] — 2026-05-12 — Watcher standby failover: second-server takeover when the lock releases
 
 Multi-server bug fix from @MariusAdrian88 ([#293](https://github.com/jgravelle/jcodemunch-mcp/pull/293)).
