@@ -102,6 +102,33 @@ def _acquire_lock(folder_path: str, storage_path: Optional[str]) -> bool:
 def _release_lock(folder_path: str, storage_path: Optional[str]) -> None:
     """Release and remove the watcher-slot lock for the given folder."""
     process_locks.release(_WATCHER_SCOPE, folder_path, storage_path)
+    _touch_watcher_signal(folder_path, storage_path)
+
+
+def _watcher_signal_path(folder_path: str, storage_path: Optional[str]) -> Path:
+    """Return the per-folder watcher release signal path."""
+    return process_locks.lock_path(_WATCHER_SCOPE, folder_path, storage_path).with_suffix(".signal")
+
+
+def _touch_watcher_signal(folder_path: str, storage_path: Optional[str]) -> None:
+    """Notify standby watcher managers that a folder lock may be available."""
+    signal_path = _watcher_signal_path(folder_path, storage_path)
+    payload = {
+        "scope": _WATCHER_SCOPE,
+        "target": folder_path,
+        "pid": os.getpid(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    tmp_path = signal_path.with_name(f"{signal_path.name}.{os.getpid()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_path.replace(signal_path)
+    except OSError:
+        logger.debug("Failed to touch watcher signal for %s", folder_path, exc_info=True)
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +370,12 @@ class WatcherManager:
         self._log_file_handle = log_file_handle
         self._on_reindex = on_reindex
         self._stop_event: Optional[asyncio.Event] = None
+        # Standby tracking for failover
+        self._standby: set[str] = set()
+        self._standby_tasks: dict[str, asyncio.Task] = {}
+        self._last_takeover_attempt: dict[str, float] = {}
+        self._takeover_retry_seconds = 30.0
+        self._takeover_throttle_seconds = 1.0
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -353,6 +386,106 @@ class WatcherManager:
     def list_folders(self) -> list[str]:
         """Return sorted list of watched folders."""
         return sorted(self._watched)
+
+    # ── Standby helpers ──────────────────────────────────────────────────────
+
+    def _mark_standby(self, folder: str) -> None:
+        self._standby.add(folder)
+        task = self._standby_tasks.get(folder)
+        if task is None or task.done():
+            self._standby_tasks[folder] = asyncio.create_task(
+                self._standby_signal_loop(folder),
+                name=f"watch-standby:{folder}",
+            )
+
+    async def _standby_signal_loop(self, folder: str) -> None:
+        signal_path = _watcher_signal_path(folder, self._storage_path)
+        signal_dir = signal_path.parent
+        try:
+            from watchfiles import awatch
+        except ImportError:
+            return
+
+        while True:
+            if self._stop_event is not None and self._stop_event.is_set():
+                return
+            try:
+                async for changes in awatch(str(signal_dir), recursive=False, step=200):
+                    if self._stop_event is not None and self._stop_event.is_set():
+                        return
+                    changed_paths = {str(Path(path)) for _, path in changes}
+                    if str(signal_path) in changed_paths:
+                        await self.maybe_takeover(folder)
+                        if folder in self._watched:
+                            return
+            except asyncio.CancelledError:
+                raise  # Propagate without logging — cancellation is normal shutdown
+            except Exception:
+                logger.warning(
+                    "Watcher standby signal loop failed for %s, restarting in 5s",
+                    folder,
+                    exc_info=True,
+                )
+                await asyncio.sleep(5.0)
+
+    def _clear_standby(self, folder: str) -> None:
+        self._standby.discard(folder)
+        task = self._standby_tasks.pop(folder, None)
+        if task is not None:
+            task.cancel()
+        self._last_takeover_attempt.pop(folder, None)
+
+    def _start_watch_task(self, folder: str) -> asyncio.Task:
+        task = asyncio.create_task(
+            _watch_single(
+                folder_path=folder,
+                debounce_ms=self._debounce_ms,
+                use_ai_summaries=self._use_ai_summaries,
+                storage_path=self._storage_path,
+                extra_ignore_patterns=self._extra_ignore_patterns,
+                follow_symlinks=self._follow_symlinks,
+                on_reindex=self._on_reindex,
+                quiet=self._quiet,
+                log_file_handle=self._log_file_handle,
+            ),
+            name=f"watch:{folder}",
+        )
+        self._active[folder] = task
+        self._watched.add(folder)
+        return task
+
+    async def maybe_takeover(self, folder: str) -> dict:
+        """Try to become the active watcher for a standby folder."""
+        folder = str(Path(folder).expanduser().resolve())
+        if folder in self._watched:
+            return {"status": "already_watched", "folder": folder}
+
+        now = time.monotonic()
+        last_attempt = self._last_takeover_attempt.get(folder, 0.0)
+        if now - last_attempt < self._takeover_throttle_seconds:
+            return {"status": "throttled", "folder": folder}
+        self._last_takeover_attempt[folder] = now
+
+        if not _acquire_lock(folder, self._storage_path):
+            self._mark_standby(folder)
+            return {"status": "lock_failed", "folder": folder, "standby": True}
+
+        self._locked.add(folder)
+        try:
+            self._clear_standby(folder)
+            self._start_watch_task(folder)
+            _watcher_output(
+                f"WatcherManager: standby took over {folder}",
+                quiet=self._quiet,
+                log_file_handle=self._log_file_handle,
+            )
+            return {"status": "started", "folder": folder}
+        except Exception:
+            self._locked.discard(folder)
+            _release_lock(folder, self._storage_path)
+            raise
+
+    # ── Folder management ────────────────────────────────────────────────────
 
     async def add_folder(self, folder: str) -> dict:
         """Add a folder to watch, acquiring lock and starting watch task.
@@ -367,33 +500,20 @@ class WatcherManager:
 
         # Acquire lock
         if not _acquire_lock(folder, self._storage_path):
-            return {"status": "lock_failed", "folder": folder}
+            self._mark_standby(folder)
+            return {"status": "lock_failed", "folder": folder, "standby": True}
 
         self._locked.add(folder)
+        self._clear_standby(folder)
 
         try:
-            task = asyncio.create_task(
-                _watch_single(
-                    folder_path=folder,
-                    debounce_ms=self._debounce_ms,
-                    use_ai_summaries=self._use_ai_summaries,
-                    storage_path=self._storage_path,
-                    extra_ignore_patterns=self._extra_ignore_patterns,
-                    follow_symlinks=self._follow_symlinks,
-                    on_reindex=self._on_reindex,
-                    quiet=self._quiet,
-                    log_file_handle=self._log_file_handle,
-                ),
-                name=f"watch:{folder}",
-            )
-            self._active[folder] = task
-            self._watched.add(folder)
+            self._start_watch_task(folder)
             _watcher_output(
                 f"WatcherManager: started watching {folder}",
                 quiet=self._quiet,
                 log_file_handle=self._log_file_handle,
             )
-            return {"status": "started", "folder": folder, "task": task}
+            return {"status": "started", "folder": folder, "task": self._active[folder]}
         except Exception as exc:
             # Clean up on failure
             self._locked.discard(folder)
@@ -408,6 +528,9 @@ class WatcherManager:
         folder = str(Path(folder).expanduser().resolve())
 
         if folder not in self._watched:
+            # Also cancel any orphaned standby task so a future lock release
+            # does not unexpectedly restart watching for this folder.
+            self._clear_standby(folder)
             return {"status": "not_watched", "folder": folder}
 
         # Cancel and await task
@@ -505,6 +628,9 @@ class WatcherManager:
         _MAX_RESTARTS = 5
 
         while True:
+            # Exit immediately if already stopped
+            if self._stop_event.is_set():
+                break
             try:
                 while not self._stop_event.is_set():
                     # Check for crashed tasks and restart them
@@ -518,22 +644,14 @@ class WatcherManager:
                                     quiet=self._quiet,
                                     log_file_handle=self._log_file_handle,
                                 )
-                                # Restart
-                                new_task = asyncio.create_task(
-                                    _watch_single(
-                                        folder_path=folder,
-                                        debounce_ms=self._debounce_ms,
-                                        use_ai_summaries=self._use_ai_summaries,
-                                        storage_path=self._storage_path,
-                                        extra_ignore_patterns=self._extra_ignore_patterns,
-                                        follow_symlinks=self._follow_symlinks,
-                                        quiet=self._quiet,
-                                        log_file_handle=self._log_file_handle,
-                                    ),
-                                    name=f"watch:{folder}",
-                                )
-                                self._active[folder] = new_task
-                    await asyncio.sleep(5.0)
+                                # Restart — cancel the dead task and start a replacement
+                                task.cancel()
+                                self._start_watch_task(folder)
+                    # Retry standby folders on fallback interval
+                    for folder in list(self._standby):
+                        await self.maybe_takeover(folder)
+                    sleep_seconds = self._takeover_retry_seconds if self._standby else 5.0
+                    await asyncio.sleep(sleep_seconds)
                 # Inner loop exited normally — reset restart counter
                 _restart_count = 0
             except asyncio.CancelledError:
@@ -562,6 +680,16 @@ class WatcherManager:
         """Signal the manager loop to stop."""
         if self._stop_event:
             self._stop_event.set()
+        for folder, task in list(self._active.items()):
+            task.cancel()
+            self._active.pop(folder, None)
+            self._watched.discard(folder)
+            if folder in self._locked:
+                self._locked.discard(folder)
+                _release_lock(folder, self._storage_path)
+        # Clear all standby state
+        for folder in list(self._standby):
+            self._clear_standby(folder)
 
 
 # ---------------------------------------------------------------------------

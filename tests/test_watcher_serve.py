@@ -977,3 +977,120 @@ class TestDefaultUseAiSummaries:
     def test_off_string_maps_to_false(self):
         """'off' string normalizes to False."""
         assert self._call("off") is False
+
+
+class TestAutoWatchTakeover:
+    """Tests for opportunistic standby takeover via _auto_watch_if_needed."""
+
+    @pytest.mark.asyncio
+    async def test_auto_watch_indexes_after_standby_takeover_before_tool_runs(self, tmp_path, monkeypatch):
+        from jcodemunch_mcp import server
+
+        folder = tmp_path / "repo"
+        folder.mkdir()
+        calls = []
+
+        class FakeWatcherManager:
+            def is_watched(self, folder_arg):
+                return False
+
+            async def maybe_takeover(self, folder_arg):
+                calls.append(("maybe_takeover", folder_arg))
+                return {"status": "started", "folder": folder_arg}
+
+            async def ensure_indexed(self, folder_arg, **kwargs):
+                calls.append(("ensure_indexed", folder_arg))
+
+            async def add_folder(self, folder_arg):
+                calls.append(("add_folder", folder_arg))
+
+        monkeypatch.setattr(server, "_watcher_manager", FakeWatcherManager())
+        monkeypatch.setattr(server.config_module, "get", lambda key, default=None: True if key == "watch" else default)
+
+        await server._auto_watch_if_needed("search_symbols", {"path": str(folder)}, None)
+
+        resolved = str(folder.resolve())
+        assert calls == [
+            ("maybe_takeover", resolved),
+            ("ensure_indexed", resolved),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_auto_watch_falls_through_when_takeover_fails(self, tmp_path, monkeypatch):
+        from jcodemunch_mcp import server
+
+        folder = tmp_path / "repo"
+        folder.mkdir()
+        calls = []
+
+        class FakeWatcherManager:
+            def is_watched(self, folder_arg):
+                return False
+
+            async def maybe_takeover(self, folder_arg):
+                calls.append(("maybe_takeover", folder_arg))
+                return {"status": "lock_failed", "folder": folder_arg, "standby": True}
+
+            async def ensure_indexed(self, folder_arg, **kwargs):
+                calls.append(("ensure_indexed", folder_arg))
+
+            async def add_folder(self, folder_arg):
+                calls.append(("add_folder", folder_arg))
+                return {"status": "started", "folder": folder_arg}
+
+        monkeypatch.setattr(server, "_watcher_manager", FakeWatcherManager())
+        monkeypatch.setattr(server.config_module, "get", lambda key, default=None: True if key == "watch" else default)
+
+        await server._auto_watch_if_needed("search_symbols", {"path": str(folder)}, None)
+
+        resolved = str(folder.resolve())
+        assert calls == [
+            ("maybe_takeover", resolved),
+            ("ensure_indexed", resolved),
+            ("add_folder", resolved),
+        ]
+
+
+class TestWatcherStandbyFailover:
+    """End-to-end standby failover lifecycle test."""
+
+    @pytest.mark.asyncio
+    async def test_second_server_can_take_over_after_first_releases_lock(self, tmp_path, monkeypatch):
+        from jcodemunch_mcp import server
+        from jcodemunch_mcp.watcher import WatcherManager
+
+        folder = tmp_path / "repo"
+        folder.mkdir()
+        storage = tmp_path / "storage"
+        started = []
+
+        async def fake_watch_single(**kwargs):
+            started.append(kwargs["folder_path"])
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(server, "watch_folders", object())
+        monkeypatch.setattr(server, "WatcherManager", WatcherManager)
+
+        import jcodemunch_mcp.watcher as watcher_mod
+        monkeypatch.setattr(watcher_mod, "_watch_single", fake_watch_single)
+
+        manager1 = WatcherManager(storage_path=str(storage), quiet=True)
+        manager2 = WatcherManager(storage_path=str(storage), quiet=True)
+
+        first = await manager1.add_folder(str(folder))
+        second = await manager2.add_folder(str(folder))
+
+        assert first["status"] == "started"
+        assert second["status"] == "lock_failed"
+        assert second["standby"] is True
+
+        await manager1.remove_folder(str(folder))
+        takeover = await manager2.maybe_takeover(str(folder))
+
+        assert takeover["status"] == "started"
+        assert str(folder.resolve()) in manager2._watched
+
+        manager1.stop()
+        manager2.stop()
+        for task in list(manager1._active.values()) + list(manager2._active.values()):
+            task.cancel()

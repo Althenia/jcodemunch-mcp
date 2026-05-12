@@ -244,6 +244,7 @@ class TestAutoWatchPathFromPathArg:
         # Mock watcher manager
         mock_mgr = AsyncMock(spec=WatcherManager)
         mock_mgr.is_watched.return_value = False
+        mock_mgr.maybe_takeover = AsyncMock(return_value={"status": "lock_failed"})
         mock_mgr.ensure_indexed = AsyncMock(return_value={"status": "indexed"})
         mock_mgr.add_folder = AsyncMock(return_value={"status": "started"})
 
@@ -272,6 +273,7 @@ class TestAutoWatchPathFromRepoArg:
         # Mock watcher manager
         mock_mgr = AsyncMock(spec=WatcherManager)
         mock_mgr.is_watched.return_value = False
+        mock_mgr.maybe_takeover = AsyncMock(return_value={"status": "lock_failed"})
         mock_mgr.ensure_indexed = AsyncMock(return_value={"status": "indexed"})
         mock_mgr.add_folder = AsyncMock(return_value={"status": "started"})
 
@@ -301,6 +303,7 @@ class TestAutoWatchTriggersOnUnwatched:
         # Mock watcher manager
         mock_mgr = AsyncMock(spec=WatcherManager)
         mock_mgr.is_watched.return_value = False  # Not watched
+        mock_mgr.maybe_takeover = AsyncMock(return_value={"status": "lock_failed"})
         mock_mgr.ensure_indexed = AsyncMock(return_value={"status": "indexed"})
         mock_mgr.add_folder = AsyncMock(return_value={"status": "started"})
 
