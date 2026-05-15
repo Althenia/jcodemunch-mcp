@@ -334,16 +334,24 @@ def safe_decode(data: bytes, encoding: str = "utf-8") -> str:
 EXTRA_IGNORE_PATTERNS_ENV_VAR = "JCODEMUNCH_EXTRA_IGNORE_PATTERNS"
 
 
-def get_extra_ignore_patterns(call_patterns: Optional[list] = None) -> list:
+def get_extra_ignore_patterns(
+    call_patterns: Optional[list] = None,
+    repo: Optional[str] = None,
+) -> list:
     """Return merged extra ignore patterns from config and per-call list.
 
     Args:
         call_patterns: Patterns supplied by the caller (per-call override).
+        repo: Repo identifier (absolute path or display name). When supplied,
+            the merged project config (`.jcodemunch.jsonc`) is consulted first;
+            falls back to global config when no project entry exists. Without
+            `repo`, only the global config is read — which silently ignores
+            project-level overrides (issue #300, reported by @domis86).
 
     Returns:
         Combined list of gitignore-style pattern strings. Empty list if none.
     """
-    config_patterns = _config.get("extra_ignore_patterns", [])
+    config_patterns = _config.get("extra_ignore_patterns", [], repo=repo)
     if isinstance(config_patterns, list):
         combined = config_patterns[:]
     else:

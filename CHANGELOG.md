@@ -2,6 +2,44 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.12] — 2026-05-15 — `.jcodemunch.jsonc` extra_ignore_patterns now honored (#300)
+
+Reported by **@domis86** in #300 with a clean Claude-assisted diagnosis.
+
+**The bug:** A project-level `.jcodemunch.jsonc` with
+`"extra_ignore_patterns": ["docs/legacy/"]` was loaded into
+`_PROJECT_CONFIGS` correctly but never read by the indexer. The discovery
+walk would log `ACCEPT: docs/legacy/...` for every file the user expected
+to be filtered. The pattern was silently dropped.
+
+**Root cause:** `get_extra_ignore_patterns()` in `security.py:337` called
+`_config.get("extra_ignore_patterns", [])` without a `repo=` argument.
+`config.get(key)` falls back to `_GLOBAL_CONFIG` when no repo is supplied,
+so the project-level merged value was never consulted. The single
+caller in `index_folder.py:585` had the resolved folder path on hand but
+wasn't forwarding it.
+
+**Fix:**
+- `get_extra_ignore_patterns()` now accepts a `repo=` argument and
+  forwards it to `_config.get`. Pre-#300 callers (no `repo=`) get
+  identical behavior; the new path activates when callers thread the
+  folder path through.
+- `discover_local_files()` in `index_folder.py` now passes
+  `repo=str(folder_path)` so `.jcodemunch.jsonc` overrides land at the
+  consumption site.
+- `jcodemunch-mcp config --check` now probes cwd for `.jcodemunch.jsonc`
+  and validates it if present. domis86's "no mention = red flag"
+  diagnostic gap closed: users editing the project config now see
+  positive confirmation it parses (or what's wrong if it doesn't).
+- 2 new regression tests in `tests/test_security.py` covering both the
+  unit-level `repo=` plumbing and the full `discover_local_files`
+  integration path.
+
+**Workarounds for users on older versions** (per the issue):
+- Pass `extra_ignore_patterns` to `index_folder` explicitly each call.
+- Or set `JCODEMUNCH_EXTRA_IGNORE_PATTERNS` env var.
+- Or move the patterns to `~/.code-index/config.jsonc` (affects every repo).
+
 ## [1.108.11] — 2026-05-15 — drift cleanup + Windows-CI test hardening
 
 Docs / hygiene patch. No behavior change.

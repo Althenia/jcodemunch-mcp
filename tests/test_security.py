@@ -423,6 +423,32 @@ class TestGetExtraIgnorePatterns:
             config_module._GLOBAL_CONFIG.clear()
             config_module._GLOBAL_CONFIG.update(orig_config)
 
+    def test_repo_arg_reads_project_config(self, tmp_path):
+        """Issue #300: passing repo= should pull from project config, not global."""
+        from jcodemunch_mcp import config as config_module
+
+        orig_global = config_module._GLOBAL_CONFIG.copy()
+        orig_project = config_module._PROJECT_CONFIGS.copy()
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._PROJECT_CONFIGS.clear()
+
+        try:
+            repo_path = str(tmp_path.resolve())
+            config_module._GLOBAL_CONFIG["extra_ignore_patterns"] = ["global/"]
+            config_module._PROJECT_CONFIGS[repo_path] = {
+                "extra_ignore_patterns": ["project_only/"],
+            }
+
+            # Without repo=: only global is seen (the pre-#300 behavior).
+            assert get_extra_ignore_patterns() == ["global/"]
+            # With repo=: project config overrides global.
+            assert get_extra_ignore_patterns(repo=repo_path) == ["project_only/"]
+        finally:
+            config_module._GLOBAL_CONFIG.clear()
+            config_module._GLOBAL_CONFIG.update(orig_global)
+            config_module._PROJECT_CONFIGS.clear()
+            config_module._PROJECT_CONFIGS.update(orig_project)
+
 
 # --- Integration: discover_local_files with security ---
 
@@ -479,6 +505,38 @@ class TestDiscoverLocalFilesSecure:
         names = [f.name for f in files]
         assert "main.py" in names
         assert "temp.py" not in names
+
+    def test_extra_ignore_patterns_from_project_config(self, tmp_path):
+        """Issue #300: .jcodemunch.jsonc-loaded extra_ignore_patterns must be
+        honored by discover_local_files, not silently dropped."""
+        from jcodemunch_mcp.tools.index_folder import discover_local_files
+        from jcodemunch_mcp import config as config_module
+
+        (tmp_path / "main.py").write_text("x = 1\n")
+        (tmp_path / "temp.py").write_text("y = 2\n")
+
+        orig_global = config_module._GLOBAL_CONFIG.copy()
+        orig_project = config_module._PROJECT_CONFIGS.copy()
+        config_module._GLOBAL_CONFIG.clear()
+        config_module._PROJECT_CONFIGS.clear()
+
+        try:
+            repo_key = str(tmp_path.resolve())
+            config_module._PROJECT_CONFIGS[repo_key] = {
+                "extra_ignore_patterns": ["temp.py"],
+            }
+            files, *_ = discover_local_files(tmp_path)
+            names = [f.name for f in files]
+            assert "main.py" in names
+            assert "temp.py" not in names, (
+                "Project-level extra_ignore_patterns was silently dropped — "
+                "issue #300 regression."
+            )
+        finally:
+            config_module._GLOBAL_CONFIG.clear()
+            config_module._GLOBAL_CONFIG.update(orig_global)
+            config_module._PROJECT_CONFIGS.clear()
+            config_module._PROJECT_CONFIGS.update(orig_project)
 
     def test_respects_config_file_limit(self, tmp_path):
         """Config controls local folder file discovery limit."""

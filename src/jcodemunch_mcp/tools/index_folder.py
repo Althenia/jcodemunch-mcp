@@ -581,8 +581,12 @@ def discover_local_files(
     root_str_norm = os.path.normcase(root_str)
     root_prefix_norm = os.path.normcase(root_prefix)
 
-    # Merge env-var global patterns with per-call patterns, then build spec
-    effective_extra = get_extra_ignore_patterns(extra_ignore_patterns)
+    # Merge env-var global, project-level, and per-call patterns, then build
+    # spec. Passing repo=str(folder_path) so .jcodemunch.jsonc overrides land
+    # (issue #300, reported by @domis86).
+    effective_extra = get_extra_ignore_patterns(
+        extra_ignore_patterns, repo=str(folder_path)
+    )
     extra_spec = None
     if effective_extra:
         try:

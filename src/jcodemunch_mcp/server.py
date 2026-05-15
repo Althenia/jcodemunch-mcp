@@ -5886,6 +5886,19 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
         else:
             print(f"  {green(CHECK)} config.jsonc valid: {config_path}")
 
+        # Probe cwd for project-level .jcodemunch.jsonc and validate if found.
+        # Without this, users editing project config see no signal that the
+        # file is being parsed at all (issue #300).
+        project_config_path = Path.cwd() / ".jcodemunch.jsonc"
+        if project_config_path.is_file():
+            project_issues = _cfg.validate_config(str(project_config_path))
+            if project_issues:
+                for issue in project_issues:
+                    print(f"  {red(CROSS)} .jcodemunch.jsonc: {issue}")
+                issues.append("project_config")
+            else:
+                print(f"  {green(CHECK)} .jcodemunch.jsonc valid: {project_config_path}")
+
         # Storage writable?
         storage = Path(storage_path)
         try:
