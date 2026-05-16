@@ -37,7 +37,7 @@ Click any badge or widget and the visitor lands on the impact page, where the fu
 Best for: GitHub READMEs, GitLab project pages, plaintext-friendly contexts. shields.io-style SVG, two-tone, auto-refreshes once per hour.
 
 ### Default (dark, kg)
-
+[![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```markdown
 [![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```
@@ -45,19 +45,19 @@ Best for: GitHub READMEs, GitLab project pages, plaintext-friendly contexts. shi
 Renders as a clickable badge that links to the impact page.
 
 ### Light theme
-
+[![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?theme=light)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```markdown
 [![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?theme=light)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```
 
 ### Imperial units (pounds)
-
+[![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?units=lbs)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```markdown
 [![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?units=lbs)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```
 
 ### Tonnes (good for larger numbers)
-
+[![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?units=tonnes)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```markdown
 [![CO₂ prevented by jCodeMunch-MCP](https://j.gravelle.us/jCodeMunch/badge.php?units=tonnes)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```
@@ -65,12 +65,15 @@ Renders as a clickable badge that links to the impact page.
 ### Combine options
 
 Query params stack:
-
+[![CO₂ prevented](https://j.gravelle.us/jCodeMunch/badge.php?theme=light&units=lbs)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```markdown
 [![CO₂ prevented](https://j.gravelle.us/jCodeMunch/badge.php?theme=light&units=lbs)](https://j.gravelle.us/jCodeMunch/impact.php)
 ```
 
 ### HTML version (for sites that don't render Markdown)
+<a href="https://j.gravelle.us/jCodeMunch/impact.php">
+  <img src="https://j.gravelle.us/jCodeMunch/badge.php" alt="CO₂ prevented by jCodeMunch-MCP">
+</a>
 
 ```html
 <a href="https://j.gravelle.us/jCodeMunch/impact.php">
@@ -85,6 +88,8 @@ Query params stack:
 Best for: marketing site footers, sustainability dashboards, About pages. Card format, larger, updates every 60 seconds, fully styled.
 
 ### Basic embed
+<div data-jcodemunch-impact></div>
+<script src="https://j.gravelle.us/jCodeMunch/embed.js" async></script>
 
 ```html
 <div data-jcodemunch-impact></div>
@@ -94,6 +99,13 @@ Best for: marketing site footers, sustainability dashboards, About pages. Card f
 That's it. The widget injects its own CSS, fetches the live counter, and renders a card. Whole card is clickable to the impact page by default.
 
 ### Configured
+<div data-jcodemunch-impact
+     data-units="lbs"
+     data-theme="light"
+     data-compact="false"
+     data-link="true">
+</div>
+<script src="https://j.gravelle.us/jCodeMunch/embed.js" async></script>
 
 ```html
 <div data-jcodemunch-impact
@@ -106,6 +118,8 @@ That's it. The widget injects its own CSS, fetches the live counter, and renders
 ```
 
 ### Compact (for tight spaces, e.g. email signatures, sidebars)
+<div data-jcodemunch-impact data-compact="true"></div>
+<script src="https://j.gravelle.us/jCodeMunch/embed.js" async></script>
 
 ```html
 <div data-jcodemunch-impact data-compact="true"></div>
