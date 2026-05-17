@@ -2,6 +2,67 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.14] - 2026-05-17 - resolve_repo perf at scale (#303)
+
+Reported by @rknighton with a complete root-cause analysis, local patch,
+and before/after timings. About 130 git worktrees and ~40 index DBs on
+Windows; `resolve_repo` on an unindexed agent worktree path timed out
+past 120s, falling agents back to broad local filesystem reads instead
+of jCodeMunch.
+
+Two cost sinks fixed:
+
+1. **`_find_canonical_candidates` spawned one `git rev-parse` subprocess
+   per indexed repo.** At 40 indexes on Windows that's 4-8s of process
+   churn before any work happens. Replaced with `_git_common_dir_cheap`,
+   which reads `.git` / `commondir` files directly:
+
+   - Main checkout: `.git` is a directory; that's the common-dir.
+   - Linked worktree (`git worktree add`): `.git` is a pointer file
+     containing `gitdir: <path>`; the pointed-to directory's `commondir`
+     file points back to the canonical `.git`. We follow that chain in
+     pure-Python filesystem reads.
+   - Submodule: `.git` pointer file with no `commondir`; the gitdir
+     itself is treated as the common-dir.
+
+2. **`_compute_repo_id(candidate, store=store)` walked the whole index
+   store via `_existing_git_identity` for path-containment checks** on
+   every candidate, even when a cheap source_root match would have
+   answered the question. Added two fast paths that run before the
+   legacy compute-then-inspect path:
+
+   - **Exact source_root match.** Pre-fetch `store.list_repos()` once,
+     return the indexed entry directly when the input path equals an
+     indexed `source_root`.
+   - **Source_root containment.** If the input path is under an indexed
+     `source_root`, return that entry. Deepest match wins when multiple
+     parents are indexed.
+
+   For the not-indexed final case, `_compute_repo_id` is now called
+   without `store=`, which skips the O(indexes) walk for the
+   provisional repo-id computation.
+
+Validation (reporter's environment, ~40 indexes / ~130 worktrees):
+
+- Before: `resolve_repo(agent worktree path)` timed out after 120s.
+- After:  `resolve_repo(canonical checkout)` ~0.095s,
+          `resolve_repo(agent worktree path)` ~0.149s.
+
+Wire shape: response now includes `_meta.match_path` indicating which
+fast path served the result (`exact_source_root` | `source_root_containment`
+| `computed_repo_id` | `not_indexed`). Additive; no other response
+fields changed.
+
+10 new regression tests in `tests/test_resolve_repo.py`:
+`TestGitCommonDirCheap` (6: main checkout, linked worktree pointer
+chain, submodule layout, non-git path, malformed pointer, empty pointer)
+and `TestResolveRepoFastPaths` (4: exact source_root, source_root
+containment, not_indexed match_path tag, no-git-subprocess invariant
+on the fast path). Full suite: 4412 passing.
+
+Worktree-canonical discovery (#277) behavior preserved bit-for-bit;
+the existing `TestWorktreeCanonicalCandidates` tests pass unchanged.
+
 ## [1.108.13] — 2026-05-15 — project-config plumbing audit (#301)
 
 Follow-up to #300. The audit issue asked: how many other `_config.get()`

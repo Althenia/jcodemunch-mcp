@@ -20,42 +20,65 @@ def _compute_repo_id(folder_path: Path, store: Optional[IndexStore] = None) -> s
     return f"{decision.owner}/{decision.name}"
 
 
-def _git_common_dir(path: Path) -> Optional[Path]:
-    """Return the canonical Git common-dir for a path, or None.
+def _git_common_dir_cheap(path: Path) -> Optional[Path]:
+    """Resolve the canonical Git common-dir via filesystem reads (no subprocess).
 
-    For the main checkout this is the same as the `.git` directory; for
-    a linked worktree it points at the main repo's `.git`. So all worktrees
-    of a repository share a common-dir, which lets us match a worktree
-    against an already-indexed canonical checkout (issue #277).
+    Standard layout:
+      - Main checkout: ``<repo>/.git`` is a directory; that IS the common-dir.
+      - Linked worktree (``git worktree add``): ``<worktree>/.git`` is a file
+        containing ``gitdir: <abs path to linked worktree gitdir>``. The
+        linked worktree gitdir contains a ``commondir`` file pointing back
+        (relative path) to the canonical ``.git`` of the main checkout.
+      - Submodule / unusual layout: ``.git`` is a file with ``gitdir:`` but
+        no ``commondir`` file. The pointed-to gitdir itself is treated as
+        the common-dir.
 
-    Same env-neutralisation as `_git_toplevel` — system/global git config is
-    disabled so a hostile workspace can't influence the probe.
+    Faster than `git rev-parse --git-common-dir` by 100-1000x on Windows;
+    safe to call O(indexes) times inside a hot loop (jcm#303).
+
+    Returns None when the path has no ``.git`` (not a git repo) or the
+    pointer file is malformed. Caller falls back to no canonical match.
     """
-    import os as _os
-    env = _os.environ.copy()
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
-    env["GIT_CONFIG_GLOBAL"] = _os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            capture_output=True,
-            text=True,
-            cwd=str(path),
-            timeout=5,
-            stdin=subprocess.DEVNULL,
-            env=env,
-        )
-        if result.returncode == 0:
-            raw = result.stdout.strip()
-            if not raw:
-                return None
-            common = Path(raw)
-            if not common.is_absolute():
-                common = (path / common).resolve()
-            return common.resolve()
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+    git = path / ".git"
+    if not git.exists():
+        return None
+
+    if git.is_dir():
+        return git.resolve()
+
+    if git.is_file():
+        try:
+            content = git.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not content.startswith("gitdir:"):
+            return None
+        gitdir_str = content[len("gitdir:"):].strip()
+        if not gitdir_str:
+            return None
+        gitdir = Path(gitdir_str)
+        if not gitdir.is_absolute():
+            gitdir = (path / gitdir).resolve()
+        else:
+            gitdir = gitdir.resolve()
+        if not gitdir.exists():
+            return None
+        commondir_file = gitdir / "commondir"
+        if commondir_file.exists():
+            try:
+                rel = commondir_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                rel = ""
+            if rel:
+                common = Path(rel)
+                if not common.is_absolute():
+                    common = (gitdir / common).resolve()
+                else:
+                    common = common.resolve()
+                return common
+        # Submodule or unusual layout — the gitdir itself is the common-dir.
+        return gitdir
+
     return None
 
 
@@ -91,11 +114,56 @@ def _git_toplevel(path: Path) -> Optional[Path]:
     return None
 
 
+def _build_indexed_response(
+    store: IndexStore,
+    repo_id: str,
+    p_resolved: Path,
+    start: float,
+    match_path: str,
+) -> Optional[dict]:
+    """Construct the indexed-repo response shape, or None when lookup fails."""
+    if not repo_id or "/" not in repo_id:
+        return None
+    owner, name = repo_id.split("/", 1)
+    status = store.inspect_index(owner, name)
+    if not status.index_present:
+        return None
+    entry = _read_repo_metadata(store, owner, name)
+    elapsed = (time.perf_counter() - start) * 1000
+    result = {
+        "found": True,
+        "indexed": status.loadable,
+        "repo": repo_id,
+        **status.as_fields(),
+        "_meta": {"timing_ms": round(elapsed, 1), "match_path": match_path},
+    }
+    metadata = {
+        "source_root": entry.get("source_root") or status.source_root,
+        "display_name": entry.get("display_name") or status.display_name,
+        "symbol_count": entry.get("symbol_count", status.symbol_count),
+        "file_count": entry.get("file_count", status.file_count),
+        "languages": entry.get("languages", status.languages),
+        "indexed_at": entry.get("indexed_at") or status.indexed_at,
+    }
+    for key, value in metadata.items():
+        if value is not None and value != "":
+            result[key] = value
+    return result
+
+
 def resolve_repo(path: str, storage_path: Optional[str] = None) -> dict:
     """Resolve a filesystem path to its indexed repo identifier.
 
     Accepts a repo root, worktree, subdirectory, or file path.
     Returns whether the path is indexed and its computed repo ID.
+
+    Performance (jcm#303): in environments with many indexes and/or many
+    Git worktrees of the same logical repo, this used to scale O(N) git
+    subprocesses through `_find_canonical_candidates` and O(N) store probes
+    through `resolve_index_identity(store=store)`. The fast paths below
+    pre-fetch the repo list once, match by exact source_root (and source_root
+    containment) before any subprocess work, and replace canonical-candidate
+    git probes with filesystem reads of `.git` / `commondir`.
     """
     start = time.perf_counter()
     p = Path(path)
@@ -113,50 +181,81 @@ def resolve_repo(path: str, storage_path: Optional[str] = None) -> dict:
     if p.is_file():
         p = p.parent
 
+    p_resolved = p.resolve()
     store = IndexStore(base_path=storage_path)
 
-    # Try candidates: input path first, then git root
+    # Single store enumeration — reused by all subsequent fast paths.
+    try:
+        all_repos = store.list_repos()
+    except Exception:
+        logger.debug("list_repos failed at resolve_repo entry", exc_info=True)
+        all_repos = []
+
+    # Fast path 1 (jcm#303): exact source_root match, then source_root
+    # containment with the deepest match winning. Avoids the
+    # resolve_index_identity(..., store=store) walk that probes every
+    # indexed repo's git_root for path containment.
+    containment_hits: list[tuple[int, dict]] = []
+    for entry in all_repos:
+        sr = entry.get("source_root", "")
+        if not sr:
+            continue
+        try:
+            sr_path = Path(sr).resolve()
+        except (OSError, ValueError):
+            continue
+        if p_resolved == sr_path:
+            built = _build_indexed_response(
+                store, entry.get("repo", ""), p_resolved, start,
+                match_path="exact_source_root",
+            )
+            if built is not None:
+                return built
+        else:
+            try:
+                if p_resolved.is_relative_to(sr_path):
+                    containment_hits.append((len(str(sr_path)), entry))
+            except (OSError, ValueError, AttributeError):
+                continue
+
+    if containment_hits:
+        # Deepest source_root wins (most specific match).
+        containment_hits.sort(key=lambda x: x[0], reverse=True)
+        for _, entry in containment_hits:
+            built = _build_indexed_response(
+                store, entry.get("repo", ""), p_resolved, start,
+                match_path="source_root_containment",
+            )
+            if built is not None:
+                return built
+
+    # Slow path: legacy compute-then-inspect for the (input, git_root)
+    # candidate pair. Reached only when the fast paths above missed.
     candidates = [p]
     git_root = _git_toplevel(p)
-    if git_root and git_root.resolve() != p.resolve():
+    if git_root and git_root.resolve() != p_resolved:
         candidates.append(git_root)
 
     for candidate in candidates:
         repo_id = _compute_repo_id(candidate, store=store)
-        owner, name = repo_id.split("/", 1)
-        status = store.inspect_index(owner, name)
-        if status.index_present:
-            # Read metadata from sidecar or full index
-            entry = _read_repo_metadata(store, owner, name)
-            elapsed = (time.perf_counter() - start) * 1000
-            result = {
-                "found": True,
-                "indexed": status.loadable,
-                "repo": repo_id,
-                **status.as_fields(),
-                "_meta": {"timing_ms": round(elapsed, 1)},
-            }
-            metadata = {
-                "source_root": entry.get("source_root") or status.source_root,
-                "display_name": entry.get("display_name") or status.display_name,
-                "symbol_count": entry.get("symbol_count", status.symbol_count),
-                "file_count": entry.get("file_count", status.file_count),
-                "languages": entry.get("languages", status.languages),
-                "indexed_at": entry.get("indexed_at") or status.indexed_at,
-            }
-            for key, value in metadata.items():
-                if value is not None and value != "":
-                    result[key] = value
-            return result
+        built = _build_indexed_response(
+            store, repo_id, p_resolved, start,
+            match_path="computed_repo_id",
+        )
+        if built is not None:
+            return built
 
-    # Not indexed — return the computed ID for the best candidate
+    # Not indexed — use cheap local identity for the provisional repo_id.
+    # No `store=` argument → skips the O(indexes) _existing_git_identity walk.
     best = candidates[0]
-    repo_id = _compute_repo_id(best, store=store)
+    repo_id = _compute_repo_id(best)
 
     # Worktree-aware canonical-index discovery (issue #277):
     # if the path is a Git worktree, look for already-indexed repos that
     # share the same --git-common-dir and surface them as candidates.
-    canonical_candidates = _find_canonical_candidates(best, store)
+    # Uses filesystem reads (no subprocess) and the pre-fetched repo list
+    # so the O(N) loop is fast even at 40+ indexes (jcm#303).
+    canonical_candidates = _find_canonical_candidates(best, store, all_repos)
 
     elapsed = (time.perf_counter() - start) * 1000
     response: dict = {
@@ -164,7 +263,7 @@ def resolve_repo(path: str, storage_path: Optional[str] = None) -> dict:
         "indexed": False,
         "repo": repo_id,
         "hint": "call index_folder to index this path",
-        "_meta": {"timing_ms": round(elapsed, 1)},
+        "_meta": {"timing_ms": round(elapsed, 1), "match_path": "not_indexed"},
     }
     if canonical_candidates:
         response["canonical_candidates"] = canonical_candidates
@@ -177,24 +276,32 @@ def resolve_repo(path: str, storage_path: Optional[str] = None) -> dict:
 
 
 def _find_canonical_candidates(
-    path: Path, store: IndexStore
+    path: Path,
+    store: IndexStore,
+    repos: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Find indexed repos sharing this path's Git common-dir.
 
     Returns a list of `{repo, source_root, rationale}` dicts. Empty when the
     path isn't in a Git repo, has no common-dir, or no indexed repo matches.
+
+    Performance (jcm#303): uses `_git_common_dir_cheap` (filesystem reads
+    only, no subprocess) for both the input path and every candidate path.
+    Accepts a pre-fetched `repos` list so the caller can avoid a redundant
+    `store.list_repos()` round-trip.
     """
-    common = _git_common_dir(path)
+    common = _git_common_dir_cheap(path)
     if common is None:
         return []
 
-    candidates: list[dict] = []
-    try:
-        repos = store.list_repos()
-    except Exception:
-        logger.debug("list_repos failed during worktree resolution", exc_info=True)
-        return []
+    if repos is None:
+        try:
+            repos = store.list_repos()
+        except Exception:
+            logger.debug("list_repos failed during worktree resolution", exc_info=True)
+            return []
 
+    candidates: list[dict] = []
     for entry in repos:
         source_root = entry.get("source_root", "")
         if not source_root:
@@ -203,7 +310,7 @@ def _find_canonical_candidates(
             other_path = Path(source_root)
             if not other_path.exists():
                 continue
-            other_common = _git_common_dir(other_path)
+            other_common = _git_common_dir_cheap(other_path)
         except (OSError, ValueError):
             continue
         if other_common is None:

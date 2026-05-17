@@ -7,7 +7,11 @@ import pytest
 
 from jcodemunch_mcp.storage import INDEX_VERSION, IndexStore
 from jcodemunch_mcp.storage.sqlite_store import _cache_evict
-from jcodemunch_mcp.tools.resolve_repo import resolve_repo, _compute_repo_id
+from jcodemunch_mcp.tools.resolve_repo import (
+    resolve_repo,
+    _compute_repo_id,
+    _git_common_dir_cheap,
+)
 from jcodemunch_mcp.watcher import _local_repo_id
 from jcodemunch_mcp.tools.index_folder import index_folder
 
@@ -240,3 +244,157 @@ class TestWorktreeCanonicalCandidates:
         assert result["indexed"] is False
         assert "canonical_candidates" not in result
         assert result["hint"] == "call index_folder to index this path"
+
+
+class TestGitCommonDirCheap:
+    """Regression: jcm#303 — filesystem-only common-dir resolution so that
+    canonical-candidate discovery scales without an O(indexes) git subprocess
+    storm in large worktree environments.
+    """
+
+    def test_main_checkout_returns_dot_git(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        assert _git_common_dir_cheap(repo) == (repo / ".git").resolve()
+
+    def test_linked_worktree_follows_gitdir_and_commondir(self, tmp_path):
+        # Simulate the standard `git worktree add` layout without invoking git.
+        canonical = tmp_path / "canonical"
+        canonical.mkdir()
+        canonical_git = canonical / ".git"
+        canonical_git.mkdir()
+        worktrees_dir = canonical_git / "worktrees" / "feature"
+        worktrees_dir.mkdir(parents=True)
+        # commondir is a relative path back to the canonical .git
+        (worktrees_dir / "commondir").write_text("../..\n", encoding="utf-8")
+
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        # .git as a pointer file with absolute gitdir, matching real git behaviour
+        (worktree / ".git").write_text(
+            f"gitdir: {worktrees_dir}\n", encoding="utf-8"
+        )
+
+        assert _git_common_dir_cheap(worktree) == canonical_git.resolve()
+        # And the main checkout resolves to the same common-dir, which is the
+        # invariant canonical-candidate matching relies on.
+        assert _git_common_dir_cheap(canonical) == canonical_git.resolve()
+
+    def test_submodule_layout_returns_gitdir(self, tmp_path):
+        # Submodule: .git is a pointer file but the gitdir has no commondir file.
+        parent_git = tmp_path / "parent" / ".git"
+        modules = parent_git / "modules" / "sub"
+        modules.mkdir(parents=True)
+
+        submodule = tmp_path / "parent" / "sub"
+        submodule.mkdir(parents=True)
+        (submodule / ".git").write_text(
+            f"gitdir: {modules}\n", encoding="utf-8"
+        )
+
+        assert _git_common_dir_cheap(submodule) == modules.resolve()
+
+    def test_non_git_path_returns_none(self, tmp_path):
+        assert _git_common_dir_cheap(tmp_path) is None
+
+    def test_malformed_pointer_file_returns_none(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").write_text("not-a-gitdir-pointer\n", encoding="utf-8")
+        assert _git_common_dir_cheap(repo) is None
+
+    def test_empty_pointer_file_returns_none(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / ".git").write_text("gitdir:\n", encoding="utf-8")
+        assert _git_common_dir_cheap(repo) is None
+
+
+class TestResolveRepoFastPaths:
+    """Regression: jcm#303 — exact source_root and source_root containment
+    must hit before the legacy compute-then-inspect path so that large index
+    stores don't time out resolve_repo.
+    """
+
+    def test_exact_source_root_match_path_meta(self, tmp_path):
+        canonical = tmp_path / "exactsrc"
+        canonical.mkdir()
+        (canonical / "main.py").write_text("def f(): return 1\n", encoding="utf-8")
+
+        store_path = str(tmp_path / "store")
+        index_folder(
+            str(canonical),
+            use_ai_summaries=False,
+            storage_path=store_path,
+            identity_mode="local",
+        )
+
+        result = resolve_repo(str(canonical), storage_path=store_path)
+        assert result["found"] is True
+        assert result["indexed"] is True
+        assert result["_meta"]["match_path"] == "exact_source_root"
+
+    def test_source_root_containment_subdirectory(self, tmp_path):
+        canonical = tmp_path / "containment"
+        canonical.mkdir()
+        sub = canonical / "src" / "deep"
+        sub.mkdir(parents=True)
+        (sub / "main.py").write_text("def f(): return 1\n", encoding="utf-8")
+
+        store_path = str(tmp_path / "store")
+        index_folder(
+            str(canonical),
+            use_ai_summaries=False,
+            storage_path=store_path,
+            identity_mode="local",
+        )
+
+        # Resolving the subdirectory should hit the containment fast path
+        # and return the indexed parent.
+        result = resolve_repo(str(sub), storage_path=store_path)
+        assert result["found"] is True
+        assert result["indexed"] is True
+        assert result["_meta"]["match_path"] == "source_root_containment"
+
+    def test_not_indexed_path_marks_match_path(self, tmp_path):
+        unrelated = tmp_path / "unrelated"
+        unrelated.mkdir()
+        store_path = str(tmp_path / "store")
+
+        result = resolve_repo(str(unrelated), storage_path=store_path)
+        assert result["found"] is True
+        assert result["indexed"] is False
+        assert result["_meta"]["match_path"] == "not_indexed"
+
+    def test_fast_path_does_not_spawn_subprocess(self, tmp_path, monkeypatch):
+        """At scale, the exact-source-root fast path must not invoke git at all.
+        Catches regressions where someone reintroduces a subprocess call in the
+        hot path."""
+        canonical = tmp_path / "nosub"
+        canonical.mkdir()
+        (canonical / "main.py").write_text("def f(): return 1\n", encoding="utf-8")
+        store_path = str(tmp_path / "store")
+        index_folder(
+            str(canonical),
+            use_ai_summaries=False,
+            storage_path=store_path,
+            identity_mode="local",
+        )
+
+        import subprocess as _sp
+        original_run = _sp.run
+        calls = []
+
+        def tracking_run(*args, **kwargs):
+            calls.append(args[0] if args else kwargs.get("args"))
+            return original_run(*args, **kwargs)
+
+        monkeypatch.setattr(_sp, "run", tracking_run)
+        result = resolve_repo(str(canonical), storage_path=store_path)
+        assert result["indexed"] is True
+        # The exact-source-root fast path returned without consulting git.
+        git_calls = [c for c in calls if c and len(c) > 0 and "git" in str(c[0]).lower()]
+        assert git_calls == [], (
+            f"expected no git subprocess in fast path, got: {git_calls}"
+        )
