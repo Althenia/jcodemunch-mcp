@@ -296,6 +296,9 @@ Add to `.vscode/settings.json`:
 
 ## Google Antigravity
 
+> [!WARNING]
+> **Setup steps below are stale as of May 2026.** Antigravity revamped the desktop app UI and removed the `⋯` → MCP Servers → Manage MCP Servers → View raw config flow that these steps rely on. The new UI only exposes per-MCP permissions, not raw-config editing. Tracking at [issue #307](https://github.com/jgravelle/jcodemunch-mcp/issues/307); will update this section once the current procedure is confirmed. For the CLI, MCP config may live in a shared settings file under the user's Antigravity data directory (path TBD).
+
 1. Open the Agent pane
 2. Click the `⋯` menu
 3. Choose **MCP Servers** → **Manage MCP Servers**
