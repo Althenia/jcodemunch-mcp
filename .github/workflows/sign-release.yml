@@ -26,6 +26,12 @@ name: Sign release artifacts
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign (e.g. v1.108.22). Required when invoking manually."
+        required: true
+        type: string
 
 permissions:
   id-token: write     # required for sigstore OIDC
@@ -43,7 +49,7 @@ jobs:
       - name: Download release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           mkdir -p artifacts
           cd artifacts
@@ -64,7 +70,11 @@ jobs:
           python-version: "3.12"
 
       - name: Sign artifacts
-        uses: sigstore/gh-action-sigstore-python@v3
+        # The Sigstore action publishes specific semver tags only (v3.3.0,
+        # v3.2.0, etc.) — there is no floating @v3 ref. Pinning to the commit
+        # SHA of v3.3.0 makes the version immutable; bump in lockstep with
+        # upstream releases when a CVE / improvement warrants.
+        uses: sigstore/gh-action-sigstore-python@04cffa1d795717b140764e8b640de88853c92acc  # v3.3.0
         with:
           inputs: |
             ./artifacts/*.whl
@@ -74,7 +84,7 @@ jobs:
       - name: Upload signature bundles to release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           cd artifacts
           # The sigstore action writes .sigstore files alongside the inputs.
