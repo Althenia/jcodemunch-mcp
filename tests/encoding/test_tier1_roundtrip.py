@@ -400,6 +400,72 @@ def test_get_file_outline_round_trip():
     assert by_id["s2"]["signature"] == "def __init__(self)"
 
 
+def test_get_file_outline_batch_round_trip():
+    """Batch shape (file_paths) must preserve every file's symbols (issue #319).
+
+    The pre-fix encoder only read top-level ``symbols``, so the nested
+    ``results[].symbols`` were silently dropped and models saw empty outlines.
+    """
+    resp = {
+        "repo": "acme/app",
+        "results": [
+            {
+                "repo": "acme/app",
+                "file": "src/a.py",
+                "language": "python",
+                "file_summary": "",
+                "symbols": [
+                    {"id": "a1", "name": "foo", "kind": "function", "signature": "def foo()", "line": 1, "end_line": 2, "parent": None, "summary": ""},
+                    {"id": "a2", "name": "bar", "kind": "function", "signature": "def bar(x: int)", "line": 4, "end_line": 6, "parent": None, "summary": ""},
+                ],
+                "_meta": {"symbol_count": 2},
+            },
+            {
+                "repo": "acme/app",
+                "file": "src/b.py",
+                "language": "python",
+                "file_summary": "",
+                "symbols": [
+                    {"id": "b1", "name": "Widget", "kind": "class", "signature": "class Widget", "line": 1, "end_line": 10, "parent": None, "summary": ""},
+                    {"id": "b2", "name": "render", "kind": "method", "signature": "def render(self)", "line": 3, "end_line": 5, "parent": "b1", "summary": ""},
+                ],
+                "_meta": {"symbol_count": 2},
+            },
+            # A file with no symbols still round-trips as an empty list.
+            {
+                "repo": "acme/app",
+                "file": "src/empty.py",
+                "language": "python",
+                "file_summary": "",
+                "symbols": [],
+                "_meta": {"symbol_count": 0},
+            },
+        ],
+        "_meta": {"timing_ms": 1.2},
+    }
+    out = _rt("get_file_outline", resp)
+    assert "results" in out
+    assert len(out["results"]) == 3
+    by_file = {r["file"]: r for r in out["results"]}
+
+    # The core regression: symbols survive batch encoding.
+    assert len(by_file["src/a.py"]["symbols"]) == 2
+    assert len(by_file["src/b.py"]["symbols"]) == 2
+    assert by_file["src/empty.py"]["symbols"] == []
+
+    # Per-file metadata survives.
+    assert by_file["src/a.py"]["_meta"]["symbol_count"] == 2
+    assert by_file["src/empty.py"]["_meta"]["symbol_count"] == 0
+    assert by_file["src/b.py"]["language"] == "python"
+
+    # Hierarchy and signatures round-trip within the correct file.
+    b_syms = {s["id"]: s for s in by_file["src/b.py"]["symbols"]}
+    assert b_syms["b2"]["parent"] == "b1"
+    assert b_syms["b1"]["parent"] is None
+    a_syms = {s["id"]: s for s in by_file["src/a.py"]["symbols"]}
+    assert a_syms["a2"]["signature"] == "def bar(x: int)"
+
+
 def test_get_repo_outline_round_trip():
     resp = {
         "repo": "acme/app",

@@ -4,6 +4,27 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.26] - 2026-05-29 - get_file_outline batch mode dropped all symbols
+
+### Fixed
+
+- `get_file_outline` in **batch mode** (`file_paths=[...]`) returned empty
+  outlines for every file — models saw "the outline came back empty" and either
+  gave up or burned tokens re-querying (issue #319, reported by @MariusAdrian88,
+  corroborated by @ImJustWeed). The bug was confined to the MUNCH `fo1` encoder:
+  it only understood the **singular** response shape, where `symbols` sits at
+  the top level. Batch mode nests the data one level down (`results[].symbols`
+  with the count in `results[]._meta.symbol_count`), so the encoder emitted an
+  empty `s` symbols table and a blank `symbol_count` for every file. The Python
+  tool computed the outlines correctly; the encoding layer silently discarded
+  them on the way out — which is why it reproduced even on perfectly-indexed
+  files and looked config-dependent (only callers with compact encoding active
+  saw it). The encoder now detects the batch shape, flattens each file's symbols
+  into a single `file`-discriminated `s` table plus a per-file `results` table
+  (file / language / file_summary / symbol_count), and regroups them on decode.
+  Singular-mode output is unchanged. New batch round-trip regression test in
+  `tests/encoding/test_tier1_roundtrip.py`.
+
 ## [1.108.25] - 2026-05-26 - secret-file detection: basename + secret-store dirs
 
 ### Fixed
