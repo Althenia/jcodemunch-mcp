@@ -79,6 +79,8 @@ jcodemunch-mcp --help
 
 For MCP client configuration, `uvx` is usually the better choice because it runs the package on demand and avoids PATH headaches.
 
+> **`'uvx' is not recognized` (Windows / Cursor / any client)?** `uvx` ships with [uv](https://docs.astral.sh/uv/). Install it with `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`, then **fully restart your editor** so it picks up the new PATH. To skip uv entirely: `python -m pip install` the package and launch with `command: "python"`, `args: ["-m", "jcodemunch_mcp"]` instead.
+
 ---
 
 # 2. Add jCodeMunch to your MCP client

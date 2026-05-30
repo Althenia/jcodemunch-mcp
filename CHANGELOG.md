@@ -21,10 +21,11 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ### Documentation
 
-- README install section now tells Windows / Cursor users what to do when `'uvx'
-  is not recognized` (issue #320): install uv via the Astral one-liner and restart
-  the editor, or skip uvx entirely with `python -m pip install` and a
-  `python -m jcodemunch_mcp` launch. Version-agnostic, no wheel-pin.
+- README, QUICKSTART, and USER_GUIDE install sections now tell Windows / Cursor
+  users what to do when `'uvx' is not recognized` (issue #320): install uv via the
+  Astral one-liner and restart the editor, or skip uvx entirely with `python -m
+  pip install` and a `python -m jcodemunch_mcp` launch. Version-agnostic, no
+  wheel-pin.
 
 ## [1.108.26] - 2026-05-29 - get_file_outline batch mode dropped all symbols
 
