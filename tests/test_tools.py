@@ -1089,6 +1089,78 @@ class TestContainerDetection:
         assert "too broad to index safely" in result["error"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows UNC path semantics only")
+class TestWindowsUNCPathSafety:
+    """Windows UNC roots should be treated as server/share plus descendants."""
+
+    def test_unc_repo_at_share_child_is_not_too_broad(self, tmp_path):
+        from jcodemunch_mcp.tools import index_folder as index_folder_module
+
+        unc_repo = Path(r"\\server\share\repo")
+
+        with (
+            patch.object(
+                index_folder_module._config, "load_project_config", return_value=None
+            ),
+            patch.object(
+                index_folder_module._config,
+                "get",
+                side_effect=lambda key, default=None, repo=None: (
+                    [] if key == "trusted_folders" else default
+                ),
+            ),
+            patch(
+                "jcodemunch_mcp.tools.index_folder.Path.resolve",
+                return_value=unc_repo,
+            ),
+            patch("jcodemunch_mcp.tools.index_folder.Path.exists", return_value=True),
+            patch("jcodemunch_mcp.tools.index_folder.Path.is_dir", return_value=True),
+            patch.object(
+                index_folder_module, "discover_local_files", return_value=([], [], {})
+            ),
+        ):
+            result = index_folder_module.index_folder(
+                str(tmp_path / "repo"),
+                use_ai_summaries=False,
+                storage_path=str(tmp_path / "store"),
+            )
+
+        assert "too broad" not in result.get("error", "")
+        assert result["error"] == "No source files found"
+
+    def test_unc_share_root_remains_too_broad(self, tmp_path):
+        from jcodemunch_mcp.tools import index_folder as index_folder_module
+
+        unc_share_root = Path(r"\\server\share")
+
+        with (
+            patch.object(
+                index_folder_module._config, "load_project_config", return_value=None
+            ),
+            patch.object(
+                index_folder_module._config,
+                "get",
+                side_effect=lambda key, default=None, repo=None: (
+                    [] if key == "trusted_folders" else default
+                ),
+            ),
+            patch(
+                "jcodemunch_mcp.tools.index_folder.Path.resolve",
+                return_value=unc_share_root,
+            ),
+            patch("jcodemunch_mcp.tools.index_folder.Path.exists", return_value=True),
+            patch("jcodemunch_mcp.tools.index_folder.Path.is_dir", return_value=True),
+        ):
+            result = index_folder_module.index_folder(
+                str(tmp_path / "share"),
+                use_ai_summaries=False,
+                storage_path=str(tmp_path / "store"),
+            )
+
+        assert result["success"] is False
+        assert "too broad to index safely" in result["error"]
+
+
 class TestIndexFolderGitignoreWarning:
     """index_folder should warn when no root .gitignore exists and file count is large."""
 

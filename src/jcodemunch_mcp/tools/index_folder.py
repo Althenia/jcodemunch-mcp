@@ -128,6 +128,20 @@ def _is_container() -> bool:
     return False
 
 
+def _path_safety_part_count(path: Path) -> int:
+    r"""Count path components for the broad-root guard.
+
+    On Windows, pathlib stores a UNC share root such as ``\\server\share\`` as
+    one anchor component. Treat that anchor as server + share so
+    ``\\server\share\repo`` has the same logical depth as ``C:\Users\repo``,
+    while the share root itself remains too broad.
+    """
+    count = len(path.parts)
+    if os.name == "nt" and str(path.drive).startswith("\\\\"):
+        count += 1
+    return count
+
+
 @lru_cache(maxsize=512)
 def _is_trusted(
     folder_path: Path, trusted_folders: tuple, whitelist_mode: bool = True
@@ -952,7 +966,8 @@ def index_folder(
     # /workspace works out of the box while bare "/" is still rejected.
     container = _is_container()
     _MIN_PATH_PARTS = 2 if container else 3
-    if len(folder_path.parts) < _MIN_PATH_PARTS:
+    path_part_count = _path_safety_part_count(folder_path)
+    if path_part_count < _MIN_PATH_PARTS:
         if not is_trusted:
             error_msg = (
                 f"Resolved path '{folder_path}' is too broad to index safely "
@@ -971,7 +986,7 @@ def index_folder(
         logger.warning(warning_msg)
         warnings.append(warning_msg)
 
-    if container and len(folder_path.parts) < 3:
+    if container and path_part_count < 3:
         warning_msg = (
             f"Container environment detected — allowing shallow path '{folder_path}'. "
             "The minimum path depth has been relaxed from 3 to 2 components."
