@@ -564,8 +564,12 @@ class OpenAIBatchSummarizer(BaseSummarizer):
 
         completed_count = 0
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit via _run_batch (not _summarize_one_batch) so the circuit
+            # breaker is honored: once summarizer_max_failures consecutive
+            # batches fail, remaining batches short-circuit to signature
+            # fallback instead of hammering a dead endpoint.
             futures = {
-                executor.submit(self._summarize_one_batch, batch): batch
+                executor.submit(self._run_batch, batch): batch
                 for batch in batches
             }
             for future in as_completed(futures):

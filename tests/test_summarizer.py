@@ -1070,6 +1070,47 @@ def test_no_degradation_warning_when_summaries_usable(caplog):
     assert "fell back to generic signatures" not in caplog.text
 
 
+def test_openai_summarizer_circuit_breaker_trips():
+    """OpenAI provider honors the circuit breaker.
+
+    Regression: the OpenAIBatchSummarizer.summarize_batch override submitted
+    _summarize_one_batch directly, bypassing _run_batch and its
+    _circuit_broken check, so summarizer_max_failures never short-circuited
+    the OpenAI provider the way it does for Anthropic/Gemini. After the
+    default 3 consecutive failures, the remaining batches must short-circuit
+    to signature fallback without further HTTP calls.
+    """
+    mock_response = MagicMock()
+    mock_response.raise_for_status.side_effect = RuntimeError("500 Server Error")
+    mock_client = MagicMock()
+    mock_client.post.return_value = mock_response
+
+    # OPENAI_CONCURRENCY=1 forces sequential batch execution so the breaker
+    # trip point is deterministic; OPENAI_BATCH_SIZE=1 gives one symbol/batch.
+    # Both are read inside summarize_batch(), so the call must run while the
+    # patched environment is still in scope.
+    symbols = [_one_symbol(name=f"f{i}", sig=f"def f{i}():") for i in range(10)]
+    with patch.dict(
+        "os.environ",
+        {
+            "OPENAI_API_BASE": "http://localhost:11434/v1",
+            "OPENAI_BATCH_SIZE": "1",
+            "OPENAI_CONCURRENCY": "1",
+        },
+        clear=True,
+    ), patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer()
+        summarizer.client = mock_client
+        summarizer.summarize_batch(symbols)
+
+    # Breaker trips after 3 consecutive failures; the other 7 batches never
+    # reach the endpoint.
+    assert mock_client.post.call_count == 3
+    assert summarizer._circuit_broken is True
+    # Every symbol still received a signature fallback.
+    assert [s.summary for s in symbols] == [f"def f{i}():" for i in range(10)]
+
+
 def test_get_model_name_strips_whitespace():
     """get_model_name() strips surrounding whitespace from the model value."""
     with patch(

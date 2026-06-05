@@ -4,6 +4,18 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- The OpenAI-compatible summarizer now honors the circuit breaker. Its
+  `summarize_batch` override submitted `_summarize_one_batch` directly,
+  bypassing `_run_batch` and its `_circuit_broken` check, so
+  `summarizer_max_failures` never short-circuited the OpenAI provider the way
+  it does for Anthropic and Gemini. A dead or failing endpoint was hammered for
+  every batch instead of giving up after the configured number of consecutive
+  failures. The override now submits `_run_batch`, so once the breaker trips the
+  remaining batches fall straight through to signature summaries. Regression
+  test in `tests/test_summarizer.py`.
+
 ## [1.108.29] - 2026-06-05 - WRR signal fusion was inert (all weights resolved to 0.0)
 
 ### Fixed
