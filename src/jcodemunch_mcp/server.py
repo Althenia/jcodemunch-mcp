@@ -6393,6 +6393,23 @@ def main(argv: Optional[list[str]] = None):
         help="Emit structured JSON (repo_id/counts/languages/indexed_at/freshness/watcher_state/lock_holder)",
     )
 
+    # --- org-report / org-rollup (team SKU) ---
+    org_report_parser = subparsers.add_parser(
+        "org-report",
+        help="Record this seat's token savings under its org (JCODEMUNCH_ORG_ID)",
+    )
+    org_report_parser.add_argument("--org", help="Org identifier (overrides JCODEMUNCH_ORG_ID)")
+    org_report_parser.add_argument("--seat", help="Seat identifier (default: JCODEMUNCH_CLIENT_ID or hostname)")
+    org_report_parser.add_argument("--model", default="opus", choices=["sonnet", "opus", "haiku"], help="Rate for the $ figure")
+    org_report_parser.add_argument("--json", action="store_true", help="Emit JSON")
+
+    org_rollup_parser = subparsers.add_parser(
+        "org-rollup",
+        help="Aggregate token savings across all seats in an org",
+    )
+    org_rollup_parser.add_argument("--org", help="Org identifier (overrides JCODEMUNCH_ORG_ID)")
+    org_rollup_parser.add_argument("--json", action="store_true", help="Emit structured JSON (seats[] + totals)")
+
     # --- claude-md ---
     claude_md_parser = subparsers.add_parser(
         "claude-md",
@@ -7034,7 +7051,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "health", "file-risk", "observatory", "keyring"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "org-report", "org-rollup", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "health", "file-risk", "observatory", "keyring"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -7083,6 +7100,38 @@ def main(argv: Optional[list[str]] = None):
             init=getattr(args, "init", False),
             upgrade=getattr(args, "upgrade", False),
         )
+        return
+
+    if args.command == "org-report":
+        from .org.report import run_org_report
+        res = run_org_report(
+            model=getattr(args, "model", "opus"),
+            org_id=getattr(args, "org", None),
+            seat_id=getattr(args, "seat", None),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(res, indent=2))
+        elif res.get("error"):
+            print(f"error: {res['error']}", file=sys.stderr)
+        else:
+            print(f"recorded seat {res['seat_id']} in org {res['org_id']}: "
+                  f"{res['tokens_saved']} tokens, ${res['usd']:.2f}, {res['calls']} calls")
+        return
+
+    if args.command == "org-rollup":
+        from .org.store import org_rollup
+        org = getattr(args, "org", None) or os.environ.get("JCODEMUNCH_ORG_ID", "")
+        if not org:
+            print("error: provide --org or set JCODEMUNCH_ORG_ID", file=sys.stderr)
+            return
+        data = org_rollup(org)
+        if getattr(args, "json", False):
+            print(json.dumps(data, indent=2))
+        else:
+            t = data["totals"]
+            print(f"org {org}: {t['seat_count']} seats · {t['tokens_saved']} tokens · ${t['usd']:.2f} · {t['calls']} calls")
+            for s in data["seats"]:
+                print(f"  {s['seat_id']:<24} {s['tokens_saved']:>9} tok  ${s['usd']:>8.2f}  {s['calls']:>5} calls")
         return
 
     if args.command == "list-repos":

@@ -4,6 +4,22 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.38] - 2026-06-07 - Org rollup (team SKU): per-seat savings aggregation
+
+### Added
+
+- New `org` package + two CLIs for cross-seat token-savings aggregation (the
+  team/enterprise SKU). `org-report` computes this seat's transcript-derived
+  savings (reusing the `receipt` machinery) and records them under
+  `JCODEMUNCH_ORG_ID` keyed by seat + day; `org-rollup --json` aggregates all
+  seats in an org → `{org_id, seats[], totals}`. Backed by a transport-agnostic
+  SQLite store (`org/store.py`: `record_seat_report` upserts per seat+day,
+  `org_rollup` sums per seat). Self-hosted model: seats record into the org
+  host's store. Data is deliberately minimal — per-seat token/dollar/call counts
+  only; no code, content, or paths. The cross-machine HTTP front door (seats
+  POSTing to the org host) is the next increment over this same store. Powers
+  the jMunch Console org-rollup card. 5 tests in `tests/test_org_rollup.py`.
+
 ## [1.108.37] - 2026-06-07 - `repos_report` includes source_root
 
 ### Added
