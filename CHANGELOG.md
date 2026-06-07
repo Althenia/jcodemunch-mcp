@@ -4,6 +4,24 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.39] - 2026-06-07 - Org rollup HTTP transport (cross-machine seat reporting)
+
+### Added
+
+- `POST /org/report` ingest route on the org host — seats ship their savings
+  over HTTP instead of needing a co-located store. Mounted on both the SSE and
+  streamable-http transports (`org/http_routes.py`). Off by default, two-key
+  turn mirroring the runtime ingest endpoints: `JCODEMUNCH_HTTP_TOKEN` bearer
+  auth (existing Starlette middleware) + `JCODEMUNCH_ORG_INGEST_ENABLED=1`.
+  Reuses the runtime body-read (gzip + size cap) and JSON helpers; records via
+  the same `record_seat_report` sink as the local path.
+- `org-report` now POSTs to a remote org host when `--endpoint` /
+  `JCODEMUNCH_ORG_ENDPOINT` is set (httpx, with the bearer token), falling back
+  to local recording otherwise. New `org_ingest_enabled` config key +
+  `JCODEMUNCH_ORG_INGEST_ENABLED` env var. 5 tests in `tests/test_org_http.py`
+  (Starlette TestClient round-trip + gate + seat-reporter POST); verified
+  end-to-end over a real streamable-http server.
+
 ## [1.108.38] - 2026-06-07 - Org rollup (team SKU): per-seat savings aggregation
 
 ### Added

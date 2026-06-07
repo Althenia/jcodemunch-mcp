@@ -42,6 +42,7 @@ ENV_VAR_MAPPING = {
     "JCODEMUNCH_RUNTIME_MAX_ROWS": "runtime_max_rows",
     "JCODEMUNCH_RUNTIME_REDACT": "runtime_redact_enabled",
     "JCODEMUNCH_RUNTIME_INGEST_ENABLED": "runtime_ingest_enabled",
+    "JCODEMUNCH_ORG_INGEST_ENABLED": "org_ingest_enabled",
     "JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES": "runtime_ingest_max_body_bytes",
     "JCODEMUNCH_SUMMARIZER_CONCURRENCY": "summarizer_concurrency",
     "JCODEMUNCH_SUMMARIZER_MAX_FAILURES": "summarizer_max_failures",
@@ -388,6 +389,7 @@ DEFAULTS = {
     "runtime_max_rows": 100_000,
     "runtime_redact_enabled": True,
     "runtime_ingest_enabled": False,
+    "org_ingest_enabled": False,
     "runtime_ingest_max_body_bytes": 5_242_880,  # 5 MB
     "summarizer_concurrency": 4,
     "summarizer_max_failures": 3,
@@ -476,6 +478,7 @@ CONFIG_TYPES = {
     "runtime_max_rows": int,
     "runtime_redact_enabled": bool,
     "runtime_ingest_enabled": bool,
+    "org_ingest_enabled": bool,
     "runtime_ingest_max_body_bytes": int,
     "summarizer_concurrency": int,
     "summarizer_max_failures": int,

@@ -5265,13 +5265,16 @@ async def run_sse_server(host: str, port: int):
     # Phase 6: optional /runtime/* live-ingest routes (off by default; gated
     # by runtime_ingest_enabled config + JCODEMUNCH_HTTP_TOKEN auth).
     from .runtime.http_routes import make_runtime_routes
+    from .org.http_routes import make_org_routes
     runtime_routes = make_runtime_routes()
+    org_routes = make_org_routes()
 
     starlette_app = Starlette(
         routes=[
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse_transport.handle_post_message),
             *runtime_routes,
+            *org_routes,
         ],
         middleware=middleware,
     )
@@ -5448,12 +5451,15 @@ async def run_streamable_http_server(host: str, port: int):
 
     # Phase 6: optional /runtime/* live-ingest routes (off by default).
     from .runtime.http_routes import make_runtime_routes
+    from .org.http_routes import make_org_routes
     runtime_routes = make_runtime_routes()
+    org_routes = make_org_routes()
 
     starlette_app = Starlette(
         routes=[
             Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
             *runtime_routes,
+            *org_routes,
         ],
         middleware=middleware,
     )
@@ -6400,6 +6406,7 @@ def main(argv: Optional[list[str]] = None):
     )
     org_report_parser.add_argument("--org", help="Org identifier (overrides JCODEMUNCH_ORG_ID)")
     org_report_parser.add_argument("--seat", help="Seat identifier (default: JCODEMUNCH_CLIENT_ID or hostname)")
+    org_report_parser.add_argument("--endpoint", help="Org host URL to POST to (overrides JCODEMUNCH_ORG_ENDPOINT); omit to record locally")
     org_report_parser.add_argument("--model", default="opus", choices=["sonnet", "opus", "haiku"], help="Rate for the $ figure")
     org_report_parser.add_argument("--json", action="store_true", help="Emit JSON")
 
@@ -7108,13 +7115,17 @@ def main(argv: Optional[list[str]] = None):
             model=getattr(args, "model", "opus"),
             org_id=getattr(args, "org", None),
             seat_id=getattr(args, "seat", None),
+            endpoint=getattr(args, "endpoint", None),
         )
         if getattr(args, "json", False):
             print(json.dumps(res, indent=2))
         elif res.get("error"):
             print(f"error: {res['error']}", file=sys.stderr)
+        elif res.get("reported") is False:
+            print(f"report to {res.get('endpoint')} failed: {res.get('error')}", file=sys.stderr)
         else:
-            print(f"recorded seat {res['seat_id']} in org {res['org_id']}: "
+            via = "posted to " + res["endpoint"] if res.get("transport") == "http" else "recorded locally"
+            print(f"seat {res['seat_id']} in org {res['org_id']} ({via}): "
                   f"{res['tokens_saved']} tokens, ${res['usd']:.2f}, {res['calls']} calls")
         return
 
