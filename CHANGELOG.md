@@ -4,6 +4,35 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.42] - 2026-06-08 - Org-rollup license gate (team SKU billing)
+
+### Added
+
+- **License gate on `org-rollup` only** — the per-org savings dashboard is the
+  paid team-SKU feature; this gates it. Every individual tool, indexing, search,
+  and seat reporting (`org-report` / the `/org/report` ingest) stay free, so a
+  trial org keeps accruing data before it pays. New `org/license.py` verifies a
+  key online against the shared `validate.php` backend (`product=jcodemunch`;
+  Stripe webhooks populate it) — the host holds no secrets, GETs the public
+  endpoint, and trusts the JSON `valid` field (body over status code).
+- `JCODEMUNCH_LICENSE_KEY` env var + `license_key` config key (surfaced by
+  `config --json`, so the Console can show license status).
+- `license` CLI subcommand — `jcodemunch-mcp license [--key KEY] [--json]`
+  reports licensed / evaluation / unlicensed status, tier, and trial days left.
+
+### Behavior
+
+- **Sticky offline:** a server-confirmed key survives network failures (cached in
+  `<CODE_INDEX_PATH>/license.json`, re-confirmed at most every 7 days); only an
+  explicit `{"valid": false}` (revoked / expired / not found) blocks. A server
+  outage never punishes a paying customer.
+- **14-day grace window** from the first unlicensed `org-rollup` call lets a new
+  org evaluate the dashboard; after it lapses with no valid key, `org-rollup`
+  hard-refuses with a pricing link (JSON callers get `{error, license_mode,
+  get_license}`). Licensed/grace runs attach a `_license` block to the rollup.
+- 7 new tests in `tests/test_org_license.py`. Live backend contract verified
+  (`product=jcodemunch` → 200 JSON; the body carries `valid` even on 400).
+
 ## [1.108.41] - 2026-06-08 - Parse cache: bounded size (FIFO eviction)
 
 ### Added

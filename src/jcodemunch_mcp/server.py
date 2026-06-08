@@ -6417,6 +6417,13 @@ def main(argv: Optional[list[str]] = None):
     org_rollup_parser.add_argument("--org", help="Org identifier (overrides JCODEMUNCH_ORG_ID)")
     org_rollup_parser.add_argument("--json", action="store_true", help="Emit structured JSON (seats[] + totals)")
 
+    license_parser = subparsers.add_parser(
+        "license",
+        help="Check jCodeMunch license status (gates the org-rollup team feature)",
+    )
+    license_parser.add_argument("--key", help="Validate this key (else uses JCODEMUNCH_LICENSE_KEY / config)")
+    license_parser.add_argument("--json", action="store_true", help="Emit JSON status")
+
     # --- claude-md ---
     claude_md_parser = subparsers.add_parser(
         "claude-md",
@@ -7058,7 +7065,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "org-report", "org-rollup", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "health", "file-risk", "observatory", "keyring"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "health", "file-risk", "observatory", "keyring"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -7131,18 +7138,69 @@ def main(argv: Optional[list[str]] = None):
 
     if args.command == "org-rollup":
         from .org.store import org_rollup
+        from .org.license import check_gate
         org = getattr(args, "org", None) or os.environ.get("JCODEMUNCH_ORG_ID", "")
+        as_json = getattr(args, "json", False)
         if not org:
             print("error: provide --org or set JCODEMUNCH_ORG_ID", file=sys.stderr)
             return
+
+        # org-rollup is the team-SKU (paid) feature — gate it. Individual tools
+        # are untouched; seat reporting stays free so trial data accrues.
+        gate = check_gate()
+        if not gate["allowed"]:
+            if as_json:
+                print(json.dumps({
+                    "error": gate["reason"],
+                    "license_mode": gate["mode"],
+                    "get_license": gate["get_license"],
+                }, indent=2))
+            else:
+                print(f"org-rollup is unavailable: {gate['reason']}", file=sys.stderr)
+                print(f"  Get a license: {gate['get_license']}", file=sys.stderr)
+            return
+        if gate["mode"] == "grace":
+            print(f"note: {gate['reason']}  ({gate['get_license']})", file=sys.stderr)
+
         data = org_rollup(org)
-        if getattr(args, "json", False):
+        data["_license"] = {
+            "mode": gate["mode"],
+            "tier": gate.get("tier"),
+            "grace_days_left": gate.get("grace_days_left"),
+            "key": gate.get("key_masked"),
+        }
+        if as_json:
             print(json.dumps(data, indent=2))
         else:
             t = data["totals"]
             print(f"org {org}: {t['seat_count']} seats · {t['tokens_saved']} tokens · ${t['usd']:.2f} · {t['calls']} calls")
             for s in data["seats"]:
                 print(f"  {s['seat_id']:<24} {s['tokens_saved']:>9} tok  ${s['usd']:>8.2f}  {s['calls']:>5} calls")
+        return
+
+    if args.command == "license":
+        from .org.license import check_gate
+        key = getattr(args, "key", None)
+        if key:
+            os.environ["JCODEMUNCH_LICENSE_KEY"] = key  # validate this key for this run
+        gate = check_gate()
+        if getattr(args, "json", False):
+            print(json.dumps(gate, indent=2))
+        else:
+            mode = gate["mode"]
+            label = {"licensed": "licensed", "grace": "evaluation (unlicensed)", "blocked": "unlicensed"}[mode]
+            print(f"License: {label}")
+            if gate.get("key_masked"):
+                print(f"  Key:   {gate['key_masked']}")
+            if gate.get("tier"):
+                print(f"  Tier:  {gate['tier']}")
+            if mode == "grace":
+                print(f"  Trial: {gate['grace_days_left']} day(s) left")
+            print(f"  {gate['reason']}")
+            if gate.get("get_license"):
+                print(f"  Get a license: {gate['get_license']}")
+            if key:
+                print("  (set JCODEMUNCH_LICENSE_KEY or config `license_key` to persist this key)")
         return
 
     if args.command == "list-repos":
