@@ -4,6 +4,17 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+### Docs
+
+- `TWEAKCC.md`: stop pinning the routing snippets to fixed tweakcc fragment
+  filenames (`system-prompt-tool-usage-read-files.md`, etc.). Claude Code
+  reorganized its system prompt and tweakcc regenerates the fragment set per
+  installed CC version, so the hardcoded names had gone stale (#326, reported by
+  @FlightXamb). Snippets are now keyed to behavior with instructions to locate
+  the current section via `~/.tweakcc/system-prompts/` or the
+  Piebald-AI/claude-code-system-prompts mirror; refreshed the apply workflow
+  (`npx tweakcc --apply`) and rollback (`npx tweakcc --restore`).
+
 ## [1.108.44] - 2026-06-08 - config --json emits group + description per key
 
 ### Added
@@ -81,7 +92,6 @@ All notable changes to jcodemunch-mcp are documented here.
   Eviction is a no-op when under the cap, when disabled, or when the cache env
   var is unset (still a pure pass-through). 4 new tests in
   `tests/test_parse_cache.py` (9 total).
-
 ## [1.108.40] - 2026-06-07 - Content-addressed parse cache for shared-host indexing
 
 ### Added

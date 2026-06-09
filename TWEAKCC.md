@@ -4,6 +4,9 @@
 >
 > **Requires:** [tweakcc](https://github.com/Piebald-AI/tweakcc) — a tool that patches Claude Code's system prompts directly.
 
+> [!IMPORTANT]
+> **This doc no longer pins specific tweakcc filenames.** Earlier revisions mapped each routing snippet to a fixed fragment name (`system-prompt-tool-usage-read-files.md`, etc.). Claude Code has since reorganized its system prompt, and tweakcc regenerates the fragment set from whatever Claude Code version you have installed — so any hardcoded filename goes stale on the next CC release ([#326](https://github.com/jgravelle/jcodemunch-mcp/issues/326)). Instead, the routing snippets below are keyed to **behavior**, and you merge each into whichever current section governs that behavior. Find your version's sections by browsing `~/.tweakcc/system-prompts/` after running tweakcc once, or the full mirror at [Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts).
+
 ---
 
 ## Why system prompt routing?
@@ -19,6 +22,20 @@ jCodemunch offers three enforcement layers:
 | **System prompt rewrites** (this doc) | Patch Claude's core instructions | Strongest — model internalizes the preference |
 
 System prompt routing embeds jCodemunch preferences directly into the tool descriptions and usage instructions that Claude reads at the start of every conversation. The model never sees "use Grep for code search" — it sees "use search_symbols for code search" from the start.
+
+---
+
+## How tweakcc applies system prompt edits
+
+tweakcc patches Claude Code's minified `cli.js` from customizations it stores in `~/.tweakcc/config.json`. For system prompts specifically:
+
+1. Run tweakcc once (`npx tweakcc`). It detects your installed Claude Code version and writes one markdown file per system-prompt part into `~/.tweakcc/system-prompts/` (or `$XDG_CONFIG_HOME/tweakcc/system-prompts`), pre-populated with that version's default text.
+2. **Edit the relevant markdown files** to inject the jCodemunch routing snippets below.
+3. Run `npx tweakcc --apply` to patch `cli.js`.
+
+Updating Claude Code overwrites the patch, but your edits are remembered — just re-run `npx tweakcc --apply`. After a CC upgrade, re-check `~/.tweakcc/system-prompts/`: section names and boundaries can shift between versions, so confirm your snippets still landed in a section that's actually in the prompt.
+
+> tweakcc maintains the canonical, per-version prompt set (and a browsable mirror of every section) at [Piebald-AI/claude-code-system-prompts](https://github.com/Piebald-AI/claude-code-system-prompts). Use it to see how the current release structures tool-usage and task guidance before deciding where each snippet goes.
 
 ---
 
@@ -65,11 +82,15 @@ System prompts (deep)  -->  PostToolUse hook (auto)
 
 ---
 
-## Prompt Rewrites (8 files)
+## Routing snippets (by behavior)
 
-All files are tweakcc prompt fragments. Headers (YAML frontmatter in `<!-- -->`) are preserved from the originals — only the content below the closing `-->` is replaced.
+Each snippet is jCodemunch routing language to merge into whichever current Claude Code prompt section governs that behavior. Append it to the relevant section's markdown file under `~/.tweakcc/system-prompts/` (preserve the default text already there — add to it, don't wipe it), then `npx tweakcc --apply`.
 
-### 1. Read files (`system-prompt-tool-usage-read-files.md`)
+How to find the right section: open `~/.tweakcc/system-prompts/` and read the part that talks about reading files / searching / tool selection / starting a task. In recent releases this guidance is more consolidated than it used to be (fewer, broader sections), so several snippets may land in the same file. When in doubt, the [system-prompts mirror](https://github.com/Piebald-AI/claude-code-system-prompts) shows the full current text of every section.
+
+### 1. Reading files
+
+Target the section that tells Claude how/when to read files.
 
 ```
 Before reading any source code file, call jCodeMunch get_file_outline to see its
@@ -80,7 +101,9 @@ reading the whole file. Use Read for non-code files (.md, .json, .yaml, .toml,
 editing. Never use cat, head, tail, or sed to read any file.
 ```
 
-### 2. Search content (`system-prompt-tool-usage-search-content.md`)
+### 2. Searching content (strings, comments, patterns)
+
+Target the section covering content/grep-style search.
 
 ```
 To search code by symbol name (function, class, method, variable), use jCodeMunch
@@ -92,7 +115,9 @@ non-code file content (.md, .json, .yaml, .txt, .env, config files). Never invok
 grep or rg via Bash.
 ```
 
-### 3. Search files (`system-prompt-tool-usage-search-files.md`)
+### 3. Finding files / browsing structure
+
+Target the section covering file discovery (glob/find-style).
 
 ```
 To browse code project structure, use jCodeMunch get_file_tree (filter with
@@ -101,7 +126,9 @@ languages, and symbol counts. Use Glob when finding files by name pattern. Never
 use find or ls via Bash for file discovery.
 ```
 
-### 4. Reserve Bash (`system-prompt-tool-usage-reserve-bash.md`)
+### 4. Reserving Bash
+
+Target the section describing when to use Bash / the terminal.
 
 ```
 Reserve Bash exclusively for system commands and terminal operations: builds,
@@ -111,7 +138,9 @@ files through it. Use jCodeMunch MCP tools for all code reading and searching. I
 unsure whether a dedicated tool exists, default to the dedicated tool.
 ```
 
-### 5. Direct search (`system-prompt-tool-usage-direct-search.md`)
+### 5. Directed search
+
+Target the section on searching for a specific function/class/symbol.
 
 ```
 For directed codebase searches (finding a specific function, class, or method),
@@ -120,7 +149,9 @@ search. For text pattern searches in code, use jCodeMunch search_text. Use nativ
 search tools only when searching non-code file content.
 ```
 
-### 6. Delegate exploration (`system-prompt-tool-usage-delegate-exploration.md`)
+### 6. Broad exploration
+
+Target the section on exploring/orienting in an unfamiliar codebase.
 
 ```
 For broader codebase exploration, start with jCodeMunch: get_repo_outline for
@@ -130,7 +161,9 @@ instruct them to prefer jCodeMunch over native search tools for source code
 exploration.
 ```
 
-### 7. Subagent guidance (`system-prompt-tool-usage-subagent-guidance.md`)
+### 7. Subagent / delegation guidance
+
+Target the section on when and how to use subagents.
 
 ```
 Use subagents when the task matches the agent's description. Subagents are
@@ -141,7 +174,9 @@ get_file_outline) rather than Read, Grep, or Glob for source code. Avoid
 duplicating work that subagents are already doing.
 ```
 
-### 8. Read first (`system-prompt-doing-tasks-read-first.md`)
+### 8. Understand before editing
+
+Target the section on doing tasks / making code changes.
 
 ```
 Do not propose changes to code you haven't understood. Before modifying code, use
@@ -213,4 +248,4 @@ This layered approach gives the strongest enforcement with the least friction.
 
 ## Rollback
 
-To revert: restore original tweakcc prompt files, re-enable the CLAUDE.md policy block and PreToolUse hooks per [AGENT_HOOKS.md](AGENT_HOOKS.md).
+To revert: run `npx tweakcc --restore` to drop tweakcc's patches (or remove your snippets from the files under `~/.tweakcc/system-prompts/` and re-run `npx tweakcc --apply`), then re-enable the CLAUDE.md policy block and PreToolUse hooks per [AGENT_HOOKS.md](AGENT_HOOKS.md).
