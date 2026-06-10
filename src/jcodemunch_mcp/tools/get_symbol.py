@@ -54,6 +54,11 @@ def _verify_against_git_sha(
             text=True,
             timeout=10,
             check=False,
+            # Windows stdio-MCP deadlock guard: never inherit the JSON-RPC pipe
+            # as the git child's stdin (Git-for-Windows' cmd\git.exe wrapper
+            # blocks forever holding the handle, even for commands that don't
+            # read stdin). Mirrors the redirect across the other git spawns.
+            stdin=subprocess.DEVNULL,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return "git_unavailable"

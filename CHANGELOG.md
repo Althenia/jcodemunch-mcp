@@ -4,6 +4,37 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.49] - 2026-06-10 - Windows stdio git-stdin deadlock straggler
+
+### Fixed
+
+- **`get_symbol_source` (git-SHA verify path) could deadlock on Windows.**
+  `_verify_against_git_sha` in `tools/get_symbol.py` spawned
+  `git -C <root> show HEAD:<file>` without redirecting stdin. Over the MCP
+  stdio transport the server's stdin is the JSON-RPC pipe; a git child that
+  inherits it hangs forever, because Git for Windows' `cmd\git.exe` wrapper
+  holds the inherited pipe handle even for commands that never read stdin.
+  Added `stdin=subprocess.DEVNULL`. This is the same class of fix shipped for
+  jdocmunch in v1.69.1 (PR #30) and already present across jcm's other git
+  spawns (freshness, git_root, git_blame, index_store, resolve_repo, watcher,
+  the get_* risk/churn tools). `get_symbol_source` is a hot read tool, so this
+  was the highest-exposure straggler.
+- **`hook_event.py` git spawns hardened too.** A re-audit found the four git
+  spawns in the `hook-event` worktree CLI (`rev-parse`, `worktree add`,
+  `worktree remove`, `branch -D`) also lacked the redirect. They run as a
+  short-lived CLI hook (lower exposure than the server hot path) but inherit
+  the hook's stdin, so they got `stdin=subprocess.DEVNULL` in the same sweep.
+  **Every jcm git spawn now redirects stdin to DEVNULL.**
+
+### Notes
+
+- Pure defensive redirect — no behavior change on the success path (these git
+  commands don't read stdin). 1 new regression test
+  (`test_git_show_redirects_stdin_to_devnull` in
+  `tests/test_git_sha_verification.py`) asserts the `git show` call passes
+  `stdin=subprocess.DEVNULL`. Full suite 4514 passed / 10 skipped.
+  GitHub-release wheel (PyPI #308).
+
 ## [1.108.48] - 2026-06-09 - opt-in strict enforcement (deny native Read/Grep)
 
 ### Added

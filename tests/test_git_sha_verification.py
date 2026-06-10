@@ -128,3 +128,29 @@ class TestGitShaVerification:
             end_line=101,
         )
         assert result == "git_sha_mismatch"
+
+    def test_git_show_redirects_stdin_to_devnull(self, git_repo):
+        """Regression (v1.108.49): the ``git show HEAD:<file>`` spawn must pass
+        ``stdin=subprocess.DEVNULL``. Over the MCP stdio transport the server's
+        stdin is the JSON-RPC pipe; a git child inheriting it deadlocks Git for
+        Windows forever (its cmd\\git.exe wrapper holds the handle even for
+        commands that don't read stdin). ``get_symbol_source`` is a hot read
+        tool, so this redirect must never regress."""
+        from unittest import mock
+
+        fake = mock.MagicMock(returncode=0, stdout="def hello():\n    return 'world'\n")
+        with mock.patch(
+            "src.jcodemunch_mcp.tools.get_symbol.subprocess.run", return_value=fake
+        ) as run:
+            _verify_against_git_sha(
+                cached_source="def hello():\n    return 'world'",
+                source_root=str(git_repo),
+                file_path="module.py",
+                line=1,
+                end_line=2,
+            )
+        assert run.call_count == 1
+        _, kwargs = run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL, (
+            "git show must redirect stdin to DEVNULL (Windows stdio-MCP deadlock guard)"
+        )

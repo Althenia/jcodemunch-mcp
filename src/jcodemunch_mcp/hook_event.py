@@ -56,6 +56,7 @@ def _resolve_main_repo(cwd: str) -> str:
             ["git", "-C", cwd, "rev-parse", "--path-format=absolute",
              "--git-common-dir"],
             capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,  # don't inherit the hook's stdin pipe (Windows git wrapper deadlock)
         )
         if result.returncode == 0:
             git_common = result.stdout.strip()
@@ -144,6 +145,7 @@ def handle_hook_event(event_type: str, manifest_path: Path | None = None) -> Non
             ["git", "-C", cwd, "worktree", "add", resolved, "-b", branch_name],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,  # don't inherit the hook's stdin pipe (Windows git wrapper deadlock)
         )
         if result.returncode != 0:
             print(f"ERROR: git worktree add failed: {result.stderr.strip()}", file=sys.stderr)
@@ -157,6 +159,7 @@ def handle_hook_event(event_type: str, manifest_path: Path | None = None) -> Non
             ["git", "-C", repo_root, "worktree", "remove", resolved, "--force"],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,  # don't inherit the hook's stdin pipe (Windows git wrapper deadlock)
         )
         # Non-fatal: worktree may already be gone.
         if result.returncode != 0:
@@ -168,6 +171,7 @@ def handle_hook_event(event_type: str, manifest_path: Path | None = None) -> Non
             ["git", "-C", repo_root, "branch", "-D", branch_name],
             capture_output=True,
             text=True,
+            stdin=subprocess.DEVNULL,  # don't inherit the hook's stdin pipe (Windows git wrapper deadlock)
         )
         # Branch deletion is best-effort — no error if it doesn't exist.
 
