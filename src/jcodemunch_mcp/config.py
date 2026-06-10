@@ -1422,6 +1422,275 @@ def _inject_blocks_before_closing_brace(content: str, blocks: list[str]) -> str:
     return before + injection + "\n" + content[last_brace:]
 
 
+# --- General typed JSONC key writer (powers `config set`) -------------------- #
+
+# Keys that must not be set through `config set` (managed by the tooling, not users).
+_READONLY_CONFIG_KEYS = {"version"}
+
+
+def _skip_ws_and_comments(content: str, i: int) -> int:
+    """Advance past whitespace and // or /* */ comments starting at i."""
+    n = len(content)
+    while i < n:
+        c = content[i]
+        if c in " \t\r\n":
+            i += 1
+        elif c == "/" and i + 1 < n and content[i + 1] == "/":
+            j = content.find("\n", i)
+            i = n if j == -1 else j + 1
+        elif c == "/" and i + 1 < n and content[i + 1] == "*":
+            j = content.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+        else:
+            break
+    return i
+
+
+def _scan_jsonc_value_end(content: str, i: int) -> int:
+    """Return the index just past the JSON value beginning at/after i.
+
+    String-, bracket-, and comment-aware, so it spans multi-line arrays/objects
+    (including the `// "field",` comment lines embedded in the `languages` /
+    `meta_fields` template arrays). Primitive values run to the next delimiter.
+    """
+    n = len(content)
+    i = _skip_ws_and_comments(content, i)
+    if i >= n:
+        return i
+    c = content[i]
+    if c == '"':
+        i += 1
+        while i < n:
+            if content[i] == "\\":
+                i += 2
+                continue
+            if content[i] == '"':
+                return i + 1
+            i += 1
+        return i
+    if c in "{[":
+        depth = 0
+        while i < n:
+            ch = content[i]
+            if ch == '"':
+                i += 1
+                while i < n:
+                    if content[i] == "\\":
+                        i += 2
+                        continue
+                    if content[i] == '"':
+                        break
+                    i += 1
+                i += 1
+                continue
+            if ch == "/" and i + 1 < n and content[i + 1] == "/":
+                j = content.find("\n", i)
+                i = n if j == -1 else j + 1
+                continue
+            if ch == "/" and i + 1 < n and content[i + 1] == "*":
+                j = content.find("*/", i + 2)
+                i = n if j == -1 else j + 2
+                continue
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return i
+    # primitive: number / true / false / null / bareword
+    while i < n and content[i] not in ",}\n]":
+        if content[i] == "/" and i + 1 < n and content[i + 1] in "/*":
+            break
+        i += 1
+    while i > 0 and content[i - 1] in " \t":
+        i -= 1
+    return i
+
+
+def set_key(content: str, key: str, value: Any) -> str:
+    """Set ``key`` to ``value`` in JSONC ``content``, preserving comments.
+
+    Generalizes ``set_bool_key`` to any JSON type. Replaces the existing value
+    (active or commented-template form, single- or multi-line) in place and
+    uncomments the key; appends the key before the closing brace if absent. The
+    new value is written as compact single-line JSON. Trailing description
+    comments after the key line are preserved.
+    """
+    import re
+
+    literal = json.dumps(value, ensure_ascii=False)
+    pattern = re.compile(
+        r"^([ \t]*)(?://[ \t]*)?\"" + re.escape(key) + r"\"[ \t]*:",
+        re.MULTILINE,
+    )
+    m = pattern.search(content)
+    if not m:
+        return _inject_blocks_before_closing_brace(content, [f'  "{key}": {literal},'])
+
+    indent = m.group(1)
+    line_start = m.start()
+    val_end = _scan_jsonc_value_end(content, m.end())
+    # consume an optional trailing comma so we don't leave a doubled one
+    j = val_end
+    while j < len(content) and content[j] in " \t":
+        j += 1
+    if j < len(content) and content[j] == ",":
+        j += 1
+    return content[:line_start] + f'{indent}"{key}": {literal},' + content[j:]
+
+
+def _typename(t: Any) -> str:
+    return "null" if t is type(None) else getattr(t, "__name__", str(t))
+
+
+def coerce_config_value(key: str, raw: Any) -> Any:
+    """Coerce + type-validate a value for ``key`` against CONFIG_TYPES.
+
+    ``raw`` may already be a typed Python object (from a JSON API caller) or a
+    string (from the CLI). Strings are JSON-parsed when possible, else kept as a
+    bare string for str-typed keys. Raises ValueError on an unknown key or a
+    type the key does not accept.
+    """
+    allowed = CONFIG_TYPES.get(key)
+    if allowed is None:
+        raise ValueError(f"unknown config key: {key!r}")
+    allowed = allowed if isinstance(allowed, tuple) else (allowed,)
+
+    if isinstance(raw, str):
+        try:
+            val = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            val = raw  # bare, unquoted string
+    else:
+        val = raw
+
+    if val is None:
+        if type(None) in allowed:
+            return None
+    elif isinstance(val, bool):
+        if bool in allowed:
+            return val
+    elif isinstance(val, int):
+        if int in allowed:
+            return val
+        if float in allowed:
+            return float(val)
+    elif isinstance(val, float):
+        if float in allowed:
+            return val
+        if int in allowed and val.is_integer():
+            return int(val)
+    elif isinstance(val, list):
+        if list in allowed:
+            return val
+    elif isinstance(val, dict):
+        if dict in allowed:
+            return val
+    elif isinstance(val, str):
+        if str in allowed:
+            return val
+
+    # Fallback: a str-typed key takes the raw text verbatim (e.g. server_output
+    # "true" must stay the string "true", not the parsed boolean).
+    if str in allowed and isinstance(raw, str):
+        return raw
+
+    raise ValueError(
+        f"{key!r} expects {', '.join(_typename(t) for t in allowed)}; "
+        f"got {_typename(type(val))}"
+    )
+
+
+def set_config_value(key: str, raw: Any, storage_path: "Path | str | None" = None) -> Any:
+    """Validate + persist one config key to the global (or given) config.jsonc.
+
+    Returns the coerced value actually written. Creates the file from the
+    template if absent. Re-parses afterward and confirms the key now reads back
+    as intended (isolating this edit from any pre-existing config issues);
+    rolls the file back and raises ValueError if the write didn't land cleanly.
+    """
+    if key in _READONLY_CONFIG_KEYS:
+        raise ValueError(f"{key!r} is read-only and cannot be set")
+    value = coerce_config_value(key, raw)
+
+    if storage_path is None:
+        config_path = _global_config_path()
+    else:
+        config_path = Path(storage_path) / "config.jsonc"
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(generate_template(), encoding="utf-8")
+
+    original = config_path.read_text(encoding="utf-8")
+    updated = set_key(original, key, value)
+    config_path.write_text(updated, encoding="utf-8")
+
+    try:
+        loaded = json.loads(_strip_jsonc(updated))
+        if loaded.get(key) != value:
+            raise ValueError("write-back did not take effect")
+    except (json.JSONDecodeError, ValueError) as e:
+        config_path.write_text(original, encoding="utf-8")
+        raise ValueError(f"config set failed (rolled back): {e}")
+    return value
+
+
+def unset_key(content: str, key: str) -> str:
+    """Remove the ACTIVE entry for ``key`` (and its line) from JSONC content.
+
+    Only matches an uncommented key line so template/example comments are left
+    intact; the key then falls back to its built-in default. No-op when the key
+    isn't actively set.
+    """
+    import re
+
+    pattern = re.compile(
+        r"^([ \t]*)\"" + re.escape(key) + r"\"[ \t]*:", re.MULTILINE
+    )
+    m = pattern.search(content)
+    if not m:
+        return content
+    line_start = m.start()
+    j = _scan_jsonc_value_end(content, m.end())
+    while j < len(content) and content[j] in " \t":
+        j += 1
+    if j < len(content) and content[j] == ",":
+        j += 1
+    nl = content.find("\n", j)
+    end = len(content) if nl == -1 else nl + 1
+    return content[:line_start] + content[end:]
+
+
+def unset_config_value(key: str, storage_path: "Path | str | None" = None) -> bool:
+    """Clear one config key so its default applies. Returns True if a change was
+    written. Rolls back and raises if the result no longer parses."""
+    if key in _READONLY_CONFIG_KEYS:
+        raise ValueError(f"{key!r} is read-only and cannot be unset")
+    if key not in CONFIG_TYPES:
+        raise ValueError(f"unknown config key: {key!r}")
+
+    if storage_path is None:
+        config_path = _global_config_path()
+    else:
+        config_path = Path(storage_path) / "config.jsonc"
+    if not config_path.exists():
+        return False
+
+    original = config_path.read_text(encoding="utf-8")
+    updated = unset_key(original, key)
+    if updated == original:
+        return False
+    config_path.write_text(updated, encoding="utf-8")
+    try:
+        json.loads(_strip_jsonc(updated))
+    except (json.JSONDecodeError, ValueError) as e:
+        config_path.write_text(original, encoding="utf-8")
+        raise ValueError(f"config unset failed (rolled back): {e}")
+    return True
+
+
 def generate_template() -> str:
     """Return default config.jsonc content."""
     from . import __version__

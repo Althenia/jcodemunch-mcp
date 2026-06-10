@@ -6387,6 +6387,17 @@ def main(argv: Optional[list[str]] = None):
         action="store_true",
         help="Emit the effective configuration as structured JSON (key/type/value/default/source) for tooling",
     )
+    config_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["set", "unset"],
+        help="set <key> <value> to write a config key, or unset <key> to clear it (default applies)",
+    )
+    config_parser.add_argument("key", nargs="?", help="config key for set/unset")
+    config_parser.add_argument(
+        "value", nargs="?",
+        help="value for set: JSON (true, 7, [\"a\"], {\"k\":1}) or a bare string",
+    )
 
     # --- list-repos ---
     list_repos_parser = subparsers.add_parser(
@@ -7133,6 +7144,39 @@ def main(argv: Optional[list[str]] = None):
             logger.debug("credential env resolution skipped", exc_info=True)
 
     if args.command == "config":
+        action = getattr(args, "action", None)
+        if action in ("set", "unset"):
+            from . import config as _cfg
+            as_json = getattr(args, "json", False)
+            key = getattr(args, "key", None)
+            if not key:
+                _emit = (lambda d: print(json.dumps(d, indent=2))) if as_json \
+                    else (lambda d: print(d.get("error", ""), file=sys.stderr))
+                _emit({"success": False, "error": f"config {action} requires a key"})
+                sys.exit(2)
+            try:
+                if action == "set":
+                    if getattr(args, "value", None) is None:
+                        raise ValueError("config set requires a value")
+                    written = _cfg.set_config_value(key, args.value)
+                    result = {"success": True, "key": key, "value": written,
+                              "message": f"set {key} = {json.dumps(written)}"}
+                else:
+                    changed = _cfg.unset_config_value(key)
+                    result = {"success": True, "key": key, "changed": changed,
+                              "message": (f"cleared {key} (default applies)" if changed
+                                          else f"{key} was not set")}
+            except ValueError as e:
+                if as_json:
+                    print(json.dumps({"success": False, "key": key, "error": str(e)}, indent=2))
+                else:
+                    print(f"error: {e}", file=sys.stderr)
+                sys.exit(1)
+            if as_json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(result["message"])
+            return
         if getattr(args, "json", False):
             from . import config as _cfg
             print(json.dumps(_cfg.config_report(repo=str(Path.cwd())), indent=2))

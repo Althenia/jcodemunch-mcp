@@ -4,6 +4,32 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.51] - 2026-06-10 - `config set` / `config unset` CLI (typed JSONC write-back)
+
+### Added
+
+- **`jcodemunch-mcp config set <key> <value>`** and **`config unset <key>`** —
+  write a config key back to the global `config.jsonc`, preserving comments.
+  `<value>` is parsed as JSON (`true`, `7`, `0.5`, `["a","b"]`, `{"k":1}`,
+  `null`) or kept as a bare string for string-typed keys. Coerced + type-checked
+  against `CONFIG_TYPES`; unknown keys, wrong types, and the read-only `version`
+  key are rejected. `--json` emits `{success, key, value|changed, message|error}`
+  (exit 1 on error). `unset` clears a key so its built-in default applies.
+  Motivation: the jMunch Console's Config screen needs to become editable, and
+  the console drives jcm through the CLI.
+- **`config.set_key()` / `set_config_value()` / `coerce_config_value()` /
+  `unset_key()` / `unset_config_value()`** — general typed JSONC write-back,
+  generalizing `set_bool_key` to every value type. A new comment/bracket/string
+  aware value scanner (`_scan_jsonc_value_end`) lets the writer replace
+  multi-line array/object values in place (including the `// "field",` comment
+  lines embedded in the `languages` / `meta_fields` template arrays). Writes are
+  re-parsed and the edited key is confirmed to read back as intended before the
+  change is kept; on any failure the file is rolled back to its prior contents
+  (a pre-existing unrelated config issue can't block a valid edit).
+
+Additive: no behavior change to `config` (show), `config --json`, `--check`,
+`--init`, `--upgrade`. New tests in `tests/test_config_set.py`.
+
 ## [1.108.50] - 2026-06-10 - `delete-index` CLI subcommand
 
 ### Added
