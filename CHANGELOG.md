@@ -4,6 +4,33 @@ All notable changes to jcodemunch-mcp are documented here.
 
 ## [Unreleased]
 
+## [1.108.61] - 2026-06-18 - Every config key is now documented (no more "Other")
+
+### Fixed
+
+- **13 config keys shipped without a template section or description**, so
+  `config --json` (and any consumer of it, including the jMunch Console's grouped
+  config screen) emitted them under the `Other` catch-all group with an empty
+  `description`. The keys existed in `DEFAULTS`/`CONFIG_TYPES` but were never
+  added to the JSONC config template that `config_report` parses for group +
+  description metadata. Added all of them to `generate_template()` under proper
+  `=== Section ===` headers with inline comments:
+  - `watch_paths`, `watch_extra_ignore`, `watch_follow_symlinks`,
+    `watch_idle_timeout`, `watch_log` -> **Watcher**
+  - `runtime_ingest_enabled`, `org_ingest_enabled`,
+    `runtime_ingest_max_body_bytes` -> **Runtime & Org HTTP Ingest** (new section)
+  - `license_key` -> **Licensing** (new section)
+  - `cross_repo_default`, `discovery_hint` -> **Identity & Indexing Behavior**
+  - `agent_selector` -> **Agent Selector (model routing)** (new section)
+  - `enrichment` -> **Enrichment (LSP)** (new section)
+
+  The `Other` group is now empty. Because metadata is parsed from the template
+  (not the user's on-disk config), descriptions appear immediately on upgrade --
+  no `config --upgrade` required. New regression test
+  `TestConfigReportGrouping::test_no_key_falls_into_other_or_missing_description`
+  fails loudly if a future key is added to `DEFAULTS` without a template entry.
+  No config *value* behavior change. Surfaced via the jMunch Console.
+
 ## [1.108.60] - 2026-06-18 - `config --check` distinguishes sandbox-limited storage probes
 
 ### Fixed

@@ -2076,6 +2076,28 @@ def generate_template() -> str:
   // "rate_limit": 0,
   //   Max requests per minute per client IP. 0 = disabled (default).
 
+  // === Runtime & Org HTTP Ingest ===
+  // Off-by-default write endpoints on the HTTP transports. Each is a
+  // two-key turn: the flag below PLUS a JCODEMUNCH_HTTP_TOKEN bearer.
+  // "runtime_ingest_enabled": false,
+  //   Accept POST /runtime/otel, /runtime/sql, /runtime/stack (live trace
+  //   ingest). Off by default — these are write endpoints.
+  // "org_ingest_enabled": false,
+  //   Accept POST /org/report so seats can report savings to this org host
+  //   (team-SKU rollup). Off by default.
+  // "runtime_ingest_max_body_bytes": 5242880,
+  //   Per-request body cap for the ingest endpoints, in bytes (default
+  //   5 MB). Checked on both the on-wire and decompressed size (gzip-bomb
+  //   guard). Minimum 1024.
+
+  // === Licensing ===
+  // "license_key": "",
+  //   jCodeMunch license key. Gates the org-rollup team feature ONLY —
+  //   every individual tool, indexing, and search stays free. Validated
+  //   online against the licensing backend (sticky-offline; 14-day grace
+  //   for a new org). Also settable via JCODEMUNCH_LICENSE_KEY. Check
+  //   status with the `license` CLI.
+
   // === Watcher ===
   // "watch": false,
   //   Enable automatic reindexing when files change.
@@ -2083,6 +2105,22 @@ def generate_template() -> str:
   // "watch_debounce_ms": 2000,
   //   Milliseconds to wait after a file change before reindexing.
   //   Higher values reduce CPU usage but slower detection.
+  // "watch_paths": [],
+  //   Folders the `watch` CLI monitors when no paths are passed on the
+  //   command line. Empty = watch the indexed repo's own source root.
+  // "watch_extra_ignore": [],
+  //   Extra gitignore-style patterns the watcher ignores on top of the
+  //   index's own ignore rules (e.g. ["*.log", "build/"]). Changes to
+  //   matching files never trigger a reindex.
+  // "watch_follow_symlinks": false,
+  //   Follow symlinked directories while watching. Default false avoids
+  //   reindex loops and watching files outside the repo.
+  // "watch_idle_timeout": null,
+  //   Seconds of no file activity after which the watcher exits. null =
+  //   run until stopped. Handy for one-shot "watch until quiet" CI runs.
+  // "watch_log": null,
+  //   Path to a file the watcher appends reindex activity to.
+  //   null = log to stderr only.
   // "freshness_mode": "relaxed",
   //   relaxed - Default. Index remains queryable during reindex.
   //             Best for interactive use (IDE, chat).
@@ -2126,6 +2164,14 @@ def generate_template() -> str:
   //   history those bounds may still not be enough — set false to
   //   skip the probe entirely. Index still builds; only the blame
   //   metadata is omitted.
+  // "cross_repo_default": false,
+  //   When true, find_importers / get_blast_radius / get_dependency_graph
+  //   traverse OTHER indexed repos by default, not just the focal one. A
+  //   per-call `cross_repo` argument still overrides this. Default false
+  //   keeps results scoped to the repo you asked about.
+  // "discovery_hint": true,
+  //   Append a short "next tools to try" hint to certain results so an
+  //   agent can chain follow-up queries. Set false to suppress the hint.
 
   // === Summarization input policy ===
   // "summarize_from_docstrings": true,
@@ -2257,6 +2303,19 @@ def generate_template() -> str:
   // "path_map": "",
   //   Cross-platform path remapping. Format: "orig1=new1,orig2=new2".
   //   Allows indexes built on Linux to work on Windows and vice versa.
+
+  // === Agent Selector (model routing) ===
+  // "agent_selector": {{}},
+  //   Config for the optional model-advisory layer (complexity scoring →
+  //   model routing, modes off/manual/auto). Empty {{}} uses the built-in
+  //   defaults; populate to override the per-complexity model batting order.
+
+  // === Enrichment (LSP) ===
+  // "enrichment": {{}},
+  //   Opt-in compiler-grade call-graph resolution via Language Servers
+  //   (pyright / gopls / ts-language-server / rust-analyzer). Empty {{}} =
+  //   disabled (AST-only call graph). Populate to configure per-language
+  //   server commands.
 
   // === Mermaid Viewer Integration ===
   // "render_diagram_viewer_enabled": false,

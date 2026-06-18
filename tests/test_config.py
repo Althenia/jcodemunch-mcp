@@ -1401,6 +1401,27 @@ class TestConfigReportGrouping:
             assert "group" in entry and isinstance(entry["group"], str) and entry["group"]
             assert "description" in entry and isinstance(entry["description"], str)
 
+    def test_no_key_falls_into_other_or_missing_description(self):
+        """Every config key must be documented in the template — a real section
+        (not the 'Other' catch-all) AND a non-empty description. Regression for
+        the 13 keys (watch_paths/watch_extra_ignore/watch_follow_symlinks/
+        watch_idle_timeout/watch_log, runtime_ingest_enabled/org_ingest_enabled/
+        runtime_ingest_max_body_bytes, license_key, cross_repo_default,
+        discovery_hint, agent_selector, enrichment) that shipped template-less,
+        so jcm emitted them as Other/no-description and the Console showed blank
+        rows. Fails loudly if a future key is added to DEFAULTS without a
+        matching template entry."""
+        from src.jcodemunch_mcp.config import config_report
+        offenders = [
+            e["key"] for e in config_report()
+            if e["group"] == "Other" or not e["description"]
+        ]
+        assert not offenders, (
+            f"config keys missing a template section/description: {offenders}. "
+            "Add each to the JSONC template in generate_template() under a "
+            "=== Section === header with an inline comment."
+        )
+
     def test_known_keys_map_to_expected_sections(self):
         from src.jcodemunch_mcp.config import config_report, _config_meta, generate_template
         groups = {e["key"]: e["group"] for e in config_report()}
