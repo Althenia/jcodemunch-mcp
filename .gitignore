@@ -1,3 +1,6 @@
+# Session-logger artifact (not part of the project)
+LAST_SESSION.md
+
 # Python
 __pycache__/
 *.py[cod]
