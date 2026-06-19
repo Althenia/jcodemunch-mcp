@@ -249,8 +249,11 @@ def check_delete_safe(
     test_ref_count = 0
     try:
         from .check_references import check_references  # noqa: PLC0415
+        # Batch form (identifiers=[...]) so check_references returns its grouped
+        # `results` shape — singular (identifier=...) returns a flat response with
+        # no `results` key, which this loop would silently read as empty (#338).
         ref_out = check_references(
-            repo=f"{owner}/{name}", identifier=target_name,
+            repo=f"{owner}/{name}", identifiers=[target_name],
             search_content=True, max_content_results=20,
             storage_path=storage_path,
         )

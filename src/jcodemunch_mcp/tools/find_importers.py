@@ -270,6 +270,9 @@ def find_importers(
         storage_path: Custom storage path.
         cross_repo: When True, also search other indexed repos for cross-repo importers.
                     Defaults to the ``cross_repo_default`` config value (False).
+                    Package-level (whole-repo) scope, so it is only supported with
+                    singular ``file_path`` or a single-element ``file_paths`` batch;
+                    combining it with a multi-file batch returns an error (#339).
 
     Returns:
         Singular mode: dict with flat ``importers`` list and _meta envelope.
@@ -305,14 +308,31 @@ def find_importers(
     repo_id = f"{owner}/{name}"
 
     if file_paths is not None:
+        # Cross-repo importer lookup is package-level (whole-repo, not per-file —
+        # _find_cross_repo_importers ignores its file_path arg). Attaching one
+        # whole-repo result across a multi-file batch would either drop the
+        # evidence (the old `""` path) or imply per-file precision that does not
+        # exist. Fail closed and point the caller at singular calls (#339).
+        if cross_repo and len(file_paths) > 1:
+            return {
+                "error": (
+                    "cross_repo=true is not supported with a multi-file 'file_paths' "
+                    "batch: cross-repo importer lookup is package-level, not per-file. "
+                    "Use singular 'file_path' calls for cross-repo evidence."
+                ),
+                "_meta": {
+                    "cross_repo_scope": "package",
+                    "file_count": len(file_paths),
+                },
+            }
         result = _find_importers_batch(file_paths, index, max_results, owner, name, start)
         if cross_repo:
+            # len(file_paths) == 1 here — equivalent to the singular cross-repo path.
             try:
                 from .list_repos import list_repos
                 all_repos = list_repos(storage_path=storage_path).get("repos", [])
                 cross_results = _find_cross_repo_importers(
-                    file_paths[0] if len(file_paths) == 1 else "",
-                    repo_id, all_repos, store, owner, name,
+                    file_paths[0], repo_id, all_repos, store, owner, name,
                 )
                 if cross_results and "results" in result:
                     # Attach cross-repo results to the batch response

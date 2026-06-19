@@ -2,6 +2,35 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.63] - 2026-06-19 - Composite preflights consume reference evidence; cross-repo batch fails closed
+
+### Fixed
+
+- **`check_edit_safe` and `check_delete_safe` no longer drop identifier
+  reference evidence** (issue #338, reported by @mmashwani). Both composite
+  preflights called `check_references` in singular mode (`identifier=...`), which
+  returns a flat response with top-level `import_references` / `content_references`
+  and no `results` key, but then iterated the batch-only `results` array. The
+  identifier content-reference signal was therefore always counted as zero, so a
+  symbol still referenced by a duck-typed/string-dispatched call site (no import
+  edge) could be reported `safe_to_delete`. Both call sites now use the batch form
+  (`identifiers=[target_name]`), which produces the grouped `results` shape the
+  loops already expect — the external preflight response shape is unchanged.
+- **`find_importers(file_paths=[...], cross_repo=true)` no longer silently drops
+  cross-repo evidence on multi-file batches** (issue #339, reported by
+  @mmashwani). The batch branch passed an empty file path into the cross-repo
+  helper for batches of more than one file. Because `_find_cross_repo_importers`
+  is package-level (it resolves the *repo's* package importers, not a per-file
+  result), attaching one whole-repo result across a batch would either drop the
+  evidence or imply a per-file precision that does not exist. The combination now
+  **fails closed** with a clear error directing callers to singular `file_path`
+  calls for cross-repo evidence; a single-element `file_paths` batch with
+  `cross_repo=true` is still honored (equivalent to the singular path).
+- New regression tests `tests/test_v1_108_63.py` (7 cases): content-reference
+  blocking on delete/edit preflights with a no-false-positive orphan guard, and
+  the cross-repo batch contract (multi-file fails closed, single-file allowed,
+  no-cross-repo batch and singular paths unaffected).
+
 ## [1.108.62] - 2026-06-19 - Index templating-language files over a supported underlying language
 
 ### Added

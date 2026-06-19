@@ -1391,7 +1391,7 @@ def _build_tools_list() -> list[Tool]:
                     "file_path": {"type": "string", "description": "Target file path within the repo (e.g. 'src/features/intake/IntakeService.js'). Use for single-file queries. Cannot be used together with file_paths."},
                     "file_paths": {"type": "array", "items": {"type": "string"}, "description": "List of target file paths for batch queries. Returns a results array. Cannot be used together with file_path."},
                     "max_results": {"type": "integer", "default": 50, "description": "Maximum results per file"},
-                    "cross_repo": {"type": "boolean", "default": False, "description": "When true, also search other indexed repos for cross-repo importers. Default: false (or JCODEMUNCH_CROSS_REPO_DEFAULT env var)."},
+                    "cross_repo": {"type": "boolean", "default": False, "description": "When true, also search other indexed repos for cross-repo importers (package-level scope). Default: false (or JCODEMUNCH_CROSS_REPO_DEFAULT env var). Only valid with singular file_path or a single-element file_paths batch; combined with a multi-file file_paths batch it returns an error (use singular calls for cross-repo evidence)."},
                 },
                 "required": ["repo"],
             },
