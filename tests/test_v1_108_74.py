@@ -55,7 +55,11 @@ async def test_disabled_tool_path_is_error(monkeypatch):
 async def test_success_stays_plain_list_not_iserror():
     """Success results stay a plain content list (SDK wraps them isError=False),
     so existing consumers that read content[0].text are unaffected."""
-    res = await call_tool("list_repos", {})
+    # Force JSON so the body is deterministic; the success path is otherwise
+    # free to MUNCH-encode (compact), which is not json.loads-able. The contract
+    # under test is the RETURN SHAPE: success stays a plain content list, never a
+    # CallToolResult, so the SDK wraps it isError=False.
+    res = await call_tool("list_repos", {"format": "json"})
     assert not isinstance(res, CallToolResult)
     assert isinstance(res, list) and res
     assert isinstance(res[0], TextContent)
