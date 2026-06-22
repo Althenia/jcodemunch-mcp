@@ -2,6 +2,41 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.69] - 2026-06-21 - Durable-change delivery: get_delivery_metrics / delivery CLI
+
+### Added
+
+- **A read-only measure of how much got *done*, not how much activity happened.**
+  The suite shows tokens used and tokens saved (input). It had no honest output
+  measure — the gap that lets teams reward raw volume (more commits, more tokens)
+  to the detriment of their pocketbooks. New `get_delivery_metrics` MCP tool +
+  `delivery` CLI mine the local git history over a window and classify each
+  non-merge commit into one mutually-exclusive bucket by precedence:
+  `revert_authored` (undoes earlier work), `reverted` (a later commit reverts
+  it), `reworked` (a file it touched was re-touched by a later commit within
+  `rework_horizon_days` — churn-back), or `durable` (landed and stuck). The
+  `commits_durable` count is the intended numerator for a cost-per-outcome ratio:
+  divide AI spend over the same window by it to show how much was delivered for
+  how little, instead of rewarding throughput.
+- **Hub-file exclusion keeps the rework signal honest.** Files co-touched by an
+  outsized share of window commits (CHANGELOG, version files, a monolithic
+  dispatch module) are shared ledgers, not evidence that a specific earlier
+  commit was redone, so they're excluded from the rework computation
+  (auditable via `_meta.hub_files_excluded`). Without this, hot files flagged
+  nearly every commit as rework (93% on this repo's own history); with it, the
+  rate is believable (38%).
+- **Durability is reported as trailing, not hidden.** Commits inside the horizon
+  haven't had time to be reworked, so they're surfaced as `commits_provisional`
+  (counted durable for now, not yet settled). Attribution is commit-level and
+  approximate by design — this is a diagnostic trend, not a score to chase
+  (rewarding the number itself just re-invents the proxy-gaming it replaces).
+- `delivery [repo] [--window-days N] [--rework-horizon-days N] [--cost DOLLARS]
+  [--json]`: passing `--cost` prints the headline cost-per-durable-change. The
+  tool is standard-tier (alongside `get_churn_rate`/`get_hotspots`); `core_compact`
+  is unaffected. Tool count 84→85 (full). New `tests/test_delivery_metrics.py`
+  (7) covering bucket partition, hub exclusion, horizon-zero, and the honest
+  no-git / empty-window paths.
+
 ## [1.108.68] - 2026-06-21 - Retrieval-regret loop: suggest_corrections / reflect
 
 ### Added

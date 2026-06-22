@@ -71,7 +71,7 @@ _CANONICAL_TOOL_NAMES: tuple[str, ...] = (
     "get_tectonic_map", "get_signal_chains",
     "render_diagram", "get_project_intel", "list_workspaces",
     # Quality & Metrics
-    "get_symbol_complexity", "get_churn_rate", "get_hotspots",
+    "get_symbol_complexity", "get_churn_rate", "get_delivery_metrics", "get_hotspots",
     "get_repo_health", "get_symbol_importance", "get_repo_map", "find_dead_code",
     "get_dead_code_v2", "get_untested_symbols", "find_similar_symbols", "search_ast",
     # Diffs & Embeddings
@@ -127,7 +127,8 @@ _SNIPPET_TOOL_CATEGORIES: list[tuple[str, list[str]]] = [
                       "get_signal_chains", "render_diagram",
                       "get_project_intel", "list_workspaces",
                       "get_group_contracts"]),
-    ("Quality & Metrics", ["get_symbol_complexity", "get_churn_rate", "get_hotspots",
+    ("Quality & Metrics", ["get_symbol_complexity", "get_churn_rate",
+                            "get_delivery_metrics", "get_hotspots",
                             "get_repo_health", "diff_health_radar",
                             "get_file_risk", "get_symbol_importance",
                             "get_repo_map", "find_similar_symbols",
@@ -182,7 +183,7 @@ _TOOL_TIER_STANDARD: frozenset[str] = _TOOL_TIER_CORE | frozenset({
     # Symbol navigation
     "find_implementations",
     # Quality & Metrics
-    "get_symbol_complexity", "get_churn_rate", "get_hotspots",
+    "get_symbol_complexity", "get_churn_rate", "get_delivery_metrics", "get_hotspots",
     "get_symbol_importance", "get_repo_map", "find_dead_code", "get_dead_code_v2",
     "get_untested_symbols", "find_similar_symbols",
     "get_repo_health", "search_ast", "winnow_symbols",
@@ -2754,6 +2755,43 @@ def _build_tools_list() -> list[Tool]:
             },
         ),
         Tool(
+            name="get_delivery_metrics",
+            description=(
+                "Quantify durable-change delivery over a window: of the non-merge commits "
+                "in the last window_days, how many landed and stuck (commits_durable) vs were "
+                "reverted or re-touched within rework_horizon_days (churn-back). commits_durable "
+                "is the honest numerator for a cost-per-outcome ratio — divide AI spend over the "
+                "same window by it to show how much got done for how little, instead of rewarding "
+                "raw activity. Hub files co-touched by most commits (CHANGELOG, version, a "
+                "monolithic dispatch module) are excluded from the rework signal (auditable via "
+                "_meta.hub_files_excluded). Durability is trailing: commits inside the horizon are "
+                "flagged commits_provisional (not yet settled). Diagnostic trend, not a score to "
+                "chase. Requires a locally indexed repo (index_folder); GitHub-indexed repos are "
+                "not supported."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier (owner/repo or just repo name)",
+                    },
+                    "window_days": {
+                        "type": "integer",
+                        "description": "Look-back window in days (default 30).",
+                        "default": 30,
+                    },
+                    "rework_horizon_days": {
+                        "type": "integer",
+                        "description": "Days within which a re-touch counts as churn-back; also "
+                                       "defines the provisional tail (default 14).",
+                        "default": 14,
+                    },
+                },
+                "required": ["repo"],
+            },
+        ),
+        Tool(
             name="get_hotspots",
             description=(
                 "Return the top-N highest-risk symbols ranked by hotspot score = "
@@ -4866,6 +4904,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     repo=arguments["repo"],
                     target=arguments["target"],
                     days=arguments.get("days", 90),
+                    storage_path=storage_path,
+                )
+            )
+        elif name == "get_delivery_metrics":
+            from .tools.get_delivery_metrics import get_delivery_metrics
+            result = await asyncio.to_thread(
+                functools.partial(
+                    get_delivery_metrics,
+                    repo=arguments["repo"],
+                    window_days=arguments.get("window_days", 30),
+                    rework_horizon_days=arguments.get("rework_horizon_days", 14),
                     storage_path=storage_path,
                 )
             )
@@ -7352,6 +7401,24 @@ def main(argv: Optional[list[str]] = None):
     health_parser.add_argument("--storage-path", default=None,
         help="Override index storage location.")
 
+    # --- delivery ---
+    delivery_parser = subparsers.add_parser(
+        "delivery",
+        help="Print durable-change delivery metrics (and optional cost-per-outcome) for a window.",
+    )
+    delivery_parser.add_argument("repo", nargs="?", default=".",
+        help="Repo identifier (path, owner/name, or bare display name). Defaults to '.' (cwd).")
+    delivery_parser.add_argument("--window-days", type=int, default=30,
+        help="Look-back window in days (default 30).")
+    delivery_parser.add_argument("--rework-horizon-days", type=int, default=14,
+        help="Days within which a re-touch counts as churn-back (default 14).")
+    delivery_parser.add_argument("--cost", type=float, default=None,
+        help="AI spend (dollars) over the same window; prints cost-per-durable-change.")
+    delivery_parser.add_argument("--json", action="store_true",
+        help="Emit the structured payload as JSON.")
+    delivery_parser.add_argument("--storage-path", default=None,
+        help="Override index storage location.")
+
     # --- digest ---
     digest_parser = subparsers.add_parser(
         "digest",
@@ -7584,7 +7651,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "health", "file-risk", "observatory", "keyring"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "health", "file-risk", "observatory", "keyring"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -8012,6 +8079,18 @@ def main(argv: Optional[list[str]] = None):
         if args.storage_path:
             argv += ["--storage-path", args.storage_path]
         sys.exit(health_main(argv))
+
+    if args.command == "delivery":
+        from .cli.delivery import main as delivery_main
+        argv = [args.repo, "--window-days", str(args.window_days),
+                "--rework-horizon-days", str(args.rework_horizon_days)]
+        if args.cost is not None:
+            argv += ["--cost", str(args.cost)]
+        if args.json:
+            argv += ["--json"]
+        if args.storage_path:
+            argv += ["--storage-path", args.storage_path]
+        sys.exit(delivery_main(argv))
 
     if args.command == "digest":
         from .cli.digest import main as digest_main
