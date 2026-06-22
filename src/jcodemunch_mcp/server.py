@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent, Resource, Prompt, PromptMessage, GetPromptResult
+from mcp.types import Tool, TextContent, Resource, Prompt, PromptMessage, GetPromptResult, CallToolResult
 
 from . import __version__
 from . import config as config_module
@@ -4046,7 +4046,7 @@ async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": f"Unknown front-door tool '{name}'"}))]
 
 
-async def _handle_order(arguments: dict) -> list[TextContent]:
+async def _handle_order(arguments: dict) -> list[TextContent] | CallToolResult:
     """order(action, args): validate against the catalog + charter gate, then
     re-enter the normal pipeline for the resolved action."""
     action = arguments.get("action")
@@ -4081,7 +4081,7 @@ def _handle_menu(arguments: dict) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
 
 
-async def _handle_route(arguments: dict) -> list[TextContent]:
+async def _handle_route(arguments: dict) -> list[TextContent] | CallToolResult:
     """route(task, repo?, execute?, model?): intent -> recommended action(s),
     optionally dispatching the top one in the same call."""
     task = arguments.get("task")
@@ -4120,13 +4120,30 @@ async def _handle_route(arguments: dict) -> list[TextContent]:
         if model and action == "plan_turn":
             exec_args["model"] = model
         result = await call_tool(action, exec_args)
-        routed = {"tool": "route", "task": task, "executed_action": action, "args": exec_args}
-        return [TextContent(type="text", text=json.dumps(routed, separators=(",", ":")))] + list(result)
+        head = TextContent(type="text", text=json.dumps(
+            {"tool": "route", "task": task, "executed_action": action, "args": exec_args},
+            separators=(",", ":")))
+        if isinstance(result, CallToolResult):
+            # The routed action failed (isError); surface its content under the
+            # route envelope and propagate the error signal rather than list()-ing
+            # a non-iterable CallToolResult.
+            return CallToolResult(content=[head, *result.content], isError=result.isError)
+        return [head] + list(result)
     return [TextContent(type="text", text=json.dumps(payload, separators=(",", ":")))]
 
 
+def _error_call_result(text: str) -> CallToolResult:
+    """Wrap an error payload so MCP clients that branch on ``isError`` see the
+    failure (F-P01), while the JSON body stays in ``content`` for in-band
+    parsers (the v1.108.30 contract). Success results stay a plain
+    ``list[TextContent]`` (the SDK wraps them ``isError=False``), so this is
+    additive on the wire — only failures gain the ``isError`` signal.
+    """
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
 @server.call_tool(validate_input=False)
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     """Handle tool calls."""
     _signal_handshake()
     storage_path = os.environ.get("CODE_INDEX_PATH")
@@ -4147,9 +4164,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             try:
                 jsonschema.validate(instance=arguments, schema=schema)
             except jsonschema.ValidationError as e:
-                return [TextContent(type="text", text=json.dumps(
+                return _error_call_result(json.dumps(
                     {"error": f"Input validation error: {e.message}"}, indent=2
-                ))]
+                ))
 
         # The Counter front door: order/menu/route. Handled before repo-scoped
         # strict-freshness/auto-watch (the front door isn't repo-scoped; order
@@ -4167,7 +4184,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 arguments.get("query", ""), bool(arguments.get("is_regex", False))
             )
             if _arg_err is not None:
-                return [TextContent(type="text", text=json.dumps(_arg_err, indent=2))]
+                return _error_call_result(json.dumps(_arg_err, indent=2))
 
         # Strict freshness mode: wait for any in-progress reindex to complete
         # before serving query results (except for write/index tools).
@@ -4185,13 +4202,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         allow_disable_tier = config_module.get("allow_disabling_tier_controls", False, repo=repo_arg)
         protected_at_call = frozenset() if allow_disable_tier else _UNDISABLEABLE_TOOLS
         if name not in protected_at_call and config_module.is_tool_disabled(name, repo=repo_arg):
-            return [TextContent(type="text", text=json.dumps({
+            return _error_call_result(json.dumps({
                 "error": (
                     f"Tool '{name}' is disabled in this project's configuration. "
                     f"Project-level tool disabling is set via the 'disabled_tools' key "
                     f"in the .jcodemunch.jsonc file. Remove '{name}' from 'disabled_tools' to re-enable."
                 )
-            }, indent=2))]
+            }, indent=2))
 
         # Auto-watch: ensure unwatched repos are indexed before tool execution
         try:
@@ -5443,7 +5460,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         except Exception:
             logger.debug("Compact encoding failed; emitting JSON", exc_info=True)
 
-        return [TextContent(type="text", text=json.dumps(result, separators=(',', ':')))]
+        _text = json.dumps(result, separators=(',', ':'))
+        if isinstance(result, dict) and "error" in result:
+            # In-band tool error (e.g. ambiguous/not-found repo, Unknown tool).
+            # Carry the same JSON body but flag isError for clients that branch
+            # on it (F-P01); the v1.108.30 passthrough already kept errors JSON.
+            _call_ok = False
+            return _error_call_result(_text)
+        return [TextContent(type="text", text=_text)]
 
     except KeyError as e:
         _call_ok = False
@@ -5461,8 +5485,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "error": f"Internal error processing {name}",
                 "summary": f"KeyError: {e}",
             }
-            return [TextContent(type="text", text=json.dumps(payload, separators=(',', ':')))]
-        return [TextContent(type="text", text=json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, separators=(',', ':')))]
+            return _error_call_result(json.dumps(payload, separators=(',', ':')))
+        return _error_call_result(json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, separators=(',', ':')))
     except Exception as exc:
         _call_ok = False
         logger.error("call_tool %s failed", name, exc_info=True)
@@ -5474,7 +5498,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "error": f"Internal error processing {name}",
             "summary": summary,
         }
-        return [TextContent(type="text", text=json.dumps(payload, separators=(',', ':')))]
+        return _error_call_result(json.dumps(payload, separators=(',', ':')))
     finally:
         try:
             from .storage.token_tracker import record_tool_latency

@@ -210,6 +210,7 @@ class TestSearchTextValidation:
             "search_text",
             {"repo": "some/repo", "query": "a" * 204, "is_regex": True},
         ))
-        text = out[0].text
+        text = out.content[0].text  # arg-validation error → CallToolResult (isError, F-P01)
+        assert out.isError is True
         assert "Regex too long" in text
         assert touched == [], f"pre-dispatch work ran before validation: {touched}"

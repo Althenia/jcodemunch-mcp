@@ -41,7 +41,12 @@ def _surface(value):
 
 
 def _call(name, args):
-    return json.loads(asyncio.run(server.call_tool(name, args))[0].text)
+    res = asyncio.run(server.call_tool(name, args))
+    # call_tool returns a plain content list on success and a CallToolResult
+    # (isError) on failure (F-P01); read the content uniformly.
+    from mcp.types import CallToolResult
+    content = res.content if isinstance(res, CallToolResult) else res
+    return json.loads(content[0].text)
 
 
 # --- 1. Full surface: front door hidden, behavior unchanged ---------------- #

@@ -2,6 +2,25 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.74] - 2026-06-22 - Harden: tool errors carry isError (MCP protocol conformance)
+
+### Changed
+
+- **Tool failures now set `isError` on the result.** Errors were returned in-band
+  only: a `{"error": ...}` JSON body inside a plain content list, which the SDK
+  wraps as `CallToolResult(isError=False)`. A non-Claude MCP client that branches
+  on `isError` therefore saw a failure as a success (PRD F-P01). `call_tool` now
+  returns a `CallToolResult(isError=True)` for every failure path (input
+  validation, disabled-tool, in-band tool error, "Unknown tool", missing-argument,
+  and internal exceptions), carrying the **same** JSON body in `content` so the
+  in-band contract (v1.108.30) still holds. Successful calls stay a plain
+  `list[TextContent]` (the SDK wraps them `isError=False`), so the wire change is
+  purely additive: only failures gain the `isError` signal. The `route` front door
+  was updated to surface a routed action's error under its envelope instead of
+  `list()`-ing a non-iterable `CallToolResult`. New `tests/test_v1_108_74.py` (4);
+  existing error-path tests updated to read `result.content[0].text` and assert
+  `isError`.
+
 ## [1.108.73] - 2026-06-22 - Harden: HTTP ingest fails closed without a token + redaction currency
 
 ### Security

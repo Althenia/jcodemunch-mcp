@@ -203,7 +203,8 @@ class TestDispatcherKeyError:
 
         monkeypatch.setattr(ss, "search_symbols", _boom)
         out = asyncio.run(call_tool("search_symbols", {"repo": repo, "query": "alpha"}))
-        payload = json.loads(out[0].text)
+        payload = json.loads(out.content[0].text)  # internal error → CallToolResult (isError, F-P01)
+        assert out.isError is True
         assert "Internal error" in payload.get("error", ""), payload
         assert "Missing required argument" not in payload.get("error", ""), payload
 
@@ -225,7 +226,8 @@ class TestDispatcherKeyError:
 
         monkeypatch.setattr(ss, "search_symbols", _boom)
         out = asyncio.run(call_tool("search_symbols", {"repo": repo, "query": "alpha"}))
-        payload = json.loads(out[0].text)
+        payload = json.loads(out.content[0].text)  # internal error → CallToolResult (isError, F-P01)
+        assert out.isError is True
         assert payload.get("error") == "Internal error processing search_symbols", payload
         assert "internal_cache_key" in payload.get("summary", ""), payload
 

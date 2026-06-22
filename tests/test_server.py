@@ -386,8 +386,10 @@ async def test_call_tool_validation_error_returns_json_error():
     """call_tool returns a JSON error when coerced arguments still fail validation."""
     result = await call_tool("search_symbols", {"repo": "owner/repo", "query": "foo", "max_results": "not_an_int"})
 
-    assert len(result) == 1
-    payload = json.loads(result[0].text)
+    from mcp.types import CallToolResult
+    assert isinstance(result, CallToolResult)  # errors now carry isError (F-P01)
+    assert result.isError is True
+    payload = json.loads(result.content[0].text)
     assert "error" in payload
     assert "Input validation error" in payload["error"]
 
@@ -398,8 +400,10 @@ async def test_call_tool_unexpected_coerce_error_returns_json():
     with patch("jcodemunch_mcp.server._ensure_tool_schemas", side_effect=RuntimeError("boom")):
         result = await call_tool("index_folder", {"path": "/tmp"})
 
-    assert len(result) == 1
-    payload = json.loads(result[0].text)
+    from mcp.types import CallToolResult
+    assert isinstance(result, CallToolResult)
+    assert result.isError is True
+    payload = json.loads(result.content[0].text)
     assert "error" in payload
     assert payload["summary"] == "RuntimeError: boom"
     # The top-level error stays generic even when the summary is exposed.
@@ -759,7 +763,9 @@ async def test_tier_controls_call_time_rejection_with_escape_hatch():
         config_module._GLOBAL_CONFIG["allow_disabling_tier_controls"] = True
 
         result = await call_tool("set_tool_tier", {"tier": "core"})
-        payload = json.loads(result[0].text)
+        from mcp.types import CallToolResult
+        assert isinstance(result, CallToolResult) and result.isError is True
+        payload = json.loads(result.content[0].text)
         assert "error" in payload
         assert "disabled" in payload["error"].lower()
     finally:
@@ -1048,7 +1054,10 @@ async def test_project_tool_disabled_rejected_in_call_tool():
             "repo": project_root,
         })
 
-        payload = json.loads(result[0].text)
+        from mcp.types import CallToolResult
+        assert isinstance(result, CallToolResult)
+        assert result.isError is True
+        payload = json.loads(result.content[0].text)
         assert "error" in payload
         assert "index_folder" in payload["error"]
         assert "disabled" in payload["error"].lower()

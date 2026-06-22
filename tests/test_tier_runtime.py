@@ -12,6 +12,14 @@ def _default_override():
     return server_mod._session_tier_overrides.get(server_mod._SESSION_TIER_DEFAULT_KEY)
 
 
+def _rtext(result):
+    """Read content[0].text whether `result` is a plain content list (success)
+    or a CallToolResult (error path now carries isError; v1.108.74 / F-P01)."""
+    from mcp.types import CallToolResult
+    content = result.content if isinstance(result, CallToolResult) else result
+    return content[0].text
+
+
 class TestSessionTierState:
     def setup_method(self):
         server_mod._reset_session_tiers()
@@ -247,7 +255,7 @@ async def test_set_tool_tier_switches_session_tier():
 
     try:
         result = await call_tool("set_tool_tier", {"tier": "core"})
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         import json
         data = json.loads(text)
         assert data.get("ok") is True
@@ -270,9 +278,11 @@ async def test_set_tool_tier_rejects_invalid_tier():
 
     try:
         result = await call_tool("set_tool_tier", {"tier": "enormous"})
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        from mcp.types import CallToolResult
+        assert isinstance(result, CallToolResult)  # errors now carry isError (F-P01)
+        assert result.isError is True
         import json
-        data = json.loads(text)
+        data = json.loads(result.content[0].text)
         assert "error" in data
     finally:
         config_mod._GLOBAL_CONFIG.clear()
@@ -310,7 +320,7 @@ async def test_announce_model_resolves_tier(adaptive_on):
 
     try:
         result = await call_tool("announce_model", {"model": "claude-haiku-4-5"})
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert data["ok"] is True
         assert data["tier"] == "core"
@@ -337,7 +347,7 @@ async def test_announce_model_idempotent(adaptive_on):
     try:
         await call_tool("announce_model", {"model": "claude-haiku-4-5"})
         second = await call_tool("announce_model", {"model": "claude-haiku-4-5"})
-        text = second[0].text if hasattr(second[0], 'text') else second[0]
+        text = _rtext(second)
         data = json.loads(text)
         assert data["changed"] is False
     finally:
@@ -359,7 +369,7 @@ async def test_announce_model_unknown_falls_back_full(adaptive_on):
 
     try:
         result = await call_tool("announce_model", {"model": "totally-new-model-2030"})
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert data["tier"] == "full"
         assert data["match_reason"] == "wildcard"
@@ -383,7 +393,7 @@ async def test_announce_model_noop_when_adaptive_tiering_disabled():
 
     try:
         result = await call_tool("announce_model", {"model": "claude-haiku-4-5"})
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert data["ok"] is True
         assert data["changed"] is False
@@ -494,7 +504,7 @@ async def test_plan_turn_model_piggyback_switches_tier(adaptive_on):
             "model": "claude-sonnet-4-6",
         }
         result = await call_tool("plan_turn", args)
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert _default_override() == "standard"
         ann = data.get("tier_announcement", {})
@@ -548,7 +558,7 @@ async def test_plan_turn_model_noop_when_adaptive_tiering_disabled():
             "model": "claude-haiku-4-5",
         }
         result = await call_tool("plan_turn", args)
-        text = result[0].text if hasattr(result[0], 'text') else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert _default_override() is None
         ann = data.get("tier_announcement", {})
@@ -585,7 +595,7 @@ async def test_plan_turn_model_does_not_switch_tier_when_plan_turn_errors(adapti
             "model": "claude-haiku-4-5",
         }
         result = await call_tool("plan_turn", args)
-        text = result[0].text if hasattr(result[0], "text") else result[0]
+        text = _rtext(result)
         data = json.loads(text)
         assert "error" in data
         assert data["summary"] == "RuntimeError: boom"
