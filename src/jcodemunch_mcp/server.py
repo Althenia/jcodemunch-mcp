@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import IO, Any, Optional
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent, Resource, Prompt, PromptMessage, GetPromptResult, CallToolResult
@@ -27,7 +27,6 @@ from . import config as config_module
 from .parser.symbols import VALID_KINDS
 from .summarizer import get_provider_name
 from .reindex_state import await_freshness_if_strict
-from .path_map import ENV_VAR as _PATH_MAP_ENV_VAR
 from .storage import result_cache_invalidate as _result_cache_invalidate
 from .storage import write_pulse as _write_pulse
 
@@ -336,7 +335,7 @@ def _catalog_names() -> set:
 import threading
 import uuid
 import weakref
-from typing import Any, Hashable
+from typing import Hashable
 
 # Tier overrides are keyed by MCP session identity so concurrent HTTP clients
 # don't clobber each other. Stdio and tests have no active session; they land
@@ -5529,7 +5528,6 @@ async def _run_server_with_watcher(
             "Install with: pip install 'jcodemunch-mcp[watch]'"
         )
 
-    import sys
     import tempfile
 
     # Resolve log file path
@@ -8023,7 +8021,7 @@ def main(argv: Optional[list[str]] = None):
                 else:
                     value = _getpass.getpass(f"Enter value for {name}: ")
                 if not value:
-                    print(f"keyring set: empty value, aborted", file=sys.stderr)
+                    print("keyring set: empty value, aborted", file=sys.stderr)
                     sys.exit(2)
                 _creds.keyring_set(name, value)
                 print(f"Stored {name} in system keyring under service '{_creds.SERVICE_NAME}'.")

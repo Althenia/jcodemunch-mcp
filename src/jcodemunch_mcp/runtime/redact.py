@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
 
 from ..redact import _PATTERNS as _SECRET_PATTERNS
 

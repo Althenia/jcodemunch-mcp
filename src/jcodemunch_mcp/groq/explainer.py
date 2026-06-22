@@ -11,7 +11,6 @@ MVP: static slides (no animation). Requires FFmpeg on PATH.
 Requires: pip install jcodemunch-mcp[groq-explain]
 """
 
-import io
 import json
 import os
 import shutil
@@ -21,7 +20,6 @@ import tempfile
 import time
 import wave
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 from .config import GcmConfig
@@ -99,7 +97,7 @@ def _check_deps() -> Optional[str]:
         parts = []
         pip_pkgs = [m for m in missing if m != "ffmpeg (system binary, not pip)"]
         if pip_pkgs:
-            parts.append(f"pip install jcodemunch-mcp[groq-explain]")
+            parts.append("pip install jcodemunch-mcp[groq-explain]")
         if "ffmpeg (system binary, not pip)" in missing:
             parts.append("Install FFmpeg: https://ffmpeg.org/download.html")
         return f"Missing dependencies: {', '.join(missing)}\n" + "\n".join(parts)
@@ -108,7 +106,6 @@ def _check_deps() -> Optional[str]:
 
 def _gather_repo_info(repo_id: str, storage_path: Optional[str] = None) -> dict:
     """Gather repo summary, file tree, and key symbols via jCodeMunch."""
-    from ..tools.list_repos import list_repos
     from ..tools.get_file_tree import get_file_tree
     from ..tools.get_repo_outline import get_repo_outline
     from ..tools.search_symbols import search_symbols
@@ -138,7 +135,7 @@ def _gather_repo_info(repo_id: str, storage_path: Optional[str] = None) -> dict:
             storage_path=storage_path,
         )
         info["key_symbols"] = symbols.get("symbols", [])
-    except Exception as e:
+    except Exception:
         info["key_symbols"] = []
 
     return info
@@ -167,14 +164,14 @@ def _generate_narration_script(cfg: GcmConfig, repo_info: dict, verbose: bool = 
     if tree:
         # Truncate tree to first 30 lines
         tree_lines = tree.split("\n")[:30]
-        parts.append(f"\nFile Tree:\n" + "\n".join(tree_lines))
+        parts.append("\nFile Tree:\n" + "\n".join(tree_lines))
 
     symbols = repo_info.get("key_symbols", [])
     if symbols:
         sym_lines = []
         for s in symbols[:10]:
             sym_lines.append(f"  {s.get('kind', '?')} {s.get('id', '?')} in {s.get('file', '?')}")
-        parts.append(f"\nKey Symbols:\n" + "\n".join(sym_lines))
+        parts.append("\nKey Symbols:\n" + "\n".join(sym_lines))
 
     context = "\n".join(parts)
 

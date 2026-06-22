@@ -113,7 +113,7 @@ class GitBlameProvider(ContextProvider):
                     "--format=COMMIT %an|%aI",
                     "--diff-filter=AM",
                     "--no-merges",
-                    f"-n", str(GIT_BLAME_COMMIT_LIMIT),
+                    "-n", str(GIT_BLAME_COMMIT_LIMIT),
                     f"--since={GIT_BLAME_SINCE}",
                     "--",
                 ],
@@ -123,7 +123,7 @@ class GitBlameProvider(ContextProvider):
                 timeout=GIT_BLAME_TIMEOUT_S,
                 stdin=subprocess.DEVNULL,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             logger.warning(
                 "GitBlameProvider: git log exceeded %.0fs budget — "
                 "blame data will be partial or empty. Set "

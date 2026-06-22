@@ -127,7 +127,6 @@ def build_lexical_channel(
 
     Reuses the existing ``_bm25_score`` function from search_symbols.
     """
-    from ..tools.search_symbols import _bm25_score  # noqa: PLC0415
 
     scored: list[tuple[float, str]] = []
     for sym in symbols:

@@ -28,7 +28,7 @@ formula if you have better calibration data.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

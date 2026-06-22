@@ -1,6 +1,5 @@
 """Resolve a filesystem path to its indexed repo identifier."""
 
-import hashlib
 import json
 import logging
 import subprocess

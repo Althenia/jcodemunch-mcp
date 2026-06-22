@@ -17,9 +17,6 @@ from ..parser import get_language_for_path
 from ..security import is_secret_file, is_binary_extension, get_max_index_files, get_extra_ignore_patterns, get_skip_patterns
 from ..storage import IndexStore
 from ._indexing_pipeline import (
-    file_languages_for_paths as _file_languages_for_paths,
-    language_counts as _language_counts,
-    complete_file_summaries as _complete_file_summaries,
     parse_and_prepare_incremental,
     parse_and_prepare_full,
 )

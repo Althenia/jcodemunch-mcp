@@ -24,7 +24,6 @@ Python graph algorithms.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import random
 import subprocess
@@ -34,7 +33,7 @@ from typing import Optional
 
 from ..storage import IndexStore
 from ._utils import resolve_repo
-from .get_dependency_graph import _build_adjacency, _invert
+from .get_dependency_graph import _build_adjacency
 
 logger = logging.getLogger(__name__)
 

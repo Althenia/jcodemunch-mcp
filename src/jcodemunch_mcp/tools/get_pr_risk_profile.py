@@ -31,7 +31,6 @@ import logging
 import math
 import sqlite3
 import time
-from collections import defaultdict
 from typing import Optional
 
 from ..storage import IndexStore

@@ -11,7 +11,6 @@ from ..parser.imports import (
 )
 from ._utils import index_status_to_tool_error, resolve_repo
 from .package_registry import (
-    build_package_registry,
     extract_root_package_from_specifier,
 )
 

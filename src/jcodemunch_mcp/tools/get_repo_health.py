@@ -25,7 +25,6 @@ from .get_dead_code_v2 import get_dead_code_v2
 from .get_dependency_cycles import get_dependency_cycles
 from .get_hotspots import get_hotspots
 from .get_dependency_graph import _build_adjacency
-from ..parser.imports import resolve_specifier
 
 
 def _avg_complexity(index) -> float:

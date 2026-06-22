@@ -8,7 +8,7 @@ from typing import Optional
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided as _cost_avoided
 from ..parser.imports import resolve_specifier
-from ._utils import index_status_to_tool_error, resolve_fqn, resolve_repo
+from ._utils import index_status_to_tool_error, resolve_repo
 
 _BYTES_PER_TOKEN = 4
 

@@ -10,8 +10,6 @@ import logging
 import os
 import re
 import time
-from fnmatch import fnmatch
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)

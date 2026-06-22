@@ -23,8 +23,6 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 from ..storage import IndexStore
-from ..parser.imports import resolve_specifier
-from ..parser.context._route_utils import ENTRY_POINT_DECORATOR_RE
 from ._utils import resolve_repo
 from ._call_graph import build_symbols_by_file, find_direct_callees
 from .flow_edges import resolve_flow_edges

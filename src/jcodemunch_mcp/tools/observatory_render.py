@@ -15,7 +15,6 @@ import json
 import xml.sax.saxutils as _sax
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional
 
 
 _GRADE_COLOR = {

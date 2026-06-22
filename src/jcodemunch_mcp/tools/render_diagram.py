@@ -20,8 +20,7 @@ from __future__ import annotations
 import re
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +566,7 @@ def _render_tectonic_map(source: dict, pal: Palette, max_nodes: int) -> dict:
     lines: list[str] = ["flowchart LR"]
     lines.append(f"  classDef anchor fill:{pal.accent},stroke:#333,stroke-width:3px,color:{pal.text}")
     lines.append(f"  classDef drifter fill:#FF851B,stroke:#333,color:{pal.text}")
-    lines.append(f"  classDef nexus stroke:#FF4136,stroke-width:4px")
+    lines.append("  classDef nexus stroke:#FF4136,stroke-width:4px")
     lines.append(f"  classDef isolated fill:{pal.dimmed},stroke:#999,color:#666")
 
     plates = source.get("plates", [])
@@ -678,8 +677,8 @@ def _render_tectonic_map(source: dict, pal: Palette, max_nodes: int) -> dict:
 def _render_dependency_cycles(source: dict, pal: Palette, max_nodes: int) -> dict:
     """Flowchart LR — each SCC in a subgraph, cycle edges red."""
     lines: list[str] = ["flowchart LR"]
-    lines.append(f"  classDef cycled fill:#FFE0E0,stroke:#FF4136,stroke-width:2px")
-    lines.append(f"  classDef clean fill:#E0FFE0,stroke:#2ECC40")
+    lines.append("  classDef cycled fill:#FFE0E0,stroke:#FF4136,stroke-width:2px")
+    lines.append("  classDef clean fill:#E0FFE0,stroke:#2ECC40")
 
     cycles = source.get("cycles", [])
     if not cycles:
@@ -821,7 +820,7 @@ def _render_impact_preview(source: dict, pal: Palette, max_nodes: int) -> dict:
 
     legend = (
         "Target node: highlighted at bottom (the symbol being removed/renamed)\n"
-        f"Depth colors: gradient from depth 1 to 5 (deeper = more indirect impact)\n"
+        "Depth colors: gradient from depth 1 to 5 (deeper = more indirect impact)\n"
         "Arrows: call chain direction (caller → callee)\n"
         "Grouped by: source file"
     )
@@ -839,9 +838,9 @@ def _render_blast_radius(source: dict, pal: Palette, max_nodes: int) -> dict:
     """Flowchart TD — concentric depth-ring subgraphs around target."""
     lines: list[str] = ["flowchart TD"]
     lines.append(f"  classDef target fill:{pal.accent},stroke:#333,stroke-width:4px,color:{pal.text}")
-    lines.append(f"  classDef confirmed fill:#FFE0E0,stroke:#FF4136")
-    lines.append(f"  classDef potential fill:#FFF3E0,stroke:#FF851B,stroke-dasharray:5 5")
-    lines.append(f"  classDef cross fill:#E0E0FF,stroke:#0074D9,stroke-dasharray:8 4")
+    lines.append("  classDef confirmed fill:#FFE0E0,stroke:#FF4136")
+    lines.append("  classDef potential fill:#FFF3E0,stroke:#FF851B,stroke-dasharray:5 5")
+    lines.append("  classDef cross fill:#E0E0FF,stroke:#0074D9,stroke-dasharray:8 4")
 
     sym = source.get("symbol", "")
     if isinstance(sym, dict):
@@ -951,7 +950,7 @@ def _render_dependency_graph(source: dict, pal: Palette, max_nodes: int) -> dict
     """Flowchart LR — directed import edges with focal file highlighted."""
     lines: list[str] = ["flowchart LR"]
     lines.append(f"  classDef focal fill:{pal.accent},stroke:#333,stroke-width:3px,color:{pal.text}")
-    lines.append(f"  classDef cross stroke:#0074D9,stroke-dasharray:8 4")
+    lines.append("  classDef cross stroke:#0074D9,stroke-dasharray:8 4")
 
     focal_file = source.get("file", "")
     neighbors = source.get("neighbors", {})

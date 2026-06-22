@@ -10,7 +10,7 @@ from typing import Optional
 from ..storage import IndexStore
 from ..parser.imports import resolve_specifier
 from ._utils import index_status_to_tool_error, resolve_repo
-from ._call_graph import _word_match, build_symbols_by_file
+from ._call_graph import _word_match
 from .find_dead_code import _is_test_file
 
 logger = logging.getLogger(__name__)

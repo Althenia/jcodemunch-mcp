@@ -864,7 +864,7 @@ def _compute_new_import(old_import_line, old_file, new_file, sym_name, language)
         new_slash = PurePosixPath(new_file).with_suffix("").as_posix()
         if old_slash in old_import_line:
             return old_import_line.replace(old_slash, new_slash), None
-        return old_import_line, f"Lua module path not found in require"
+        return old_import_line, "Lua module path not found in require"
 
     elif language == "julia":
         # Julia: using OldModule.Sub → using NewModule.Sub
@@ -912,7 +912,7 @@ def _compute_new_import(old_import_line, old_file, new_file, sym_name, language)
         new_stem = PurePosixPath(new_file).with_suffix("").as_posix()
         if old_stem in old_import_line:
             return old_import_line.replace(old_stem, new_stem), None
-        return old_import_line, f"GDScript path not found in preload()"
+        return old_import_line, "GDScript path not found in preload()"
 
     elif language == "bash":
         # Bash: source old/path -> source new/path

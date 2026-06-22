@@ -32,7 +32,7 @@ jobs:
         run: uv sync --group dev --extra watch
 
       - name: Run tests
-        run: uv run pytest tests/ -v --tb=short --cov=src --cov-report=term-missing
+        run: uv run pytest tests/ -v --tb=short --cov=src --cov-report=term-missing --cov-fail-under=74
 
       - name: Verify sdist contains no sensitive paths
         if: runner.os == 'Linux'
@@ -50,3 +50,26 @@ jobs:
             exit 1
           fi
           echo "OK: No sensitive paths found in sdist."
+
+  lint:
+    # Platform-independent, so run once rather than across the test matrix.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.6.5"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Ruff lint (src/)
+        # Rule selection + grandfathered ignores live in [tool.ruff.lint] in
+        # pyproject.toml. Keep the gate green: fix the finding, or justify a new
+        # ignore in the same PR.
+        run: uv run ruff check src/

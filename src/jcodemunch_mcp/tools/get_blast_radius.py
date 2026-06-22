@@ -9,7 +9,7 @@ from ..storage import IndexStore, result_cache_get, result_cache_put
 from ..parser.imports import resolve_specifier
 from ._utils import index_status_to_tool_error, resolve_repo, resolve_fqn
 from .package_registry import extract_root_package_from_specifier
-from ._call_graph import build_symbols_by_file, _word_match, find_direct_callers, bfs_callers
+from ._call_graph import build_symbols_by_file, bfs_callers
 from .find_dead_code import _is_test_file
 from .decision_context import resolve_decision_context
 
@@ -336,7 +336,6 @@ def get_blast_radius(
     if cross_repo:
         try:
             from .list_repos import list_repos
-            from .package_registry import build_package_registry
             all_repos_data = list_repos(storage_path=storage_path).get("repos", [])
             pkg_names = getattr(index, "package_names", []) or []
             if pkg_names:

@@ -2,6 +2,35 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.76] - 2026-06-22 - Quality gates: CI lint (ruff) + coverage floor
+
+### CI / Tooling (WI-3.1 / F-Q01)
+
+- **Ruff lint gate.** New `lint` CI job runs `ruff check src/` once
+  (platform-independent). `[tool.ruff.lint]` in pyproject keeps the high-signal
+  pyflakes + pycodestyle-error rules and grandfathers this codebase's deliberate
+  patterns via `ignore` (E402 lazy/local imports, plus E701/E721/E731/E741);
+  `__init__.py` re-exports are exempt from F401. ruff added to the dev group.
+- **Coverage floor.** The test job now runs `--cov-fail-under=74` (current
+  coverage ~76%), so coverage can no longer erode silently.
+
+### Fixed (lint cleanup across src/)
+
+- Applied ruff's safe autofixes across 49 modules (83 findings: unused imports,
+  empty f-strings, redefinitions, and safe dead-code removals). No behavior
+  change; full suite still 4717 passed.
+- Two real findings: `server.py` annotated a local with an undefined `IO` (now
+  imported from typing — harmless at runtime since local annotations aren't
+  evaluated, but a genuine undefined name); `storage/sqlite_store.py` had a
+  duplicate `".sh"` dict key (both mapped to "bash"; the redundant one removed).
+
+### Deferred (tracked ratchet follow-ups)
+
+- F841 (~31 pre-existing dead local variables) stays in `ignore` until each can
+  be removed with per-case RHS side-effect review. mypy/pyright type-checking is
+  not yet wired (469 untyped modules); a report-mode step is the next ratchet.
+  These complete Phase 3.
+
 ## [1.108.75] - 2026-06-22 - Quality gates: live core_compact ceiling + schema/dispatch param parity
 
 ### Tests

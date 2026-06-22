@@ -6,7 +6,6 @@ and map them to repo IDs so import graph tools can traverse repo boundaries.
 import logging
 import os
 import re
-import time
 from pathlib import Path
 from typing import Optional
 

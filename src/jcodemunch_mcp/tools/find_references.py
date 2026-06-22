@@ -1,7 +1,6 @@
 """Find all files that reference (import) a given identifier."""
 
 import posixpath
-import re
 import time
 from typing import Optional
 
@@ -64,7 +63,7 @@ def _calling_symbols_in_file(
     Used to populate the optional ``calling_symbols`` field when
     ``include_call_chain=True``.  Each result is ``{id, name, kind, line}``.
     """
-    from ._call_graph import build_symbols_by_file, _word_match, _symbol_body
+    from ._call_graph import _word_match, _symbol_body
 
     # Lazy: build symbols_by_file only once per call_chain enrichment pass.
     # We do it here inline to keep the function self-contained; callers can

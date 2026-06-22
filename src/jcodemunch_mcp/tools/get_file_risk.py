@@ -28,7 +28,6 @@ import logging
 import re
 import subprocess
 import time
-from pathlib import Path
 from typing import Optional
 
 from ..storage import IndexStore

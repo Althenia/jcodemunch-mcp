@@ -13,10 +13,8 @@ The encoder lazily downloads the model on first call to ``encode_batch()`` if
 ``onnxruntime`` is installed but the model file is missing.
 """
 
-import json
 import logging
 import os
-import re
 import sys
 import unicodedata
 from pathlib import Path

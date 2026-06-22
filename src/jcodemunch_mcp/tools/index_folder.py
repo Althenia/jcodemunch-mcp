@@ -27,7 +27,6 @@ from ..security import (
     is_symlink_escape,
     is_secret_file,
     is_binary_file,
-    should_exclude_file,
     DEFAULT_MAX_FILE_SIZE,
     get_max_folder_files,
     get_extra_ignore_patterns,
@@ -529,9 +528,7 @@ from ._indexing_pipeline import (
     language_counts as _language_counts,
     complete_file_summaries as _complete_file_summaries,
     parse_and_prepare_incremental,
-    parse_and_prepare_full,
     parse_immediate,
-    deferred_summarize,
 )
 from .package_registry import extract_package_names as _extract_package_names
 
@@ -2163,7 +2160,6 @@ def index_folder(
 
                 # Gather symbols for changed/new files
                 delta_files = set(delta_changed) | set(delta_new)
-                from ..parser.symbols import Symbol as _SymClass
                 delta_symbols = [s for s in all_symbols if s.file in delta_files]
 
                 store.save_branch_delta(

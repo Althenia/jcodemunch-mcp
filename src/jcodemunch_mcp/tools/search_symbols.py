@@ -8,7 +8,7 @@ import time
 from fnmatch import fnmatch
 from typing import Optional
 
-from ..storage import IndexStore, CodeIndex, record_savings, estimate_savings, cost_avoided
+from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ..parser.imports import resolve_specifier
 from ._utils import resolve_repo, resolve_fqn, index_status_to_tool_error
 

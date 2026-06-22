@@ -26,7 +26,6 @@ time rather than per-call to avoid spawning a new thread on every tool use.
 """
 
 import atexit
-import bisect
 import json
 import logging
 import os

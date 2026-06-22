@@ -10,10 +10,8 @@ Requires: pip install jcodemunch-mcp[groq-voice]
 
 import io
 import sys
-import tempfile
 import time
 import wave
-from pathlib import Path
 from typing import Optional
 
 from .config import GcmConfig
@@ -100,7 +98,6 @@ def record_audio(verbose: bool = False) -> bytes:
     if not frames:
         return b""
 
-    import numpy as np
     audio_data = np.concatenate(frames, axis=0)
 
     # Encode as WAV in memory

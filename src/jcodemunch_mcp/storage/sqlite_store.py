@@ -2462,7 +2462,7 @@ class SQLiteIndexStore:
                 ".css": "css", ".scss": "scss", ".less": "less",
                 ".json": "json", ".yaml": "yaml", ".yml": "yaml",
                 ".toml": "toml", ".md": "markdown", ".rst": "rst",
-                ".sh": "bash", ".ps1": "powershell",
+                ".ps1": "powershell",
             }
             for path in paths:
                 if path in result:

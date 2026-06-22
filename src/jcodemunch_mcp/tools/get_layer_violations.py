@@ -1,7 +1,6 @@
 """Validate inter-module imports against declared architectural layers."""
 
 import time
-from pathlib import PurePosixPath
 from typing import Optional
 
 from ..storage import IndexStore

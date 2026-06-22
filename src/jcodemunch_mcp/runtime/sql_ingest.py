@@ -35,7 +35,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from typing import Iterable
 
 from .redact import redact_trace_record
 from .sql_log import SqlQueryRecord, iter_sql_from_text, parse_sql_log_file

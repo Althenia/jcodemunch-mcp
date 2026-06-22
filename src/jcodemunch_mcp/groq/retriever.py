@@ -5,7 +5,6 @@ import os
 import sys
 from typing import Optional
 
-from ..storage import IndexStore
 from ..tools.list_repos import list_repos
 from ..tools.get_ranked_context import get_ranked_context
 from ..tools.index_folder import index_folder

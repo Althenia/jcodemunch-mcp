@@ -32,7 +32,7 @@ to the helpers here.
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 
 # The front-door tool names. These are never themselves dispatchable via
 # ``order`` (no front-door recursion).

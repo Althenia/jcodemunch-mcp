@@ -11,7 +11,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from ._route_utils import has_dependency, read_package_json, make_route_file_context
+from ._route_utils import read_package_json, make_route_file_context
 from .base import ContextProvider, FileContext, register_provider
 
 logger = logging.getLogger(__name__)

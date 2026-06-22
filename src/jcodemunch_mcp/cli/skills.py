@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Optional
 
 
 # Marker is on the first non-frontmatter heading line so we can detect an

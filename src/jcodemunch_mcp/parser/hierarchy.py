@@ -1,7 +1,6 @@
 """Build symbol tree hierarchy for file outlines."""
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 from .symbols import Symbol
 

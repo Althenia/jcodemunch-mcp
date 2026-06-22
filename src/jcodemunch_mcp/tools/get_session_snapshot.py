@@ -46,7 +46,7 @@ def _render_snapshot(
     duration_str = f"{duration_mins}m" if duration_mins > 0 else f"{int(duration_s)}s"
 
     snapshot_parts = [
-        f"## Session Snapshot (jCodemunch)",
+        "## Session Snapshot (jCodemunch)",
         f"**Duration:** {duration_str} | **Files explored:** {total_files} | **Searches:** {total_queries}",
     ]
 
