@@ -2,6 +2,26 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.75] - 2026-06-22 - Quality gates: live core_compact ceiling + schema/dispatch param parity
+
+### Tests
+
+- **Hard live `core_compact <= 4000` assertion (WI-3.3 / F-Q03).** The existing
+  success-criterion test read the frozen `schema_baseline.json`, so a description
+  or param breach (e.g. v1.108.70's transient 3956->4011) only failed after the
+  baseline was regenerated. New `test_live_core_compact_under_4000_hard_ceiling`
+  recomputes core + compact_schemas from `_build_tools_list()` directly and fails
+  the moment it exceeds 4000, so a breach cannot reach a release.
+- **Schema-vs-dispatch param parity test (WI-3.2 / F-P02 / F-C02).** The existing
+  registration guard checks tool-name presence only, not arguments. New
+  `tests/test_dispatch_schema_parity.py` parses `call_tool`'s source and asserts
+  every `arguments["k"]` / `arguments.get("k")` a tool's dispatch branch reads is
+  a declared inputSchema property (so a caller can actually pass it). Surfaced two
+  intentional patterns now handled explicitly: config-conditional properties
+  (`render_diagram.open_in_viewer`, built with the feature flag on) and a
+  documented forgiving alias (`get_file_outline` accepts `file` for `file_path`).
+  A guard-the-guard test fails loudly if the AST walk ever goes vacuous.
+
 ## [1.108.74] - 2026-06-22 - Harden: tool errors carry isError (MCP protocol conformance)
 
 ### Changed

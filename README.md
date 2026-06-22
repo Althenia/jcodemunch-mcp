@@ -110,9 +110,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.75](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.75)** (2026-06-22) — Quality gates: live core_compact ceiling + schema/dispatch param parity
 - **[v1.108.74](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.74)** (2026-06-22) — Harden: tool errors carry isError (MCP protocol conformance)
 - **[v1.108.73](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.73)** (2026-06-22) — Harden: HTTP ingest fails closed without a token + redaction currency
-- **[v1.108.72](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.72)** (2026-06-22) — resolve_repo flags relative paths over detached transports
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)

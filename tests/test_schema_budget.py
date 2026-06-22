@@ -95,6 +95,48 @@ def test_v2_success_criterion_core_compact_under_4000():
     )
 
 
+@pytest.mark.skipif(not _HAS_TIKTOKEN, reason="tiktoken not installed")
+def test_live_core_compact_under_4000_hard_ceiling():
+    """§10 criterion enforced on the LIVE build, not just the frozen baseline.
+
+    The sibling test above reads benchmarks/schema_baseline.json, so a description
+    or param breach (e.g. v1.108.70's 3956->4011) only fails AFTER the baseline is
+    regenerated — by which point the breach has shipped. This recomputes core +
+    compact_schemas straight from _build_tools_list() and fails the moment it
+    exceeds 4000, so a breach can't reach a release (F-Q03 / F-A02).
+    """
+    import tiktoken as _tk
+
+    from jcodemunch_mcp import config as config_module
+    from jcodemunch_mcp.server import _build_tools_list
+
+    encoding = _tk.get_encoding("cl100k_base")
+    cfg = config_module._GLOBAL_CONFIG  # type: ignore[attr-defined]
+    original = {k: cfg.get(k) for k in ("tool_profile", "compact_schemas")}
+    try:
+        cfg["tool_profile"] = "core"
+        cfg["compact_schemas"] = True
+        tools = _build_tools_list()
+        payload = [
+            {"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
+            for t in tools
+        ]
+        count = len(encoding.encode(json.dumps(payload, separators=(",", ":"))))
+    finally:
+        for k, v in original.items():
+            if v is None:
+                cfg.pop(k, None)
+            else:
+                cfg[k] = v
+
+    assert count <= 4000, (
+        f"LIVE core_compact is {count} tokens, over the §10 <=4000 ceiling. Trim a "
+        f"core-tier tool description, or strip/demote a param under compact "
+        f"(_COMPACT_STRIP_PARAMS / _COMPACT_DEMOTE_ENUM_PARAMS). Do NOT just "
+        f"regenerate benchmarks/schema_baseline.json to paper over it."
+    )
+
+
 def test_compact_demotes_language_enum_keeps_capability():
     """Under compact_schemas, the ~76-value `language` enum is demoted to a
     plain string filter (reclaims ~200 tokens) but the param stays usable. The
