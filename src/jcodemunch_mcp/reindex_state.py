@@ -51,6 +51,10 @@ class _RepoState:
     stale_since: Optional[float] = None
     # Reset to 0 on success; incremented on each failure for escalation.
     consecutive_failures: int = 0
+    # Set when a failure is non-transient (e.g. a missing watcher dependency).
+    # A fatal failure is surfaced immediately (bypassing the 2-failure tolerance)
+    # and signals callers not to keep restarting the task. Cleared on success.
+    fatal: bool = False
 
 
 # ── Module-level state ───────────────────────────────────────────────────────
@@ -134,17 +138,23 @@ def mark_reindex_done(repo: str, result: Optional[dict] = None) -> None:
         state.last_reindex_done = time.monotonic()
         state.stale_since = None          # index is now fresh
         state.consecutive_failures = 0   # reset failure counter on success
+        state.fatal = False              # a successful reindex clears fatal state
         if result is not None:
             state.last_result = result
         _repo_events[repo].set()
 
 
-def mark_reindex_failed(repo: str, error: str) -> None:
+def mark_reindex_failed(repo: str, error: str, *, fatal: bool = False) -> None:
     """Mark a repo's reindex as failed.
 
     stale_since is intentionally NOT cleared — the index IS still stale.
     consecutive_failures is incremented; error details are only surfaced
     in get_reindex_status() after the 2nd+ consecutive failure.
+
+    Set ``fatal=True`` for a non-transient failure (e.g. a missing watcher
+    dependency). A fatal failure is surfaced immediately — without waiting for a
+    2nd consecutive failure — because it will not self-heal on retry, and watcher
+    tasks should not be restarted into the same crash.
     """
     with _states_lock:
         state = _get_state(repo)
@@ -152,6 +162,8 @@ def mark_reindex_failed(repo: str, error: str) -> None:
         state.reindex_finished = True
         state.reindex_error = error          # stored internally always
         state.consecutive_failures += 1
+        if fatal:
+            state.fatal = True
         state.last_reindex_done = time.monotonic()
         # stale_since stays set — index remains stale after a failed reindex
         _repo_events[repo].set()
@@ -182,10 +194,15 @@ def get_reindex_status(repo: str) -> dict:
             "reindex_in_progress": state.reindexing,
             "stale_since_ms": stale_since_ms,
         }
-        # Expose error details only on 2nd+ consecutive failure (transient tolerance)
-        if state.consecutive_failures >= 2 and state.reindex_error:
+        # Expose error details on the 2nd+ consecutive failure (transient
+        # tolerance), or immediately when the failure is fatal — a fatal failure
+        # won't self-heal, so hiding the first one would let watch-status report
+        # a healthy watcher while per-repo tasks crash-loop (#353).
+        if state.reindex_error and (state.fatal or state.consecutive_failures >= 2):
             status["reindex_error"] = state.reindex_error
             status["reindex_failures"] = state.consecutive_failures
+            if state.fatal:
+                status["reindex_fatal"] = True
         return status
 
 

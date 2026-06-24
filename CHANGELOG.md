@@ -2,6 +2,62 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.78] - 2026-06-23 - Issue batch: type aliases, ranked-context compact rows, watcher health, secret-name source modules
+
+Four source-cited correctness fixes (all reported by @mmashwani).
+
+### Fixed
+
+- **#352 — Python 3.12 `type` alias statements are now emitted as symbols.**
+  `type JsonReportValue = str | int` was searchable as text but absent from
+  `get_file_outline` / `search_symbols(kind="type")`. The Python spec declared
+  `type_patterns=["type_alias_statement"]`, but `type_patterns` is consumed
+  nowhere — every other language surfaces its type nodes via `symbol_node_types`.
+  Python now does the same: `type_alias_statement` -> kind `"type"`, with a
+  dedicated `_extract_name` branch (the alias name is nested under the `left`
+  field, and generic aliases like `type Vec[T] = ...` resolve to `Vec`). Purely
+  additive — a re-index picks up the aliases; no `INDEX_VERSION` bump.
+
+- **#354 — `get_ranked_context` compact output no longer emits blank rows.**
+  The `rc1` compact schema declares `id|name|kind|file|line|score|token_cost|
+  summary`, but both producers keyed their rows by `symbol_id`/`combined_score`/
+  `fusion_score`/`tokens`, so every declared column read empty and the encoder
+  wrote blank rows while `items_included` reported a nonzero count. Each context
+  item now also carries the schema's display fields (drawn from the symbol;
+  `source` stays JSON-only so compact rows remain cheap). The legacy keys are
+  retained, so the JSON shape is backward-compatible. The schema-driven encoder
+  also **fails closed** now: if a table has rows but no declared column was
+  populated across all of them, it raises and the dispatcher falls back to JSON
+  rather than shipping a "N items, all blank" payload.
+
+- **#353 — `watch-status` surfaces a failing watcher instead of reporting healthy
+  while per-repo tasks crash-loop.** Three fixes: (1) `_watch_single` validates
+  the `watchfiles` dependency BEFORE the initial index — previously the import
+  check ran after `mark_reindex_done`, so a missing extra left the index marked
+  healthy and the task crash-looped through the initial reindex on every restart;
+  a missing dependency now marks the repo failed (fatal) and aborts. (2) A new
+  `WatcherDependencyError` is non-transient: `WatcherManager.run` records every
+  crashed task in reindex state and does NOT restart a fatal one. (3) **Key
+  alignment:** `get_watch_status` read reindex_state by folder path, but watch
+  tasks write by repo_id (`local/<name>-<hash>`), so failures were structurally
+  invisible — it now resolves the same repo_id key. `mark_reindex_failed(...,
+  fatal=True)` surfaces immediately (bypassing the 2-consecutive-failure
+  tolerance) with a `reindex_fatal` flag; success clears it.
+
+- **#351 (core) — source modules named `*secret*` are indexable, and `index_file`
+  honors the same eligibility as `index_folder`.** The broad `*secret*` basename
+  glob exempted documentation extensions but not source code, so
+  `secret_redaction.py` / `secret_scanner.ts` were skipped by `index_folder` and
+  flip-flopped (an `index_file` repair was dropped by the next full index). A
+  source module that *handles* secrets is code, not a credential file: a curated
+  programming-language extension set is now exempt from the broad glob (data/
+  config markup like `.yaml`/`.json` is deliberately NOT exempt, so a real
+  `prod-secrets.yaml` still skips). `index_file` now runs `is_secret_file` so it
+  refuses actual credential files folder indexing would skip — closing the
+  add-then-prune inconsistency. The broader credential classifier (path-specific
+  rules, key-material directories, token-boundary basenames) from the report's
+  prototype is deferred to a deliberate follow-up.
+
 ## [1.108.77] - 2026-06-23 - Raise the `http` extra's starlette floor to a patched release
 
 ### Security / Packaging

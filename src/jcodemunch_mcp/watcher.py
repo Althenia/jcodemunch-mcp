@@ -38,6 +38,35 @@ class WatcherError(Exception):
     pass
 
 
+class WatcherDependencyError(WatcherError):
+    """A required watcher dependency is missing (e.g. the `watch` extra).
+
+    Non-transient: the per-repo task cannot watch files until the dependency is
+    installed, so the WatcherManager must NOT restart it into the same crash.
+    """
+
+    pass
+
+
+_WATCHFILES_MISSING_MSG = (
+    "watchfiles is required for the watch subcommand. "
+    "Install it with: pip install 'jcodemunch-mcp[watch]'"
+)
+
+
+def _require_watchfiles() -> None:
+    """Raise WatcherDependencyError if the optional watcher dependency is absent.
+
+    Called before any per-repo initial index so a missing dependency fails fast
+    (and visibly) instead of running the initial reindex, marking it done, then
+    crash-looping on the import afterwards (#353).
+    """
+    try:
+        import watchfiles  # noqa: F401
+    except ImportError as exc:
+        raise WatcherDependencyError(_WATCHFILES_MISSING_MSG) from exc
+
+
 # Platform-specific: fcntl for Unix (advisory locking)
 try:
     import fcntl
@@ -176,6 +205,22 @@ async def _watch_single(
     store = IndexStore(base_path=storage_path)
     repo_id = _local_repo_id(remap(folder_path, _pairs, reverse=True), store=store)
     _repo_owner, _repo_store_name = repo_id.split("/", 1)
+
+    # Validate the watcher dependency BEFORE the initial index. If watchfiles is
+    # missing, mark the repo failed (fatal) and abort now — previously the import
+    # check ran AFTER the initial index + mark_reindex_done, so a missing
+    # dependency left the index marked healthy and the task crash-looped through
+    # the initial reindex on every restart (#353).
+    try:
+        _require_watchfiles()
+    except WatcherDependencyError as exc:
+        mark_reindex_failed(repo_id, str(exc), fatal=True)
+        _watcher_output(
+            f"  FATAL: cannot watch {folder_path}: {exc}",
+            quiet=quiet,
+            log_file_handle=log_file_handle,
+        )
+        raise
 
     # Memory hash cache: rel_path -> content hash (for WatcherChange old_hash passthrough)
     _hash_cache: dict[str, str] = {}
@@ -433,6 +478,26 @@ class WatcherManager:
             task.cancel()
         self._last_takeover_attempt.pop(folder, None)
 
+    def _record_task_crash(self, folder: str, exc: BaseException) -> None:
+        """Record a crashed per-repo watch task in reindex state (#353).
+
+        Keyed by the same repo_id that _watch_single writes under, so
+        get_watch_status surfaces the failure. A WatcherDependencyError is marked
+        fatal (surfaced immediately, no restart); other crashes are transient
+        (visible after the 2nd consecutive failure).
+        """
+        try:
+            _pairs = parse_path_map()
+            store = IndexStore(base_path=self._storage_path)
+            repo_id = _local_repo_id(remap(folder, _pairs, reverse=True), store=store)
+            mark_reindex_failed(
+                repo_id,
+                str(exc) or exc.__class__.__name__,
+                fatal=isinstance(exc, WatcherDependencyError),
+            )
+        except Exception:
+            logger.debug("Failed to record watcher task crash for %s", folder, exc_info=True)
+
     def _start_watch_task(self, folder: str) -> asyncio.Task:
         task = asyncio.create_task(
             _watch_single(
@@ -638,14 +703,28 @@ class WatcherManager:
                         if task and task.done() and not task.cancelled():
                             exc = task.exception()
                             if exc:
+                                # Record the crash in reindex state so watch-status
+                                # surfaces a failing/degraded watcher instead of
+                                # reporting healthy while tasks crash-loop (#353).
+                                self._record_task_crash(folder, exc)
+                                fatal = isinstance(exc, WatcherDependencyError)
+                                verb = "not restarting (fatal)" if fatal else "restarting..."
                                 _watcher_output(
-                                    f"WatcherManager: task crashed for {folder}: {exc}, restarting...",
+                                    f"WatcherManager: task crashed for {folder}: {exc}, {verb}",
                                     quiet=self._quiet,
                                     log_file_handle=self._log_file_handle,
                                 )
-                                # Restart — cancel the dead task and start a replacement
                                 task.cancel()
-                                self._start_watch_task(folder)
+                                if fatal:
+                                    # A missing dependency won't self-heal — stop
+                                    # watching this folder rather than spin forever.
+                                    self._active.pop(folder, None)
+                                    self._watched.discard(folder)
+                                    if folder in self._locked:
+                                        self._locked.discard(folder)
+                                        _release_lock(folder, self._storage_path)
+                                else:
+                                    self._start_watch_task(folder)
                     # Retry standby folders on fallback interval
                     for folder in list(self._standby):
                         await self.maybe_takeover(folder)

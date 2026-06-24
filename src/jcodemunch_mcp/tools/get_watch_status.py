@@ -26,6 +26,27 @@ from ..watch_all import discover_local_repos
 logger = logging.getLogger(__name__)
 
 
+def _reindex_key(folder: str, storage_path: Optional[str]) -> str:
+    """Resolve the reindex_state key a watch task registers for ``folder``.
+
+    Watcher tasks key reindex_state by the repo_id (``local/<name>-<hash>``)
+    that ``index_folder`` would use — NOT the folder path. Reading by folder
+    path returned a phantom default state, so get_watch_status could never see a
+    real reindex failure or crash (#353). Resolve the same repo_id here; fall
+    back to the folder path if identity resolution fails for any reason.
+    """
+    try:
+        from ..storage import IndexStore
+        from ..path_map import parse_path_map, remap
+        from ..watcher import _local_repo_id
+
+        store = IndexStore(base_path=storage_path)
+        return _local_repo_id(remap(folder, parse_path_map(), reverse=True), store=store)
+    except Exception:
+        logger.debug("Failed to resolve reindex key for %s; using folder path", folder, exc_info=True)
+        return folder
+
+
 def get_watch_status(storage_path: Optional[str] = None) -> dict:
     """Return a summary of watch-all coverage and health."""
     discovered = discover_local_repos(storage_path)
@@ -36,9 +57,10 @@ def get_watch_status(storage_path: Optional[str] = None) -> dict:
     any_watched_by_another_process = False
     my_pid = os.getpid()
     for folder in discovered:
-        # Repo-key used by reindex_state is the folder path itself (what
-        # watcher._watch_single registers). Keep this aligned with watcher.py.
-        status = get_reindex_status(folder)
+        # reindex_state is keyed by the repo_id watcher._watch_single registers
+        # (local/<name>-<hash>), not the folder path. Resolve the same key so a
+        # failing/crash-looping watcher task is actually visible here (#353).
+        status = get_reindex_status(_reindex_key(folder, storage_path))
         entry = {
             "source_root": folder,
             "exists": Path(folder).is_dir(),
@@ -59,7 +81,7 @@ def get_watch_status(storage_path: Optional[str] = None) -> dict:
             any_stale = True
         if status.get("reindex_in_progress"):
             any_in_progress = True
-        if status.get("reindex_failures"):
+        if status.get("reindex_failures") or status.get("reindex_fatal"):
             any_failing = True
         repos_out.append(entry)
 

@@ -22,6 +22,34 @@ _PR_WEIGHT = 100.0
 _DIVERSITY_DECAY = 0.5       # penalty growth per same-file symbol
 _FILE_GROUP_CAP = 3          # max symbols from a single file
 
+# Max chars for the compact-row summary so packed rows stay cheap (#354).
+_COMPACT_SUMMARY_MAX = 160
+
+
+def _compact_fields(sym: dict, score: float, token_cost: int) -> dict:
+    """Display fields the rc1 compact encoder declares (#354).
+
+    The fusion/non-fusion producers key their rows by ``symbol_id`` /
+    ``combined_score`` / ``tokens``, but the compact schema reads
+    ``id``/``name``/``kind``/``file``/``line``/``score``/``token_cost``/``summary``.
+    Emitting both keeps the JSON shape backward-compatible while giving the
+    compact path real cells instead of blank rows. ``source`` is intentionally
+    not surfaced here — it stays JSON-only so compact rows remain cheap.
+    """
+    summary = sym.get("summary") or sym.get("signature") or ""
+    if len(summary) > _COMPACT_SUMMARY_MAX:
+        summary = summary[:_COMPACT_SUMMARY_MAX].rstrip() + "…"
+    return {
+        "id": sym.get("id"),
+        "name": sym.get("name"),
+        "kind": sym.get("kind"),
+        "file": sym.get("file"),
+        "line": sym.get("line"),
+        "score": round(score, 4),
+        "token_cost": token_cost,
+        "summary": summary,
+    }
+
 
 def _pack_budget(
     scored_items: list[tuple[float, dict]],
@@ -285,6 +313,11 @@ def get_ranked_context(
             "combined_score": round(adj_score, 4),
             "tokens": item_tokens,
             "source": source,
+            # Compact-encoder display fields (#354): the rc1 schema declares
+            # id/name/kind/file/line/score/token_cost/summary. Without these the
+            # producer dict had none of them, so every compact row encoded blank
+            # while items_included reported a nonzero count.
+            **_compact_fields(sym, adj_score, item_tokens),
         })
 
     # Negative evidence for low-confidence or empty results
@@ -475,6 +508,8 @@ def _get_ranked_context_fusion(
             "channels": {k: round(v, 6) for k, v in fr.channel_contributions.items()} if fr else {},
             "tokens": item_tokens,
             "source": source,
+            # Compact-encoder display fields (#354) — see non-fusion path.
+            **_compact_fields(sym, adj_score, item_tokens),
         })
 
     raw_bytes = sum(

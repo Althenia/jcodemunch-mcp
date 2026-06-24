@@ -136,6 +136,23 @@ _SECRET_GLOB_SAFE_EXTENSIONS: frozenset[str] = frozenset({
 # Patterns that should NOT be applied to doc extensions (too broad for prose files).
 _SECRET_DOC_EXEMPT_PATTERNS: frozenset[str] = frozenset({"*secret*"})
 
+# Programming-language source extensions. A module named secret_redaction.py /
+# secret_scanner.ts is code that *handles* secrets, not a credential file, so the
+# broad *secret* basename glob must not skip it (#351). This is deliberately a
+# curated PROGRAMMING-language set, NOT the full parser registry: data/config
+# markup (.yaml/.json/.toml/.xml/.ini/.env/.csv) is excluded so a real
+# credential file like prod-secrets.yaml is still flagged.
+_SECRET_GLOB_SAFE_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
+    ".py", ".pyw", ".pyi",
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".go", ".rs", ".rb", ".php", ".java", ".kt", ".kts", ".scala",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx",
+    ".cs", ".swift", ".dart", ".m", ".mm",
+    ".sh", ".bash", ".zsh", ".fish", ".ps1",
+    ".lua", ".pl", ".pm", ".r", ".ex", ".exs", ".erl", ".clj", ".cljs",
+    ".fs", ".fsx", ".vb", ".groovy", ".sql",
+})
+
 # Directory segments that conventionally hold credential material (Kubernetes
 # Secrets, Terraform, Docker secrets, Ansible vault dirs, …). Matched as WHOLE
 # path segments — never as substrings — so a service directory like
@@ -200,7 +217,16 @@ def is_secret_file(file_path: str) -> bool:
     for pattern in SECRET_PATTERNS:
         if pattern in excluded:
             continue
-        if pattern in _SECRET_DOC_EXEMPT_PATTERNS and ext in _SECRET_GLOB_SAFE_EXTENSIONS:
+        # The broad `*secret*` glob is exempted for documentation extensions
+        # (docs/secrets-handling.md) and for source-code extensions
+        # (secret_redaction.py, secret_scanner.ts) — both name code/prose that
+        # discusses or handles secrets, not credential material (#351). The
+        # narrow patterns (*.pem, *.key, credentials.json, …) still apply to
+        # every extension.
+        if pattern in _SECRET_DOC_EXEMPT_PATTERNS and (
+            ext in _SECRET_GLOB_SAFE_EXTENSIONS
+            or ext in _SECRET_GLOB_SAFE_SOURCE_EXTENSIONS
+        ):
             continue
         if fnmatch.fnmatch(name, pattern):
             return True

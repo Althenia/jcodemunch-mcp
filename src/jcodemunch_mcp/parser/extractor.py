@@ -721,6 +721,21 @@ def _extract_name(node, spec: LanguageSpec, source_bytes: bytes) -> Optional[str
                     return source_bytes[name_node.start_byte:name_node.end_byte].decode("utf-8")
         return None
 
+    # Python 3.12+ type alias: `type Name = ...`. The `left` field is a `type`
+    # node wrapping the alias name (an identifier, or a generic_type whose first
+    # identifier is the name, e.g. `type Vec[T] = ...` -> "Vec"). Descend to the
+    # first identifier so both plain and generic aliases resolve.
+    if node.type == "type_alias_statement" and spec.ts_language == "python":
+        left = node.child_by_field_name("left")
+        if left is not None:
+            stack = [left]
+            while stack:
+                cur = stack.pop(0)
+                if cur.type == "identifier":
+                    return source_bytes[cur.start_byte:cur.end_byte].decode("utf-8")
+                stack.extend(cur.children)
+        return None
+
     # Dart: type_alias name is the first type_identifier child
     if node.type == "type_alias" and spec.ts_language == "dart":
         for child in node.children:

@@ -136,16 +136,30 @@ def encode(
         rows = response.get(t.key, []) or []
         out_rows: list[list[Any]] = []
         intern_set = set(t.intern)
+        any_value = False
         for row in rows:
             if not isinstance(row, dict):
                 continue
             encoded_row: list[Any] = []
             for c in t.cols:
                 v = row.get(c)
+                if v is not None and v != "":
+                    any_value = True
                 if c in intern_set and isinstance(v, str):
                     v = legend.encode_prefix(v)
                 encoded_row.append(v)
             out_rows.append(encoded_row)
+        # Fail closed (#354): a producer dict whose keys don't match any declared
+        # column encodes to all-blank cells, so the agent sees "N items" with no
+        # usable data. If a table has rows but every declared column came back
+        # empty across all of them, the schema and producer disagree — raise so
+        # the dispatcher falls back to JSON and the real data survives the wire.
+        if out_rows and not any_value:
+            raise ValueError(
+                f"schema/producer mismatch: table {t.key!r} has "
+                f"{len(out_rows)} row(s) but no declared column "
+                f"({'|'.join(t.cols)}) was populated"
+            )
         sections.append(write_table(t.tag, out_rows))
 
     header = write_header(tool, encoding_id)

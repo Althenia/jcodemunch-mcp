@@ -9,7 +9,7 @@ from typing import Callable, Optional
 from .. import config as _config
 from ..parser import LANGUAGE_EXTENSIONS, get_language_for_path
 from ..parser.context import discover_providers, collect_metadata
-from ..security import validate_path
+from ..security import validate_path, is_secret_file
 from ..storage import IndexStore
 from ..storage.index_store import _file_hash, _get_git_head, _get_git_branch
 from ._indexing_pipeline import parse_and_prepare_incremental
@@ -87,6 +87,22 @@ def index_file(
 
     # Compute rel_path, hash, and mtime
     rel_path = file_path.relative_to(source_root).as_posix()
+
+    # Eligibility: match index_folder's discovery filter so a manual index_file
+    # call cannot add a credential file that the next full folder index would
+    # skip and then prune — the flip-flop in #351. is_secret_file already exempts
+    # source modules (e.g. secret_redaction.py) after the same-issue fix, so this
+    # only refuses actual credential files (.env, *.pem, secrets/db.yaml, …).
+    if is_secret_file(rel_path):
+        return {
+            "success": False,
+            "error": (
+                f"Skipped secret/credential file: {rel_path}. "
+                "Folder indexing skips this file too, so indexing it here would "
+                "not survive the next full index."
+            ),
+            "skipped": "secret",
+        }
 
     # Check language support
     ext = file_path.suffix

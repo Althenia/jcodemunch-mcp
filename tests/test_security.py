@@ -146,14 +146,29 @@ class TestSecretDetection:
     @pytest.mark.parametrize("path", [
         "config/secrets.yaml",
         "config/secrets.json",
-        "src/secrets.py",
         ".secrets",
         "app.secrets",
         "my-app-secrets",
     ])
     def test_non_doc_secret_files_still_flagged(self, path):
-        """Non-doc files with 'secret' in the name must still be caught."""
+        """Non-doc, non-source files with 'secret' in the name must still be caught."""
         assert is_secret_file(path) is True
+
+    @pytest.mark.parametrize("path", [
+        # #351: a SOURCE module named *secret* is code that HANDLES secrets, not a
+        # credential file. The broad *secret* basename glob must carve it out the
+        # same way it does documentation, so folder + index_file indexing agree.
+        "src/secret_redaction.py",
+        "src/secret_scanner.ts",
+        "src/secrets.py",
+        "src/utils/mysecretstuff.py",
+        "tools/secret_manager.rs",
+        "queries/secrets.sql",
+        "cmd/secret_loader.go",
+    ])
+    def test_source_modules_with_secret_basename_not_flagged(self, path):
+        """#351: source-code extensions are exempt from the broad *secret* glob."""
+        assert is_secret_file(path) is False
 
     # --- Substring-vs-segment regression (the secrets-manager false positive) ---
 
@@ -189,7 +204,8 @@ class TestSecretDetection:
         "services/secrets-manager/certs/server.pem",
         "services/secrets-manager/credentials.json",
         "deploy/secret-config/private.key",
-        "src/utils/mysecretstuff.py",
+        # A non-source data file whose basename matches *secret* is still flagged.
+        "data/mysecretstuff.csv",
     ])
     def test_basename_secret_hits_flagged_anywhere(self, path):
         """Basename pattern matches fire no matter the parent directory."""

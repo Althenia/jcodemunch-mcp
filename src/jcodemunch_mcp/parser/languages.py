@@ -253,6 +253,12 @@ PYTHON_SPEC = LanguageSpec(
     symbol_node_types={
         "function_definition": "function",
         "class_definition": "class",
+        # Python 3.12+ `type X = ...` alias statement. Listed here (not only in
+        # the never-consumed `type_patterns`) so the generic walker emits it as a
+        # symbol, mirroring how TS/Go/Rust/etc. carry their type nodes. Name comes
+        # from a dedicated `_extract_name` branch (the alias name is nested under
+        # the `left` field, not a direct `name` field).
+        "type_alias_statement": "type",
     },
     name_fields={
         "function_definition": "name",
