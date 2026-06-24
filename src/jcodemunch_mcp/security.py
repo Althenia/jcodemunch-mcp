@@ -90,156 +90,68 @@ def is_symlink_escape(root: Path, path: Path) -> bool:
 
 
 # --- Secret File Detection ---
+#
+# The classifier itself lives in `secret_classifier.py` (a pure, structured,
+# group-based credential detector). This module owns the boolean public API and
+# the translation of the `exclude_secret_patterns` config key into the
+# classifier's override knobs.
 
-SECRET_PATTERNS = [
-    "*.env",
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "*.credentials",
-    "*.keystore",
-    "*.jks",
-    "*.token",
-    "*secret*",
-    "id_rsa",
-    "id_rsa.*",
-    "id_ed25519",
-    "id_ed25519.*",
-    "id_dsa",
-    "id_ecdsa",
-    ".htpasswd",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    "credentials.json",
-    "service-account*.json",
-    "*.secrets",
-]
+from .secret_classifier import (  # noqa: E402  (kept beside its callers)
+    ALL_GROUPS as _SECRET_GROUPS,
+    GROUP_BROAD_BASENAME as _GROUP_BROAD,
+    GROUP_SECRET_STORE as _GROUP_STORE,
+    classify_secret_file,
+)
 
 
-# Doc extensions that are safe from the broad *secret* glob. A file like
-# "secrets-handling.md" is documentation about secrets, never a credential file.
-# More specific patterns (*.key, *.pem, credentials.json, etc.) still apply to
-# all extensions regardless of this set.
-_SECRET_GLOB_SAFE_EXTENSIONS: frozenset[str] = frozenset({
-    ".md", ".markdown", ".mdx",
-    ".rst",
-    ".txt",
-    ".adoc", ".asciidoc", ".asc",
-    ".html", ".htm",
-    ".ipynb",
-})
+def _resolve_secret_overrides(excluded: list[str]) -> tuple[set[str], list[str]]:
+    """Translate `exclude_secret_patterns` entries into classifier overrides.
 
-# Patterns that should NOT be applied to doc extensions (too broad for prose files).
-_SECRET_DOC_EXEMPT_PATTERNS: frozenset[str] = frozenset({"*secret*"})
+    Three accepted forms, for backward compatibility and the new group-aware
+    control:
 
-# Programming-language source extensions. A module named secret_redaction.py /
-# secret_scanner.ts is code that *handles* secrets, not a credential file, so the
-# broad *secret* basename glob must not skip it (#351). This is deliberately a
-# curated PROGRAMMING-language set, NOT the full parser registry: data/config
-# markup (.yaml/.json/.toml/.xml/.ini/.env/.csv) is excluded so a real
-# credential file like prod-secrets.yaml is still flagged.
-_SECRET_GLOB_SAFE_SOURCE_EXTENSIONS: frozenset[str] = frozenset({
-    ".py", ".pyw", ".pyi",
-    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-    ".go", ".rs", ".rb", ".php", ".java", ".kt", ".kts", ".scala",
-    ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx",
-    ".cs", ".swift", ".dart", ".m", ".mm",
-    ".sh", ".bash", ".zsh", ".fish", ".ps1",
-    ".lua", ".pl", ".pm", ".r", ".ex", ".exs", ".erl", ".clj", ".cljs",
-    ".fs", ".fsx", ".vb", ".groovy", ".sql",
-})
-
-# Directory segments that conventionally hold credential material (Kubernetes
-# Secrets, Terraform, Docker secrets, Ansible vault dirs, …). Matched as WHOLE
-# path segments — never as substrings — so a service directory like
-# "secrets-manager" is not mistaken for a secret store.
-_SECRET_DIR_NAMES: frozenset[str] = frozenset({"secret", "secrets"})
-
-# Non-source data/config/credential extensions. A file with one of these
-# extensions sitting inside a _SECRET_DIR_NAMES directory is treated as secret
-# material even when its basename is innocuous (e.g. "secrets/database.yaml").
-# Source-code and documentation extensions are deliberately excluded: a .go/.py
-# file under "secrets/" is code that *handles* secrets, not a secret itself.
-_SECRET_BEARING_EXTENSIONS: frozenset[str] = frozenset({
-    ".yaml", ".yml", ".json", ".ini", ".cfg", ".conf", ".config",
-    ".properties", ".toml", ".xml", ".env",
-    ".tfvars", ".tfstate",
-    ".pem", ".key", ".crt", ".cer", ".der", ".p12", ".pfx",
-    ".jks", ".keystore",
-})
+    - A classifier group slug (e.g. ``"key_material_directories"``) disables
+      that whole group.
+    - The legacy ``"*secret*"`` token disables the broad-basename group AND its
+      directory analogue (the secret-store data group), matching the pre-redesign
+      opt-out so existing configs behave the same.
+    - Any other glob becomes an allow pattern — a file matching it is never
+      treated as secret (the per-pattern opt-out, e.g. ``"*.pem"``).
+    """
+    disabled: set[str] = set()
+    allow: list[str] = []
+    for entry in excluded:
+        if entry in _SECRET_GROUPS:
+            disabled.add(entry)
+        elif entry == "*secret*":
+            disabled.add(_GROUP_BROAD)
+            disabled.add(_GROUP_STORE)
+        else:
+            allow.append(entry)
+    return disabled, allow
 
 
 def is_secret_file(file_path: str) -> bool:
-    """Check if a file path matches known secret file patterns.
+    """Return True if a path is judged to be a secret/credential file.
 
-    Two stages, deliberately **not** a substring scan of the whole path:
+    Thin boolean wrapper over :func:`secret_classifier.classify_secret_file`,
+    applying the project's ``exclude_secret_patterns`` overrides. Use the
+    classifier directly when the structured verdict (reason / group / confidence)
+    is needed (logging, diagnostics).
 
-    1. **Basename patterns.** Every entry in :data:`SECRET_PATTERNS` is a
-       basename pattern (``.env``, ``*.pem``, ``id_rsa``, ``*secret*``, …),
-       matched against the file's basename only. The broad ``*secret*`` glob
-       used to be run against the *full* path, which dropped entire legitimate
-       subtrees — e.g. every file under a ``services/secrets-manager/``
-       microservice — because the directory name contains the substring
-       ``secret``. ``*secret*`` is still skipped for known documentation
-       extensions (.md, .rst, .txt, .adoc, .html, .ipynb, …) so a file like
-       ``docs/secrets-handling.md`` is never flagged.
-
-    2. **Secret-store directories.** Credentials are also commonly stored as
-       data/config files inside a directory whose *whole-segment* name is
-       ``secret`` or ``secrets`` (Kubernetes Secrets, Terraform, Docker
-       secrets, …) under an innocuous basename like ``database.yaml``. Such a
-       file is flagged when it lives under a ``secret``/``secrets`` path segment
-       **and** its extension is a non-source data/credential extension
-       (:data:`_SECRET_BEARING_EXTENSIONS`). Source files (``.go``, ``.rs``,
-       ``.py``, …) and docs under those directories are treated as code that
-       *handles* secrets, not as secret material, and are not flagged. Only the
-       exact segments ``secret``/``secrets`` trigger this — ``secrets-manager``
-       is a service, not a store.
-
-    Args:
-        file_path: Relative file path (forward slashes).
-
-    Returns:
-        True if the file is judged to be a secret/credential file.
+    The classifier never reads file contents — it decides from the basename and
+    directory shape only. A source module that *handles* secrets
+    (``secret_redaction.py``) is code, not credential material, and is not
+    flagged; an actual credential file (``.env``, ``*.pem``, ``secrets/db.yaml``,
+    ``.aws/credentials``) is.
     """
-    import fnmatch
-
-    name = os.path.basename(file_path).lower()
-    _, ext = os.path.splitext(name)
-
-    excluded = set(_config.get("exclude_secret_patterns", []))
-
-    # Stage 1 — basename patterns.
-    for pattern in SECRET_PATTERNS:
-        if pattern in excluded:
-            continue
-        # The broad `*secret*` glob is exempted for documentation extensions
-        # (docs/secrets-handling.md) and for source-code extensions
-        # (secret_redaction.py, secret_scanner.ts) — both name code/prose that
-        # discusses or handles secrets, not credential material (#351). The
-        # narrow patterns (*.pem, *.key, credentials.json, …) still apply to
-        # every extension.
-        if pattern in _SECRET_DOC_EXEMPT_PATTERNS and (
-            ext in _SECRET_GLOB_SAFE_EXTENSIONS
-            or ext in _SECRET_GLOB_SAFE_SOURCE_EXTENSIONS
-        ):
-            continue
-        if fnmatch.fnmatch(name, pattern):
-            return True
-
-    # Stage 2 — data/credential files inside a secret-store directory. Gated by
-    # the same opt-out as the broad *secret* glob, since this is its directory
-    # analogue. Whole-segment match only, so "secrets-manager" does not qualify.
-    if "*secret*" not in excluded and ext in _SECRET_BEARING_EXTENSIONS:
-        parents = os.path.dirname(file_path).lower().replace("\\", "/").split("/")
-        if any(segment in _SECRET_DIR_NAMES for segment in parents):
-            return True
-
-    return False
+    excluded = list(_config.get("exclude_secret_patterns", []) or [])
+    disabled, allow = _resolve_secret_overrides(excluded)
+    return classify_secret_file(
+        file_path,
+        disabled_groups=disabled,
+        allow_patterns=allow,
+    ).is_secret
 
 
 # --- Binary File Detection ---

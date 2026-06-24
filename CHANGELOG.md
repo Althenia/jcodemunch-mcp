@@ -2,6 +2,56 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.79] - 2026-06-23 - Structured credential-file classifier (#351 redesign)
+
+Completes the broader credential classifier deferred from v1.108.78 (#351,
+reported by @mmashwani). Clean-room implementation in our own idiom, validated
+against the 85-case oracle the reporter attached.
+
+### Changed
+
+- **Secret-file detection is now a structured, group-based classifier**
+  (`secret_classifier.classify_secret_file` → `SecretFileDecision` with
+  `reason`/`group`/`matched_pattern`/`confidence`). `security.is_secret_file`
+  stays the boolean public API and now delegates to it. Filename/path shape only
+  — it never reads file contents. New groups, in precedence order:
+  - **path_specific_credentials** — credential stores only a path identifies:
+    `.aws/credentials`, `.kube/config`, `.docker/config.json`,
+    `.config/gcloud/application_default_credentials.json`, `.azure/accessTokens.json`,
+    `.cargo/credentials[.toml]`, `.gem/credentials`, `composer/auth.json`.
+  - **exact_credential_names** — expanded: `client_secret*.json`,
+    `oauth2_client_secret*.json`, `application_default_credentials.json`,
+    `*-firebase-adminsdk-*.json`, `token.json`, `*.agekey` added.
+  - **key_material_directories** — private-key/keystore files under `keys/`,
+    `certs/`, `ssl/`, `tls/`, `pki/`, … (private-key extensions only).
+  - **credential_extensions** — adds `*.p8`, `*.ppk`.
+  - **secret_store_data** — directory segments expanded to `credential`,
+    `credentials`, `creds`, `vault`; compound suffixes (`*.tfstate.backup`,
+    `*.tfvars.json`, `*.auto.tfvars`) handled.
+  - **broad_secret_basename** — now **token-boundary** (`(^|[._-])secrets?($|[._-])`)
+    so `prod-secrets.yaml` matches but `secretariat.csv` / `prodsecret.yaml` do not.
+
+- **Behavior corrections (all toward fewer false positives/negatives):**
+  - **Public** SSH keys (`*.pub`) and **public** certificates (`*.crt`/`*.cer`/
+    `*.der`, even under `secrets/`) are no longer treated as secret material; the
+    private key beside them still is.
+  - Template/example fixtures (`*.example`, `*.sample`, `*.template`, `*.tmpl`,
+    `*.dist`) are exempt.
+  - `secret`-as-substring basenames (`secretariat.csv`, `mysecretstuff.csv`) are
+    no longer skipped.
+  - Path-specific credential stores that basename matching never caught
+    (`.aws/credentials`, `.kube/config`, …) are now excluded.
+
+- **`exclude_secret_patterns` is group-aware.** An entry that is a group slug
+  (e.g. `key_material_directories`) disables that whole group; the legacy
+  `*secret*` token disables the broad-basename + secret-store groups (unchanged
+  behavior for existing configs); any other glob is a per-pattern allow.
+
+New `secret_classifier.py` + `tests/test_secret_classifier.py` (82 cases mirroring
+the oracle). `security.py` delegates; `tests/test_security.py` reconciled to the
+corrected policy (public keys/certs, token-boundary). `SECURITY.md` rewritten for
+the group model. Full suite 4930 passed / 7 skipped. Closes #351.
+
 ## [1.108.78] - 2026-06-23 - Issue batch: type aliases, ranked-context compact rows, watcher health, secret-name source modules
 
 Four source-cited correctness fixes (all reported by @mmashwani).

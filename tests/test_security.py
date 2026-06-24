@@ -15,7 +15,6 @@ from jcodemunch_mcp.security import (
     is_binary_file,
     safe_decode,
     should_exclude_file,
-    SECRET_PATTERNS,
     BINARY_EXTENSIONS,
     DEFAULT_MAX_INDEX_FILES,
     MAX_INDEX_FILES_ENV_VAR,
@@ -98,7 +97,6 @@ class TestSecretDetection:
         "private.key",
         "cert.p12",
         "id_rsa",
-        "id_rsa.pub",
         "id_ed25519",
         "credentials.json",
         ".htpasswd",
@@ -118,6 +116,9 @@ class TestSecretDetection:
         "server.go",
         "Dockerfile",
         "package.json",
+        # Public SSH key / public certificate companions are NOT secret material.
+        "id_rsa.pub",
+        "id_ed25519.pub",
     ])
     def test_non_secret_files_pass(self, filename):
         assert is_secret_file(filename) is False
@@ -204,12 +205,24 @@ class TestSecretDetection:
         "services/secrets-manager/certs/server.pem",
         "services/secrets-manager/credentials.json",
         "deploy/secret-config/private.key",
-        # A non-source data file whose basename matches *secret* is still flagged.
-        "data/mysecretstuff.csv",
+        # A non-source data file whose basename carries a `secret` token at a
+        # word boundary is still flagged (here `prod-secrets`).
+        "data/prod-secrets.csv",
     ])
     def test_basename_secret_hits_flagged_anywhere(self, path):
         """Basename pattern matches fire no matter the parent directory."""
         assert is_secret_file(path) is True
+
+    @pytest.mark.parametrize("path", [
+        # #351 redesign: the broad heuristic is now token-boundary, so a `secret`
+        # SUBSTRING inside another word no longer matches a non-source data file.
+        "data/mysecretstuff.csv",
+        "data/secretariat.csv",
+        "data/prodsecret.yaml",
+    ])
+    def test_secret_substring_in_data_basename_not_flagged(self, path):
+        """Token-boundary heuristic: `secret` inside a larger word does not match."""
+        assert is_secret_file(path) is False
 
     @pytest.mark.parametrize("path", [
         # THE HOLE the basename-only fix opens: data/config files with innocuous
@@ -219,16 +232,30 @@ class TestSecretDetection:
         "app/secrets/oauth.json",
         "deploy/secrets/values.yml",
         "infra/secret/backend.tfvars",
-        "k8s/secrets/tls.crt",
         "k8s/secrets/tls.key",
         "ansible/secret/vault.ini",
         "etc/secrets/app.properties",
+        # Expanded secret-store directory segments (#351 redesign).
+        "config/credentials/database.toml",
+        "vault/prod.auto.tfvars",
+        "secrets/terraform.tfstate.backup",
     ])
     def test_data_files_in_secret_store_dirs_still_flagged(self, path):
         """Regression for the basename-only over-correction: credential data
-        files under an exact 'secret'/'secrets' directory segment must remain
+        files under an exact secret-store directory segment must remain
         excluded even though their basenames match no pattern."""
         assert is_secret_file(path) is True
+
+    @pytest.mark.parametrize("path", [
+        # A PUBLIC certificate is not secret material just because it sits under a
+        # secret-store directory (#351 redesign); the private key beside it is
+        # still caught by its extension.
+        "k8s/secrets/tls.crt",
+        "k8s/secrets/ca.cer",
+    ])
+    def test_public_certs_in_secret_store_dirs_not_flagged(self, path):
+        """Public cert extensions are not credential material."""
+        assert is_secret_file(path) is False
 
     @pytest.mark.parametrize("path", [
         # "secrets-manager" / "secret-config" are service names, not stores:

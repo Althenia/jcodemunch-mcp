@@ -37,18 +37,43 @@ Files are filtered through multiple layers:
 
 ## Secret Exclusion
 
-Files matching known secret patterns are excluded during indexing.
+Credential files are excluded during indexing by a structured classifier
+(`secret_classifier.classify_secret_file`, behind the `security.is_secret_file`
+boolean). It decides from the **filename and directory shape only** — it never
+reads file contents. Detection is organized into groups, in precedence order:
 
-**Excluded patterns include:**
+* **Exact credential names:** `.env`, `.env.*`, `.htpasswd`, `.netrc`, `.npmrc`,
+  `.pypirc`, `credentials.json`, `service-account*.json`, `client_secret*.json`,
+  `application_default_credentials.json`, `*-firebase-adminsdk-*.json`,
+  `token.json`, `*.token`, `*.credentials`, `*.secrets`, `*.agekey`, and SSH
+  private keys (`id_rsa*`, `id_ed25519*`, `id_dsa*`, `id_ecdsa*`).
+* **Credential extensions:** `*.pem`, `*.key`, `*.p8`, `*.p12`, `*.pfx`, `*.ppk`,
+  `*.jks`, `*.keystore`.
+* **Path-specific credentials:** `~/.aws/credentials`, `~/.kube/config`,
+  `~/.docker/config.json`, `~/.config/gcloud/application_default_credentials.json`,
+  `~/.azure/accessTokens.json`, `~/.cargo/credentials[.toml]`, `~/.gem/credentials`,
+  `composer/auth.json` — credential stores that only a path (not a basename) names.
+* **Key-material directories:** a private-key/keystore file under `keys/`,
+  `certs/`, `ssl/`, `tls/`, `pki/`, … (private-key extensions only — **public**
+  certs `*.crt`/`*.cer`/`*.der` are not excluded just for living here).
+* **Secret-store data:** data/config files (`*.yaml`, `*.json`, `*.tfvars`,
+  `*.tfstate[.backup]`, …) under a whole-segment `secret`/`secrets`/`credential`/
+  `credentials`/`creds`/`vault` directory.
+* **Broad `secret` basename:** a `secret`/`secrets` token at a **word boundary**
+  (so `prod-secrets.yaml` is excluded but `secretariat.csv` is not), excluding
+  source-code and documentation files (`secret_redaction.py` is code that
+  *handles* secrets, not a credential file).
 
-* Environment files: `.env`, `.env.*`, `*.env`
-* Certificates / keys: `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.keystore`, `*.jks`
-* SSH keys: `id_rsa*`, `id_ed25519*`, `id_dsa*`, `id_ecdsa*`
-* Credentials: `credentials.json`, `service-account*.json`, `*.credentials`
-* Auth files: `.htpasswd`, `.netrc`, `.npmrc`, `.pypirc`
-* Generic secret indicators: `*secret*`, `*.secrets`, `*.token`
+**Not excluded:** public SSH keys (`*.pub`), public certificates, template /
+example fixtures (`*.example`, `*.sample`, `*.template`, `*.tmpl`, `*.dist`).
 
-When a secret file is detected, a warning is included in the indexing response. Secret files are never stored in the index or cached content directory.
+**Overrides** (`exclude_secret_patterns` config key): a group slug (e.g.
+`key_material_directories`) disables that whole group; the legacy `*secret*`
+token disables the broad-basename and secret-store groups; any other glob is a
+per-pattern allow (a matching file is never treated as secret).
+
+When a secret file is detected, a warning is included in the indexing response.
+Secret files are never stored in the index or cached content directory.
 
 ---
 
