@@ -1,23 +1,23 @@
 {
-  "current": "1.108.76",
+  "current": "1.108.83",
   "entries": [
     {
-      "version": "1.108.76",
-      "date": "2026-06-22",
-      "title": "Quality gates: CI lint (ruff) + coverage floor",
-      "summary": "- **Ruff lint gate.** New `lint` CI job runs `ruff check src/` once (platform-independent). `[tool.ruff.lint]` in pyproject keeps the high-signal pyflakes + pycodestyle-error rules and grandfathers this codebase's deliberate patterns via `ignore` (E402 lazy/local imports, plus E701/E721/E731/E741);"
+      "version": "1.108.83",
+      "date": "2026-06-26",
+      "title": "Tame watch-all CPU under WSL (#356)",
+      "summary": "`watch-all` pegged 15-30% CPU continuously on WSL (reported by @Blainexi). Root cause is `watchfiles` behavior, not a busy loop: **watchfiles auto-enables polling whenever it detects WSL** (inotify is unreliable across the WSL boundary), and its default 300ms poll interval re-stats the entire watched tree"
     },
     {
-      "version": "1.108.75",
-      "date": "2026-06-22",
-      "title": "Quality gates: live core_compact ceiling + schema/dispatch param parity",
-      "summary": "- **Hard live `core_compact <= 4000` assertion (WI-3.3 / F-Q03).** The existing success-criterion test read the frozen `schema_baseline.json`, so a description or param breach (e.g. v1.108.70's transient 3956->4011) only failed after the baseline was regenerated. New `test_live_core_compact_under_4000_hard_ceiling`"
+      "version": "1.108.82",
+      "date": "2026-06-24",
+      "title": "Exclude org_savings.db from list_repos",
+      "summary": "The team-SKU org-rollup store (`org_savings.db`, written by `org/store.py`) lives in `~/.code-index/` alongside per-repo index `.db` files, but `list_repos` only excluded `telemetry.db`. So `org_savings.db` was enumerated as a phantom `local/org_savings` repo (symbol_count 0, empty source_root) \u2014 it showed an"
     },
     {
-      "version": "1.108.74",
-      "date": "2026-06-22",
-      "title": "Harden: tool errors carry isError (MCP protocol conformance)",
-      "summary": "- **Tool failures now set `isError` on the result.** Errors were returned in-band only: a `{\"error\": ...}` JSON body inside a plain content list, which the SDK wraps as `CallToolResult(isError=False)`. A non-Claude MCP client that branches on `isError` therefore saw a failure as a success (PRD F-P01). `call_tool` now"
+      "version": "1.108.81",
+      "date": "2026-06-24",
+      "title": "Lazy git identity probe in get_watch_status / list-repos",
+      "summary": "`list-repos` (and `get_watch_status`) grew slow on hosts with many indexed repos \u2014 60s+ in the wild \u2014 because `get_watch_status` resolved each discovered repo's reindex-state key up front, and that resolution (`_reindex_key` \u2192 `resolve_index_identity`) is a **git identity probe**: roughly one git"
     }
   ]
 }

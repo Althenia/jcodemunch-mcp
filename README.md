@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.76](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.76)** (2026-06-22) — Quality gates: CI lint (ruff) + coverage floor
-- **[v1.108.75](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.75)** (2026-06-22) — Quality gates: live core_compact ceiling + schema/dispatch param parity
-- **[v1.108.74](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.74)** (2026-06-22) — Harden: tool errors carry isError (MCP protocol conformance)
+- **[v1.108.83](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.83)** (2026-06-26) — Tame watch-all CPU under WSL (#356)
+- **[v1.108.82](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.82)** (2026-06-24) — Exclude org_savings.db from list_repos
+- **[v1.108.81](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.81)** (2026-06-24) — Lazy git identity probe in get_watch_status / list-repos
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
