@@ -446,6 +446,20 @@ only extra that bundles them together.
 
 </details>
 
+#### Upgrading
+
+Upgrade through whatever installed it, then restart your editor / MCP client so
+it relaunches the server on the new version:
+
+```bash
+pip install -U jcodemunch-mcp          # pip
+pipx upgrade jcodemunch-mcp            # pipx
+uv tool upgrade jcodemunch-mcp        # uv tool
+uvx jcodemunch-mcp@latest --help      # uvx (forces a cache refresh)
+```
+
+Check what you're running with `jcodemunch-mcp --version`.
+
 #### 2. Add it to your MCP client
 
 If you’re using Claude Code, pick whichever matches what you installed in step 1.
