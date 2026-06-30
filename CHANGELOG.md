@@ -2,6 +2,27 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.87] - 2026-06-30 - License v1.1: tighten redistribution & attribution terms
+
+Dual-Use License updated to **v1.1**. The non-commercial grant previously
+allowed open-ended "distribute," which permitted repackaging the project under a
+different name and republishing it to public package registries. v1.1 keeps
+non-commercial **use, copy, and modify** free, but narrows redistribution:
+
+- Verbatim, non-commercial sharing is still allowed, but only with all notices
+  retained, **under the original name**, and **not** uploaded to any public
+  package registry/index/marketplace (PyPI, npm, crates.io, etc.).
+- No listing anyone other than the original author as author, and no
+  representing the author as the publisher/maintainer/endorser of a modified or
+  renamed version.
+- Added a "No use of name or marks" clause (jCodeMunch / jCodeMunch-MCP / Munch /
+  jMunch / the author's name).
+- Renamed, repackaged, derivative, or registry redistribution now requires prior
+  written permission.
+
+Commercial terms and the disclaimer are unchanged. Documentation/licensing only;
+no code or behavior change, no INDEX_VERSION bump.
+
 ## [1.108.86] - 2026-06-30 - `watch-all` announces its steady state (#357)
 
 `watch-all` is a long-lived foreground daemon: it indexes, then blocks watching
