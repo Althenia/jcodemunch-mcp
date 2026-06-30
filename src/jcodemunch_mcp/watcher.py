@@ -316,6 +316,13 @@ async def _watch_single(
     except ImportError as exc:
         raise ImportError(_watchfiles_missing_msg()) from exc
 
+    # The watcher now blocks here until a file changes. Without a line saying so,
+    # the silence after the initial index reads as a hang (reported twice).
+    _watcher_output(
+        f"  Now watching {folder_path} for changes (idle until you edit a file).",
+        quiet=quiet, log_file_handle=log_file_handle,
+    )
+
     async for changes in awatch(
         folder_path,
         debounce=debounce_ms,

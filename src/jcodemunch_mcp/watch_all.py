@@ -146,6 +146,18 @@ async def watch_all(
     for folder in initial:
         await manager.add_folder(folder)
 
+    # watch-all is a long-lived foreground daemon: it indexes, then blocks
+    # watching for edits. Say so once up front so the post-index silence isn't
+    # mistaken for a hang, and point at the background-service alternative.
+    if initial:
+        _watcher_output(
+            f"jcodemunch-mcp watch-all: watching {len(initial)} repo(s). It stays "
+            "running and re-indexes on every file change. Press Ctrl+C to stop. "
+            "To run it in the background as a login service instead: "
+            "jcodemunch-mcp watch-install",
+            quiet=quiet, log_file_handle=log_file_handle,
+        )
+
     rediscover_task = asyncio.create_task(_rediscover_loop(), name="watch-all:rediscover")
     run_task = asyncio.create_task(manager.run(), name="watch-all:manager")
 

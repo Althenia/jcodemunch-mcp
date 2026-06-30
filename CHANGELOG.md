@@ -2,6 +2,25 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.86] - 2026-06-30 - `watch-all` announces its steady state (#357)
+
+`watch-all` is a long-lived foreground daemon: it indexes, then blocks watching
+for file changes. The silence after the initial index was read as a hang twice
+(@zakblacki). Nothing was wrong — but a daemon that goes quiet should say so.
+
+### Changed
+
+- **`watch-all` prints a one-time guidance line after seeding repos**: how many
+  repos it's watching, that it stays running and re-indexes on every change, that
+  Ctrl+C stops it, and that `jcodemunch-mcp watch-install` runs it in the
+  background as a login service instead.
+- **Each repo prints `Now watching <path> for changes (idle until you edit a
+  file).`** right after its initial index, so the per-repo silence is expected,
+  not mysterious.
+
+Output-only; no behavior change. New `tests/test_v1_108_86.py`. Files:
+`watch_all.py`, `watcher.py`.
+
 ## [1.108.85] - 2026-06-29 - Install-mechanism-aware `watch` hint + migration-warning de-spam (#357)
 
 Two `watch-all` papercuts surfaced by @zakblacki (pipx install, py3.14) while
