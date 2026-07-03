@@ -48,9 +48,9 @@ no longer referenced.
 from __future__ import annotations
 
 import asyncio
-import gzip
 import logging
 import os
+import zlib
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -188,28 +188,68 @@ def _resolve_repo_param(request: "Request") -> Optional[tuple[str, str]]:
     return None
 
 
+def _bounded_gunzip(raw: bytes, cap: int) -> Optional[bytes]:
+    """Gzip-decompress at most ``cap`` output bytes; ``None`` when exceeded.
+
+    Decompresses incrementally via zlib so a gzip bomb never materialises
+    more than ``cap + 1`` output bytes in memory. Handles concatenated
+    multi-member streams. Raises ``zlib.error`` on malformed/truncated input.
+    """
+    out = bytearray()
+    buf = raw
+    while buf:
+        d = zlib.decompressobj(wbits=31)
+        while True:
+            out += d.decompress(buf, cap + 1 - len(out))
+            if len(out) > cap:
+                return None
+            buf = d.unconsumed_tail
+            if d.eof or not buf:
+                break
+        if not d.eof:
+            raise zlib.error("compressed stream ended before end-of-stream marker")
+        buf = d.unused_data
+    return bytes(out)
+
+
 async def _read_body(request: "Request") -> tuple[Optional[bytes], Optional[str]]:
     """Read the request body, honouring Content-Encoding: gzip + size cap.
 
     Returns ``(body, error)``. On size-cap violation returns
     ``(None, "...")`` so the caller emits a 413.
+
+    The body is read incrementally from ``request.stream()`` and rejected as
+    soon as the running total crosses the cap, so an over-cap payload is
+    never fully buffered. Gzip bodies are decompressed in bounded chunks
+    (never more than cap + 1 output bytes in memory at once).
     """
     cap = _max_body_bytes()
     encoding = (request.headers.get("content-encoding") or "").strip().lower()
-    raw = await request.body()
-    if len(raw) > cap and encoding != "gzip":
-        return None, (
-            f"request body too large: {len(raw)} bytes > {cap} cap. "
-            f"Increase JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES or split the payload."
-        )
+    # gzip worst-case expands incompressible input by well under 0.1%, so any
+    # compressed body past cap + slack cannot decompress to within the cap.
+    wire_limit = cap + 65536 if encoding == "gzip" else cap
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > wire_limit:
+            return None, (
+                f"request body too large: exceeded the {cap} byte cap "
+                f"({total} bytes read on the wire before rejecting). "
+                f"Increase JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES or split the payload."
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     if encoding == "gzip":
         try:
-            decoded = gzip.decompress(raw)
-        except OSError as exc:
+            decoded = _bounded_gunzip(raw, cap)
+        except zlib.error as exc:
             return None, f"gzip decode failed: {exc}"
-        if len(decoded) > cap:
+        if decoded is None:
             return None, (
-                f"decompressed body too large: {len(decoded)} bytes > {cap} cap "
+                f"decompressed body too large: exceeds the {cap} cap "
                 f"(on-wire was {len(raw)} bytes — declared Content-Encoding: gzip). "
                 f"This is the gzip-bomb guard; tune JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES "
                 f"if your real workload genuinely needs more."

@@ -216,15 +216,17 @@ class NuxtContextProvider(ContextProvider):
                 continue
 
             rel_path = rel.replace("\\", "/")
-            seen: set[str] = set()
+            seen: dict[str, set[str]] = {}
             for m in pattern.finditer(content):
                 name = m.group(1)
                 target = self._auto_import_symbols[name]
-                if target not in seen and target != rel_path:
-                    seen.add(target)
+                if target != rel_path:
+                    seen.setdefault(target, set()).add(name)
 
             if seen:
-                imports = [{"specifier": t, "names": []} for t in sorted(seen)]
+                imports = [
+                    {"specifier": t, "names": sorted(seen[t])} for t in sorted(seen)
+                ]
                 self._extra_imports.setdefault(rel_path, []).extend(imports)
                 edge_count += 1
 

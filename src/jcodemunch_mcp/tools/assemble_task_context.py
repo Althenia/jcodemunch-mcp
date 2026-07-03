@@ -431,14 +431,15 @@ def assemble_task_context(
             # Scope to anchor names when available
             name_filter = anchor_syms[0].get("name", "") if anchor_syms else None
             out = find_hot_paths(
-                repo_id, top_n=5, name_filter=name_filter, storage_path=storage_path,
+                repo_id, query=name_filter, top_n=5, storage_path=storage_path,
             )
             if isinstance(out, dict) and "error" not in out:
-                hot = out.get("hot_paths", []) or []
+                hot = out.get("results", []) or []
                 if hot:
                     _add_entry("runtime", "find_hot_paths", {
                         "hot_paths": [
-                            {"symbol_id": h.get("symbol_id", ""), "hits": h.get("hits", 0),
+                            {"symbol_id": h.get("symbol_id", ""),
+                             "hits": h.get("runtime_count", 0),
                              "p95_ms": h.get("p95_ms", 0)}
                             for h in hot[:5]
                         ],

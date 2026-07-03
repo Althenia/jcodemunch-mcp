@@ -2,6 +2,47 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.95] - 2026-07-03 - Three externally reported fixes: dead runtime stage, streaming ingest body cap, Nuxt edge names
+
+All three findings came from an external security researcher's scan of the
+repo, manually verified against source before shipping. Thanks, Rohit.
+
+### Fixed
+
+- **`assemble_task_context` runtime stage never contributed.** The stage
+  called `find_hot_paths` with an invalid `name_filter` kwarg — every call
+  raised `TypeError`, which the stage's own error handling swallowed at debug
+  level, so the runtime hot-paths signal silently never appeared in any
+  capsule. Fixing the kwarg (`query=`) exposed two more latent mismatches in
+  the same stage that the reporter's scan missed: it read a `hot_paths`
+  response key (the tool returns `results`) and a `hits` row field (the tool
+  returns `runtime_count`). All three fixed; the stage now produces entries
+  whenever runtime traces exist.
+- **HTTP ingest body cap enforced while reading, not after.** `_read_body`
+  buffered the entire request body before checking the size cap, so an
+  over-cap payload was fully allocated in memory before the 413 (flagged as
+  a residual in the v1.108.73 hardening notes). The body is now read
+  incrementally from the request stream and rejected as soon as the running
+  total crosses the cap. Gzip bodies additionally get bounded decompression:
+  a new `_bounded_gunzip` inflates via zlib in capped chunks (never more
+  than cap + 1 output bytes in memory), replacing the old
+  decompress-everything-then-check gzip-bomb guard. Multi-member gzip
+  streams still decode; on-wire gzip is capped at cap + 64 KiB slack (gzip's
+  worst-case expansion is far below that, so no legitimate payload is
+  affected).
+- **Nuxt auto-import edges now carry the imported symbol names.** 
+  `_build_auto_import_edges` matched the auto-imported name but only used it
+  to resolve the target file — edges shipped as `{"specifier": ..., 
+  "names": []}`, so downstream import-graph consumers couldn't tell which
+  composable/util a page actually used. Edges now aggregate every matched
+  name per target: `{"specifier": ..., "names": ["useAuth", ...]}`.
+
+Not a bug (verified and rejected from the same report): ranking telemetry
+`confidence` — `attach_confidence` writes `_meta.confidence` before
+`_record_ranking_event` reads it, so the logged value was never `None`.
+
+No INDEX_VERSION bump. New `tests/test_v1_108_95.py` (12).
+
 ## [1.108.94] - 2026-07-02 - New tool: index_dependency (index the libraries a repo actually uses)
 
 Agents constantly need API ground truth for third-party libraries, and until
