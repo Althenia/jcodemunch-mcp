@@ -19,6 +19,12 @@ from .sqlite_store import SQLiteIndexStore, _VERIFIED_PATHS
 logger = logging.getLogger(__name__)
 
 # Bump this when the index schema changes in an incompatible way.
+# v17 (1.108.96): adds `scip_edges` / `scip_unmapped` / `scip_meta` tables
+# for compile-time evidence ingest (`import-scip`). Compiler-verified
+# reference/implementation edges from a SCIP index file; kept separate
+# from the runtime_* family so runtime coverage stats stay purely
+# observational. Empty and zero-cost until `import-scip` runs.
+# Tables 16-vintage upgrade in place via _migrate_v16_to_v17.
 # v16 (1.98.0): adds `runtime_stack_events(symbol_id, source, severity,
 # count, first_seen, last_seen)` table for Phase 5 stack-frame ingest.
 # Severity ∈ {error, warn, info} per stack frame; lets agents distinguish
@@ -42,7 +48,7 @@ logger = logging.getLogger(__name__)
 # relative to the indexed subdir (not the git root); they are
 # detected as old-format on first v1.96 indexing run and discarded
 # in favour of a fresh git-root-rooted walk.
-INDEX_VERSION = 16
+INDEX_VERSION = 17
 
 
 @dataclass(frozen=True)

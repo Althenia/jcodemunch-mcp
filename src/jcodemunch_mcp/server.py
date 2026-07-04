@@ -7261,6 +7261,24 @@ def main(argv: Optional[list[str]] = None):
     )
     _add_common_args(import_trace_parser)
 
+    # --- import-scip (compile-time evidence: SCIP index ingest) ---
+    import_scip_parser = subparsers.add_parser(
+        "import-scip",
+        help="Ingest a SCIP index file (compiler-verified cross-references) into the scip_* tables",
+    )
+    import_scip_parser.add_argument(
+        "scip_path",
+        metavar="PATH",
+        help="Path to a .scip index file (as emitted by scip-typescript / scip-python / scip-java / scip-go / rust-analyzer; .gz accepted)",
+    )
+    import_scip_parser.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        help="Repo identifier (owner/name) — defaults to resolving the current directory",
+    )
+    _add_common_args(import_scip_parser)
+
     # --- init ---
     init_parser = subparsers.add_parser(
         "init",
@@ -7843,7 +7861,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "health", "file-risk", "observatory", "keyring"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "health", "file-risk", "observatory", "keyring"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -8533,6 +8551,18 @@ def main(argv: Optional[list[str]] = None):
             path=trace_path,
             repo=args.repo,
             redact_enabled=not args.no_redact,
+            storage_path=os.environ.get("CODE_INDEX_PATH"),
+        )
+        print(_json.dumps(result, indent=2))
+        if not result.get("success", True):
+            sys.exit(1)
+    elif args.command == "import-scip":
+        from .tools.import_scip import import_scip as _import_scip
+        import json as _json
+
+        result = _import_scip(
+            path=args.scip_path,
+            repo=args.repo,
             storage_path=os.environ.get("CODE_INDEX_PATH"),
         )
         print(_json.dumps(result, indent=2))

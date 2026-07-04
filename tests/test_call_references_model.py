@@ -59,10 +59,10 @@ class TestIndexVersionBump:
     """INDEX_VERSION is bumped to 9."""
 
     def test_index_version_is_9(self):
-        """v1.98.0 bumped INDEX_VERSION to 16 for the runtime_stack_events
-        table (Phase 5 stack-log ingest). Test name kept for git-blame
+        """v1.108.96 bumped INDEX_VERSION to 17 for the scip_* compile-time
+        evidence tables (`import-scip`). Test name kept for git-blame
         stability; assertion tracks the current value."""
-        assert INDEX_VERSION == 16
+        assert INDEX_VERSION == 17
 
 
 class TestCallersByNameIndex:

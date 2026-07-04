@@ -181,6 +181,33 @@ CREATE TABLE IF NOT EXISTS runtime_stack_events (
 
 CREATE INDEX IF NOT EXISTS idx_runtime_stack_events_severity ON runtime_stack_events(severity, last_seen);
 CREATE INDEX IF NOT EXISTS idx_runtime_stack_events_symbol ON runtime_stack_events(symbol_id);
+
+CREATE TABLE IF NOT EXISTS scip_edges (
+    from_symbol_id TEXT NOT NULL,
+    to_symbol_id   TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    count          INTEGER NOT NULL DEFAULT 0,
+    first_seen     TEXT,
+    last_seen      TEXT,
+    PRIMARY KEY (from_symbol_id, to_symbol_id, kind)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scip_edges_to ON scip_edges(to_symbol_id);
+
+CREATE TABLE IF NOT EXISTS scip_unmapped (
+    file_path    TEXT,
+    line_no      INTEGER,
+    scip_symbol  TEXT,
+    reason       TEXT NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    last_seen    TEXT,
+    PRIMARY KEY (file_path, line_no, scip_symbol, reason)
+);
+
+CREATE TABLE IF NOT EXISTS scip_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Pragmas set on every connection open
@@ -557,6 +584,51 @@ def _migrate_v15_to_v16(conn: sqlite3.Connection) -> None:
     logger.info("Migrated v15→v16: added runtime_stack_events table for stack-log ingest")
 
 
+def _migrate_v16_to_v17(conn: sqlite3.Connection) -> None:
+    """Migrate a v16 database to v17: add scip_* tables for compile-time evidence.
+
+    Existing rows in every other table are preserved verbatim — the new
+    tables are purely additive and stay empty (zero-cost) until
+    ``jcodemunch-mcp import-scip <path.scip>`` ingests a SCIP index file.
+
+    ``scip_edges`` is deliberately a separate family from ``runtime_edges``:
+    compile-time evidence (what the compiler proved) must never pollute
+    runtime coverage statistics (what production actually executed).
+    """
+    conn.executescript("""\
+        CREATE TABLE IF NOT EXISTS scip_edges (
+            from_symbol_id TEXT NOT NULL,
+            to_symbol_id   TEXT NOT NULL,
+            kind           TEXT NOT NULL,
+            count          INTEGER NOT NULL DEFAULT 0,
+            first_seen     TEXT,
+            last_seen      TEXT,
+            PRIMARY KEY (from_symbol_id, to_symbol_id, kind)
+        );
+        CREATE INDEX IF NOT EXISTS idx_scip_edges_to ON scip_edges(to_symbol_id);
+
+        CREATE TABLE IF NOT EXISTS scip_unmapped (
+            file_path    TEXT,
+            line_no      INTEGER,
+            scip_symbol  TEXT,
+            reason       TEXT NOT NULL,
+            count        INTEGER NOT NULL DEFAULT 0,
+            last_seen    TEXT,
+            PRIMARY KEY (file_path, line_no, scip_symbol, reason)
+        );
+
+        CREATE TABLE IF NOT EXISTS scip_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+        ("index_version", "17"),
+    )
+    logger.info("Migrated v16→v17: added scip_* tables for compile-time evidence ingest")
+
+
 def _unlink_retry(path: Path, retries: int = 3, delay: float = 0.1) -> bool:
     """Delete a file with retry logic for Windows file-locking (PermissionError).
 
@@ -652,6 +724,8 @@ class SQLiteIndexStore:
                     _migrate_v14_to_v15(conn)
                 if stored_version < 16:
                     _migrate_v15_to_v16(conn)
+                if stored_version < 17:
+                    _migrate_v16_to_v17(conn)
 
             SQLiteIndexStore._initialized_dbs.add(db_key)
 

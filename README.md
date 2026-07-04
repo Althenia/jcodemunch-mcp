@@ -283,6 +283,10 @@ The point: jCodeMunch is structured retrieval *with* an orchestration layer over
 
 And the questions don't stop at your own code: `index_dependency` resolves a third-party package to the version *actually installed* in your repo (`node_modules` or a repo-local virtualenv — version read from package metadata, no registry lookup, nothing leaves your machine) and indexes it as its own queryable repo in one call. Your agent stops guessing a library's API from training data and starts reading the exact code it's running against — including compiled npm packages that ship only `dist/` with type declarations.
 
+### Compiler-verified references — no language server required
+
+AST-derived analysis is fast and language-broad, but dynamic dispatch and barrel re-exports can hide references from any static heuristic. `import-scip` closes that gap with evidence instead of guesswork: point it at a SCIP index file — the artifact `scip-typescript`, `scip-python`, `scip-java`, `scip-go`, `rust-analyzer`, and `scip-clang` already emit in CI — and jCodeMunch stores the compiler's own reference and implementation edges alongside the index. `find_references` then labels agreement as `verification: "compiler_verified"` and, more importantly, surfaces the references *only the compiler saw* as additional `source: "scip"` rows. The evidence is honest about its age: results ingested at an older index HEAD carry a `stale` flag and a re-import hint rather than posing as current truth. One command in CI (`scip-typescript index && jcodemunch-mcp import-scip index.scip`), zero language servers running, nothing executed by jCodeMunch itself, and everything stays on your machine.
+
 ### Agent config hygiene
 
 `audit_agent_config` scans your CLAUDE.md, .cursorrules, copilot-instructions.md, and other agent config files for token waste: per-file token cost, stale symbol references (cross-referenced against the index — catches renamed or deleted functions), dead file paths, redundancy between global and project configs, bloat, and scope leaks. No other tool can tell you "line 15 references a function that was renamed three weeks ago."

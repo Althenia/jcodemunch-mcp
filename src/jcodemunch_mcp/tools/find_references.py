@@ -270,6 +270,122 @@ def _attach_runtime_to_response(response: dict, store, owner: str, name: str) ->
     return response
 
 
+def _attach_scip_to_response(response: dict, store, owner: str, name: str) -> dict:
+    """Stamp compile-time (SCIP) evidence on a find_references response.
+
+    When the repo has ingested SCIP data (`jcodemunch-mcp import-scip`):
+    files whose symbols carry a compiler-verified reference to the queried
+    identifier gain ``verification: "compiler_verified"``, and files the
+    compiler proved but the import graph missed (dynamic dispatch, barrel
+    re-exports) are appended as ``source: "scip"`` rows. ``_meta.scip``
+    summarises counts + staleness. Byte-identical no-op when no SCIP data
+    has been ingested (honest-empty), including on pre-v17 databases.
+
+    Idempotent across the result cache: re-attaching to an already-annotated
+    response neither duplicates rows nor changes counts.
+    """
+    import sqlite3
+
+    db_path = store._sqlite._db_path(owner, name)
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return response
+    conn.row_factory = sqlite3.Row
+    try:
+        try:
+            if conn.execute("SELECT 1 FROM scip_edges LIMIT 1").fetchone() is None:
+                return response
+        except sqlite3.OperationalError:
+            # Pre-v17 database that has never been migrated or ingested.
+            return response
+
+        scip_meta = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM scip_meta").fetchall()
+        }
+        head_row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'git_head'"
+        ).fetchone()
+        live_head = head_row["value"] if head_row and head_row["value"] else ""
+        ingest_head = scip_meta.get("git_head", "")
+        stale = bool(ingest_head and live_head and ingest_head != live_head)
+
+        def _verified_files(identifier: str) -> dict[str, int]:
+            rows = conn.execute(
+                """
+                SELECT s_from.file AS ref_file, SUM(e.count) AS n
+                FROM scip_edges e
+                JOIN symbols s_to ON s_to.id = e.to_symbol_id
+                JOIN symbols s_from ON s_from.id = e.from_symbol_id
+                WHERE e.kind = 'reference' AND s_to.name = ? COLLATE NOCASE
+                GROUP BY s_from.file
+                """,
+                (identifier,),
+            ).fetchall()
+            return {row["ref_file"]: row["n"] for row in rows}
+
+        # (identifier, holder-dict) pairs for singular and batch shapes
+        entries: list[tuple[Optional[str], dict]] = []
+        if "references" in response and "identifier" in response:
+            entries.append((response.get("identifier"), response))
+        for entry in response.get("results", []) or []:
+            entries.append((entry.get("identifier"), entry))
+
+        verified_count = 0
+        scip_only_count = 0
+        touched = False
+        for identifier, holder in entries:
+            if not identifier:
+                continue
+            files = _verified_files(identifier)
+            if not files:
+                continue
+            touched = True
+            refs = holder.get("references", [])
+            import_refs = [r for r in refs if r.get("source") != "scip"]
+            import_files = {r.get("file") for r in import_refs}
+            already_appended = {r.get("file") for r in refs if r.get("source") == "scip"}
+            for ref in import_refs:
+                if ref.get("file") in files:
+                    ref["verification"] = "compiler_verified"
+                    verified_count += 1
+            scip_only = sorted(f for f in files if f not in import_files)
+            scip_only_count += len(scip_only)
+            for f in scip_only:
+                if f in already_appended:
+                    continue
+                holder.setdefault("references", []).append({
+                    "file": f,
+                    "matches": [{"match_type": "scip_reference", "names": [identifier]}],
+                    "verification": "compiler_verified",
+                    "source": "scip",
+                })
+            if "reference_count" in holder:
+                holder["reference_count"] = len(holder.get("references", []))
+
+        if touched:
+            scip_block: dict = {
+                "verified_files": verified_count,
+                "scip_only_files": scip_only_count,
+                "tool": scip_meta.get("tool", ""),
+                "ingested_at": scip_meta.get("ingested_at", ""),
+                "stale": stale,
+            }
+            if stale:
+                scip_block["note"] = (
+                    "SCIP evidence was ingested at a different index HEAD. "
+                    "Re-run your SCIP indexer and `jcodemunch-mcp import-scip` "
+                    "after reindexing."
+                )
+            response.setdefault("_meta", {})["scip"] = scip_block
+    except sqlite3.Error:
+        return response
+    finally:
+        conn.close()
+    return response
+
+
 def find_references(
     repo: str,
     identifier: Optional[str] = None,
@@ -323,7 +439,10 @@ def find_references(
 
     if identifiers is not None:
         result = _find_references_batch(identifiers, index, max_results, owner, name, start)
-        return _attach_runtime_to_response(result, store, owner, name)
+        return _attach_scip_to_response(
+            _attach_runtime_to_response(result, store, owner, name),
+            store, owner, name,
+        )
     else:
         repo_key = f"{owner}/{name}"
         specific_key = (identifier, max_results, include_call_chain)
@@ -333,11 +452,17 @@ def find_references(
             result["_meta"] = {**cached["_meta"],
                                "timing_ms": round((time.perf_counter() - start) * 1000, 1),
                                "cache_hit": True}
-            return _attach_runtime_to_response(result, store, owner, name)
+            return _attach_scip_to_response(
+                _attach_runtime_to_response(result, store, owner, name),
+                store, owner, name,
+            )
         result = _find_references_single(
             identifier, index, max_results, owner, name, start,
             include_call_chain=include_call_chain,
             store=store,
         )
         result_cache_put("find_references", repo_key, specific_key, result)
-        return _attach_runtime_to_response(result, store, owner, name)
+        return _attach_scip_to_response(
+            _attach_runtime_to_response(result, store, owner, name),
+            store, owner, name,
+        )

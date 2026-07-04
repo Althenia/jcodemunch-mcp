@@ -2,6 +2,46 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.96] - 2026-07-04 - Compile-time evidence: `import-scip` brings compiler-verified cross-references
+
+### Added
+
+- **New CLI verb `import-scip <path.scip>`** — ingests a SCIP index file
+  (the protobuf artifact emitted by `scip-typescript`, `scip-python`,
+  `scip-java`, `scip-go`, `rust-analyzer`, `scip-clang`; `.gz` accepted)
+  and stores compiler-verified reference and implementation edges in new
+  per-repo `scip_edges` / `scip_unmapped` / `scip_meta` tables. The
+  compile-time sibling of `import-trace`: teams already produce `.scip`
+  files in CI, so one import gives compiler-grade cross-references with no
+  language server running and nothing executed by jcodemunch itself. The
+  parser is a dependency-free protobuf wire-format reader — unknown fields
+  are skipped by construction, so future SCIP schema additions are ignored
+  rather than fatal.
+- **`find_references` now surfaces compile-time evidence.** When SCIP data
+  has been ingested: files whose symbols carry a compiler-verified
+  reference to the queried identifier gain `verification:
+  "compiler_verified"`, and references the compiler proved but the
+  import graph missed (dynamic dispatch, barrel re-exports) are appended
+  as `source: "scip"` rows — those are net-new findings, not decoration.
+  `_meta.scip` reports verified/scip-only counts, the producing tool, and
+  an honest staleness flag: evidence ingested at an older index HEAD is
+  labelled stale with a re-import hint, never presented as current truth.
+  Responses are byte-identical when no SCIP data exists.
+- **Index schema v17** — adds the three `scip_*` tables. Existing indexes
+  upgrade in place on first contact (empty tables, zero cost, no reindex
+  required); rows in every other table are preserved verbatim. The family
+  is deliberately separate from `runtime_*` so compile-time proof never
+  inflates runtime coverage statistics.
+- New env var `JCODEMUNCH_SCIP_MAX_ROWS` (default 200000) caps the
+  `scip_edges` / `scip_unmapped` tables with FIFO eviction, matching the
+  runtime-table policy.
+
+Unmapped occurrences (external package symbols, unindexed code) are
+recorded in `scip_unmapped` with a reason — visible, never guessed.
+Import-statement occurrences are skipped (the import graph already covers
+them); SCIP-local symbols are skipped (function-internal). Both skips are
+counted in the CLI output.
+
 ## [1.108.95] - 2026-07-03 - Three externally reported fixes: dead runtime stage, streaming ingest body cap, Nuxt edge names
 
 All three findings came from an external security researcher's scan of the
