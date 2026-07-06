@@ -110,7 +110,7 @@ jcodemunch-mcp/
 │   │   ├── signal_fusion.py   # Weighted Reciprocal Rank fusion (lexical + structural + similarity + identity)
 │   │   ├── confidence.py      # 0-1 retrieval confidence score on every result envelope (v1.75.0+)
 │   │   ├── freshness.py       # Per-symbol _freshness ∈ {fresh, edited_uncommitted, stale_index} (v1.77.0+)
-│   │   ├── tuning.py          # Online weight tuner — learns per-repo semantic_weight + identity_boost from the ranking ledger (v1.79.0+)
+│   │   ├── tuning.py          # Online weight tuner — learns per-repo semantic_weight from the ranking ledger (v1.79.0+)
 │   │   └── embed_drift.py     # 16-string canary + cosine drift detector (v1.80.0+)
 │   ├── summarizer/
 │   ├── tools/

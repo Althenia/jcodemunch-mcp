@@ -2,6 +2,29 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.102] - 2026-07-05 - Audit W6: remove the dead `identity_boost` learned weight from the tuner
+
+### Removed
+
+- **`tune_weights` no longer learns or persists an `identity_boost` weight.**
+  Since v1.79.0 the online tuner regressed an `identity_boost` value out of the
+  ranking ledger (splitting events by `identity_hit`, stepping ±0.05, clamping to
+  `[0.5, 2.0]`) and wrote it to `~/.code-index/tuning.jsonc` — but nothing ever
+  read it back. There is a `get_semantic_weight` consumer that `search_symbols`
+  calls at query time; there was never a matching `get_identity_boost`, so the
+  learned value was write-only dead state that made the tuner look like it did
+  more than it did. The identity proposal, its constants
+  (`_DEFAULT_IDENTITY_BOOST`, `_IDENTITY_BOUNDS`), the `mean_confidence_identity_*`
+  / `identity_step` fields in the `--explain` signals, and the third element of
+  `_propose`'s return tuple are gone; `_propose` now returns
+  `(new_semantic_weight, signals)`. Semantic-weight learning is unchanged. The
+  `identity_hit` telemetry column stays in the ranking ledger (it records whether
+  an identity match occurred — data, not a tuned knob). Existing `tuning.jsonc`
+  files that carry a stale `identity_boost` key are inert and untouched; the tuner
+  simply stops writing new ones. Docs corrected (they had described `identity_boost`
+  as applied at query time, which was never true). New tests in
+  `tests/test_v1_108_102.py`. No `INDEX_VERSION` bump.
+
 ## [1.108.101] - 2026-07-05 - Audit W5: hybrid semantic ranking no longer collapses lexical range on an exact match
 
 ### Fixed

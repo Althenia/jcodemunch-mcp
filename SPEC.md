@@ -722,15 +722,14 @@ Inputs:
 | `repo` | str | optional | Limit tuning to one repo. Default: every repo present in the ledger. |
 | `dry_run` | bool | `false` | Compute proposed deltas without writing `~/.code-index/tuning.jsonc`. |
 | `min_events` | int | 50 | Skip repos with fewer ledger events than this (defends against overfitting). |
-| `explain` | bool | `false` | Include per-signal correlations (mean confidence with/without semantic and identity channels) in the response. |
+| `explain` | bool | `false` | Include per-signal correlations (mean confidence with/without the semantic channel) in the response. |
 
-Reads the persisted `ranking_events` ledger, splits events by signal
-(`semantic_used`, `identity_hit`), and proposes a `±0.05` step on the
-matching weight when the mean confidence delta between groups exceeds
-0.05. Bounded — `semantic_weight` clamps to `[0.1, 0.8]` and
-`identity_boost` to `[0.5, 2.0]`. `search_symbols` consults the resulting
-overrides at query time when the caller leaves `semantic_weight` at the
-default 0.5.
+Reads the persisted `ranking_events` ledger, splits events by
+`semantic_used`, and proposes a `±0.05` step on `semantic_weight` when
+the mean confidence delta between groups exceeds 0.05. Bounded —
+`semantic_weight` clamps to `[0.1, 0.8]`. `search_symbols` consults the
+resulting override at query time when the caller leaves `semantic_weight`
+at the default 0.5.
 
 ---
 

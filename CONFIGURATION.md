@@ -311,10 +311,9 @@ Each retrieval result also carries a per-symbol `_freshness ∈ {fresh, edited_u
 ### Retrieval tuning
 
 `tune_weights` (v1.79.0+) reads the persisted ranking ledger and writes
-per-repo `semantic_weight` / `identity_boost` overrides to
-`~/.code-index/tuning.jsonc`. `search_symbols` consults the file at query
-time when the caller leaves `semantic_weight` at the default; explicit
-non-default values always win. Disable by removing the file or by passing
+per-repo `semantic_weight` overrides to `~/.code-index/tuning.jsonc`.
+`search_symbols` consults the file at query time when the caller leaves
+`semantic_weight` at the default; explicit non-default values always win. Disable by removing the file or by passing
 an explicit `semantic_weight` argument on each call.
 
 `check_embedding_drift` (v1.80.0+) pins a 16-string canary at

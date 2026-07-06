@@ -658,7 +658,7 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 |------|--------------|----------------|
 | `get_session_stats` | Token savings, cost avoided, per-tool breakdown, and `latency_per_tool` (p50/p95/max/error_rate) for the current session | — |
 | `analyze_perf` | Per-tool latency telemetry + cache hit-rates. Defaults to in-memory session ring; `window=1h\|24h\|7d\|all` reads `~/.code-index/telemetry.db` (opt-in). `compare_release="X.Y.Z"` diffs against a saved token baseline. `ledger=true` summarises ranking events. | `window`, `top`, `tool`, `compare_release`, `ledger` |
-| `tune_weights` | Learn per-repo retrieval weights from the v1.78.0 ranking ledger. Writes `~/.code-index/tuning.jsonc` with `semantic_weight` / `identity_boost` overrides applied at query time. | `repo`, `dry_run`, `min_events`, `explain` |
+| `tune_weights` | Learn per-repo retrieval weights from the v1.78.0 ranking ledger. Writes `~/.code-index/tuning.jsonc` with a `semantic_weight` override applied at query time. | `repo`, `dry_run`, `min_events`, `explain` |
 | `check_embedding_drift` | Pin (or re-check) a 16-string canary against the active embedding provider. Catches silent provider model changes that quietly degrade hybrid retrieval. | `capture`, `force`, `threshold` |
 
 ### Retrieval health signals (v1.74.0+)

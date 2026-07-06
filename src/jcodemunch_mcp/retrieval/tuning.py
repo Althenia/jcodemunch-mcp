@@ -6,14 +6,12 @@ tuner is *additive* — it suggests deltas to the defaults when there's
 statistical evidence that a signal helps; default behavior is preserved
 when there isn't enough evidence.
 
-Two signals are learned:
+One signal is learned:
   * ``semantic_weight``  — bumped if events with ``semantic_used=1`` had
                            higher mean confidence than events with
                            ``semantic_used=0``.
-  * ``identity_boost``   — bumped if events with ``identity_hit=1`` had
-                           higher mean confidence than events without.
 
-Both are bounded; the tuner won't overshoot and won't apply learning
+It is bounded; the tuner won't overshoot and won't apply learning
 without enough events (default 50). Learning reads a recency window of
 the ledger (default 90 days) rather than the lifetime history, so old
 events can't anchor weights to a query distribution that no longer
@@ -38,11 +36,9 @@ _TUNING_FILE = "tuning.jsonc"
 
 # Defaults (current behavior baseline)
 _DEFAULT_SEMANTIC_WEIGHT = 0.5
-_DEFAULT_IDENTITY_BOOST = 1.0
 
 # Bounds — never let learning leave these intervals
 _SEMANTIC_BOUNDS = (0.1, 0.8)
-_IDENTITY_BOUNDS = (0.5, 2.0)
 
 # Step size — single tuning pass moves a weight by at most this much
 _LEARN_STEP = 0.05
@@ -107,8 +103,8 @@ def _ensure_cache(base_path: Optional[str]) -> dict:
 
 
 def get_overrides(repo: str, base_path: Optional[str] = None) -> dict:
-    """Return ``{semantic_weight?, identity_boost?, learned_from_events,
-    captured_at}`` for ``repo`` (empty dict when unlearned)."""
+    """Return ``{semantic_weight?, learned_from_events, captured_at}`` for
+    ``repo`` (empty dict when unlearned)."""
     cache = _ensure_cache(base_path)
     return dict(cache.get(repo, {}))
 
@@ -170,19 +166,17 @@ class WeightTuner:
         self,
         events: list[tuple],
         existing: dict,
-    ) -> tuple[Optional[float], Optional[float], dict]:
-        """Return ``(new_semantic_weight, new_identity_boost, signals)``.
+    ) -> tuple[Optional[float], dict]:
+        """Return ``(new_semantic_weight, signals)``.
 
         ``signals`` carries the means/correlations used for the proposal
         so callers can ``--explain`` the decision.
         """
         if not events:
-            return None, None, {}
+            return None, {}
 
         confidences_with_sem: list[float] = []
         confidences_without_sem: list[float] = []
-        confidences_with_id: list[float] = []
-        confidences_without_id: list[float] = []
 
         # Schema (column index): 0 ts, 1 repo, 2 tool, 3 query_hash,
         # 4 query, 5 returned_ids, 6 top1, 7 top2, 8 confidence,
@@ -192,21 +186,15 @@ class WeightTuner:
             if conf is None:
                 continue
             sem_used = bool(row[9])
-            id_hit = bool(row[10])
             (confidences_with_sem if sem_used else confidences_without_sem).append(float(conf))
-            (confidences_with_id if id_hit else confidences_without_id).append(float(conf))
 
         mean_sem_on = _mean(confidences_with_sem)
         mean_sem_off = _mean(confidences_without_sem)
-        mean_id_on = _mean(confidences_with_id)
-        mean_id_off = _mean(confidences_without_id)
 
         signals = {
             "events_with_confidence": len(confidences_with_sem) + len(confidences_without_sem),
             "mean_confidence_semantic_on": _round(mean_sem_on),
             "mean_confidence_semantic_off": _round(mean_sem_off),
-            "mean_confidence_identity_on": _round(mean_id_on),
-            "mean_confidence_identity_off": _round(mean_id_off),
         }
 
         new_sem = None
@@ -220,18 +208,7 @@ class WeightTuner:
                 new_sem = _clamp(current + step, _SEMANTIC_BOUNDS)
                 signals["semantic_step"] = step
 
-        new_id = None
-        if mean_id_on is not None and mean_id_off is not None:
-            current = float(
-                existing.get("identity_boost", _DEFAULT_IDENTITY_BOOST)
-            )
-            delta_conf = mean_id_on - mean_id_off
-            if abs(delta_conf) >= _CONFIDENCE_DELTA_THRESHOLD:
-                step = _LEARN_STEP if delta_conf > 0 else -_LEARN_STEP
-                new_id = _clamp(current + step, _IDENTITY_BOUNDS)
-                signals["identity_step"] = step
-
-        return new_sem, new_id, signals
+        return new_sem, signals
 
     def learn(
         self,
@@ -254,14 +231,11 @@ class WeightTuner:
                 "before": before,
                 "after": before,
             }
-        new_sem, new_id, signals = self._propose(events, before)
+        new_sem, signals = self._propose(events, before)
         after: dict = dict(before)
         changed = False
         if new_sem is not None and new_sem != before.get("semantic_weight"):
             after["semantic_weight"] = round(new_sem, 4)
-            changed = True
-        if new_id is not None and new_id != before.get("identity_boost"):
-            after["identity_boost"] = round(new_id, 4)
             changed = True
         if not changed:
             return {
