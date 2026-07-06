@@ -2,6 +2,28 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.101] - 2026-07-05 - Audit W5: hybrid semantic ranking no longer collapses lexical range on an exact match
+
+### Fixed
+
+- **Semantic/hybrid `search_symbols` no longer crushes non-exact lexical scores
+  when an exact-name match is present.** The two-pass scorer folded the identity
+  boost (exact 50 / prefix 30 / segment 20) into the BM25 value tracked as
+  `max_bm25`, so as soon as any exact match existed the normalization denominator
+  jumped far above the real lexical range (~single digits) and every non-exact
+  result's genuine lexical score was divided down toward zero — hybrid ranking
+  degenerated toward pure-semantic among them, discarding real keyword overlap
+  (the common case for name-like queries). The scorer now normalizes the lexical
+  BM25 (identity excluded, via `_bm25_score_no_identity`) and the identity signal
+  on their own scales and combines them with `max(lex_norm, id_norm)`: an exact
+  or prefix match still dominates — its identity term is the max, so its channel
+  is 1.0, byte-identical to the old identity-boosted value, and exact-match scores
+  are unchanged — while non-exact results keep their full lexical dynamic range.
+  This aligns the hybrid path with what the fusion pipeline already did
+  deliberately via `_bm25_score_no_identity`. Scoped to the semantic/hybrid path
+  (opt-in; needs an embedding provider); the default BM25 path is untouched. New
+  tests in `tests/test_v1_108_101.py`. No `INDEX_VERSION` bump.
+
 ## [1.108.100] - 2026-07-05 - Fix latent NameError in the v1.108.99 fusion similarity error path
 
 ### Fixed

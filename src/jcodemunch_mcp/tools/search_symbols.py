@@ -1147,10 +1147,20 @@ def _search_symbols_semantic(
             all_emb.update(new_emb)
 
     # ── Two-pass scoring ───────────────────────────────────────────────────
-    # Pass 1: collect BM25 + cosine for every filtered symbol
-    raw: list[tuple[dict, float, float]] = []  # (sym, bm25, cosine)
-    max_bm25 = 0.0
+    # Pass 1: collect lexical BM25 (identity EXCLUDED), the identity signal, and
+    # cosine for every filtered symbol. Keeping identity out of the lexical
+    # normalisation basis is the fix for W5: folding the exact/prefix boost
+    # (50/30/20) into max_bm25 inflated the denominator whenever any exact match
+    # existed, crushing every non-exact result's genuine lexical score toward 0.
+    from ..retrieval.signal_fusion import _bm25_score_no_identity
+    raw: list[tuple[dict, float, float, float]] = []  # (sym, lex, identity, cosine)
+    max_lex = 0.0
+    max_id = 0.0
     max_cos = 0.0
+    # Identity-inclusive max (== the old max_bm25, since _bm25_score == lex + idn),
+    # kept only for the negative-evidence threshold below so that check is unchanged.
+    max_bm25 = 0.0
+    query_joined = " ".join(query_terms)
 
     for sym in index.symbols:
         if has_filters:
@@ -1163,22 +1173,37 @@ def _search_symbols_semantic(
             if decorator and not any(decorator.lower() in d.lower() for d in (sym.get("decorators") or [])):
                 continue
 
-        bm25 = 0.0 if semantic_only else _bm25_score(sym, query_terms, idf, avgdl, centrality, raw_query=query)
-        if bm25 > max_bm25:
-            max_bm25 = bm25
+        if semantic_only:
+            lex = idn = 0.0
+        else:
+            lex = _bm25_score_no_identity(sym, query_terms, idf, avgdl, centrality)
+            idn = _identity_score(sym, query_joined, raw_query=query)
+        if lex > max_lex:
+            max_lex = lex
+        if idn > max_id:
+            max_id = idn
+        if lex + idn > max_bm25:
+            max_bm25 = lex + idn
 
         sym_vec = all_emb.get(sym["id"])
         cos = _cosine_similarity(query_vec, sym_vec) if sym_vec else 0.0
         if cos > max_cos:
             max_cos = cos
 
-        raw.append((sym, bm25, cos))
+        raw.append((sym, lex, idn, cos))
 
-    # Pass 2: normalise BM25 and compute combined score
+    # Pass 2: normalise lexical and identity on their OWN scales, then take the
+    # max. An exact/prefix match still dominates — its identity term is max_id, so
+    # id_norm == 1.0 and the channel matches the value the old identity-boosted
+    # bm25_norm produced, leaving exact-match scores unchanged — while non-exact
+    # results keep their full lexical dynamic range instead of being divided down
+    # by the identity-inflated denominator (W5).
     scored: list[tuple[float, dict]] = []
-    for sym, bm25, cos in raw:
-        bm25_norm = (bm25 / max_bm25) if max_bm25 > 0.0 else 0.0
-        score = cos if semantic_only else (1.0 - semantic_weight) * bm25_norm + semantic_weight * cos
+    for sym, lex, idn, cos in raw:
+        lex_norm = (lex / max_lex) if max_lex > 0.0 else 0.0
+        id_norm = (idn / max_id) if max_id > 0.0 else 0.0
+        lexical_channel = max(lex_norm, id_norm)
+        score = cos if semantic_only else (1.0 - semantic_weight) * lexical_channel + semantic_weight * cos
         if score <= 0.0:
             continue
         scored.append((score, sym))
