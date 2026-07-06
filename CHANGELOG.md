@@ -2,6 +2,33 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.103] - 2026-07-06 - Audit WS-6: parser correctness (V7 nested-function misclassification + V8 syntax-error symbol loss)
+
+### Fixed
+
+- **Nested and closure functions are no longer misclassified as methods (V7).**
+  The generic AST walker promoted a child function to `kind='method'` whenever
+  it had any enclosing symbol, so a `def` inside a `def` (or inside a method)
+  came back as a method. Promotion is now gated on the parent being a
+  type/class container, using the previously-dead `container_node_types` spec
+  field (threaded to the extractor as `parent_is_container`). A function nested
+  in another function keeps `kind='function'`. Qualified names also chain
+  through the full parent path (`parent.qualified_name` instead of
+  `parent.name`), so same-named symbols nested under different scopes stay
+  distinct (`A.Mid.Inner` vs `B.Mid.Inner` no longer collide). Affects the
+  generic-spec languages (Python, JS, TS, Go, Rust, Java, PHP, etc.); the C++
+  path (which uses `class_scope_depth`) is unchanged.
+- **A syntax error in one symbol no longer erases the cleanly-defined symbols
+  around it (V8).** Extraction bailed on `node.has_error`, which is true if a
+  node OR ANY descendant contains an error. For a class with one mid-edit method
+  that dropped the entire class symbol and re-parented its surviving methods as
+  top-level functions; in watch-mode reindex during active editing a whole file
+  could lose its structure. Extraction now keys off a cleanly-extractable name:
+  a symbol with an intact identifier is kept even when a syntax error sits
+  deeper in its body, while a node whose own identifier is unparseable is still
+  dropped. Clean files are unaffected (no `has_error` anywhere → no behavior
+  change). New tests in `tests/test_v1_108_103.py`. No `INDEX_VERSION` bump.
+
 ## [1.108.102] - 2026-07-05 - Audit W6: remove the dead `identity_boost` learned weight from the tuner
 
 ### Removed

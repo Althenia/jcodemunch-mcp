@@ -460,11 +460,17 @@ def _walk_tree(
     class_scope_depth: int = 0,
     call_types: Optional[set[str]] = None,
     calls: Optional[list] = None,
+    parent_is_container: bool = False,
 ):
     """Recursively walk the AST and extract symbols.
 
     When *call_types* and *calls* are provided, also collects call sites
     (byte_offset, called_name) in a single pass — no second AST walk needed.
+
+    *parent_is_container* is True when ``parent_symbol`` is a type/class
+    container (a ``spec.container_node_types`` node), which is what promotes a
+    child function to a method. It stays False when the parent is another
+    function, so nested/closure functions keep kind='function' (audit V7).
     """
     # Dart: function_signature inside method_signature is handled by method_signature
     if node.type == "function_signature" and node.parent and node.parent.type == "method_signature":
@@ -474,6 +480,7 @@ def _walk_tree(
     local_scope_parts = scope_parts or []
     next_parent = parent_symbol
     next_class_scope_depth = class_scope_depth
+    next_is_container = parent_is_container
 
     if is_cpp and node.type == "namespace_definition":
         ns_name = _extract_cpp_namespace_name(node, source_bytes)
@@ -499,6 +506,7 @@ def _walk_tree(
                 parent_symbol,
                 local_scope_parts,
                 class_scope_depth,
+                parent_is_container,
             )
             if symbol:
                 symbols.append(symbol)
@@ -508,6 +516,7 @@ def _walk_tree(
                         next_class_scope_depth = class_scope_depth + 1
                 else:
                     next_parent = symbol
+                    next_is_container = node.type in spec.container_node_types
                 # Python field-centric classes (dataclass / Pydantic / attrs):
                 # surface annotated class-body fields as `field` child symbols so
                 # outlines expose the class contract, not just its name (#355).
@@ -544,6 +553,7 @@ def _walk_tree(
             next_class_scope_depth,
             call_types,
             calls,
+            next_is_container,
         )
 
 
@@ -616,19 +626,20 @@ def _extract_symbol(
     parent_symbol: Optional[Symbol] = None,
     scope_parts: Optional[list[str]] = None,
     class_scope_depth: int = 0,
+    parent_is_container: bool = False,
 ) -> Optional[Symbol]:
     """Extract a Symbol from an AST node."""
     kind = spec.symbol_node_types[node.type]
-    
-    # Skip nodes with errors
-    if node.has_error:
-        return None
-    
-    # Extract name
+
+    # Extract name first. A cleanly-named symbol is kept even when a syntax
+    # error sits deeper in its body: the old blanket `node.has_error` bail
+    # erased an entire class when one method was mid-edit and declassed the
+    # surviving siblings (audit V8). A node whose own identifier is unparseable
+    # returns no name here and is still dropped.
     name = _extract_name(node, spec, source_bytes)
     if not name:
         return None
-    
+
     # Build qualified name
     if language in ("cpp", "arduino"):
         if parent_symbol:
@@ -641,8 +652,12 @@ def _extract_symbol(
             kind = "method"
     else:
         if parent_symbol:
-            qualified_name = f"{parent_symbol.name}.{name}"
-            kind = "method" if kind == "function" else kind
+            qualified_name = f"{parent_symbol.qualified_name}.{name}"
+            # A function is a method only when its immediate lexical parent is a
+            # type/class container (spec.container_node_types), not another
+            # function. Nested/closure functions stay kind='function' (audit V7).
+            if kind == "function" and parent_is_container:
+                kind = "method"
         else:
             qualified_name = name
 
