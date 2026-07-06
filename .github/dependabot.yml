@@ -13,3 +13,16 @@ updates:
         applies-to: security-updates
         patterns:
           - "*"
+  # GitHub Actions are SHA-pinned in .github/workflows/*.yml; this keeps them
+  # covered by vulnerability alerts (same security-only posture as `uv` above —
+  # version-update noise suppressed, security PRs grouped).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    groups:
+      security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
