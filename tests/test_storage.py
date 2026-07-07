@@ -3,7 +3,6 @@
 import pytest
 import json
 import sqlite3
-from pathlib import Path
 
 from jcodemunch_mcp.storage import IndexStore, CodeIndex
 from jcodemunch_mcp.storage.sqlite_store import _cache_evict
@@ -607,7 +606,6 @@ def test_has_source_file_populated_index():
 
 def test_index_integrity_checksum(tmp_path):
     """save_index writes a .db file with WAL mode; load_index reads it back."""
-    import sqlite3
     store = IndexStore(base_path=str(tmp_path))
 
     store.save_index(
@@ -629,13 +627,14 @@ def test_index_integrity_checksum(tmp_path):
     assert loaded.name == "sum"
     assert loaded.owner == "check"
 
-    # Corrupting the db file raises DatabaseError
+    # A corrupt db file is handled gracefully: load_index returns None instead
+    # of raising a raw sqlite3.DatabaseError traceback (audit V9b). Callers
+    # routed through load_repo_index_or_error then report sqlite_corrupt + hint.
     db_path.write_bytes(b"not a sqlite db")
     # Evict cache — corrupted file must be read from disk, not served from cache
     from jcodemunch_mcp.storage.sqlite_store import _cache_evict
     _cache_evict("check", "sum")
-    with pytest.raises(sqlite3.DatabaseError):
-        store.load_index("check", "sum")
+    assert store.load_index("check", "sum") is None
 
 
 def test_schema_validation_rejects_missing_fields(tmp_path):

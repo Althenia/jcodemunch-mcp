@@ -63,19 +63,41 @@ def import_scip(
         owner, name = repo_id.split("/", 1)
 
     store = IndexStore(base_path=storage_path)
-    db_path = store._sqlite._db_path(owner, name)  # type: ignore[attr-defined]
+    sqlite_store = store._sqlite  # type: ignore[attr-defined]
+    db_path = sqlite_store._db_path(owner, name)
     if not db_path.exists():
         return {
             "success": False,
             "error": f"index database not found for {owner}/{name}; run `jcodemunch-mcp index` first.",
         }
 
+    # Serialise the scip_edges write against concurrent full/incremental
+    # reindexes of the same .db via the indexwrite lock (audit V9). Uses the
+    # exact lock_target/storage_root save_index uses so they actually block
+    # each other.
+    from ..storage import process_locks
+    lock_target = f"{owner}/{name}"
+    storage_root = str(sqlite_store.base_path)
     try:
-        result = ingest_scip_file(
-            db_path=str(db_path),
-            file_path=path,
-            max_rows=_scip_max_rows(),
-        )
+        with process_locks.held(
+            "indexwrite", lock_target, storage_root, wait_seconds=60.0
+        ) as got_lock:
+            if not got_lock:
+                detail = process_locks.current_holder_diagnostic(
+                    "indexwrite", lock_target, storage_root,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"could not acquire index-write lock for {lock_target} "
+                        f"after 60s{detail}"
+                    ),
+                }
+            result = ingest_scip_file(
+                db_path=str(db_path),
+                file_path=path,
+                max_rows=_scip_max_rows(),
+            )
     except FileNotFoundError as e:
         return {"success": False, "error": str(e)}
     except ValueError as e:

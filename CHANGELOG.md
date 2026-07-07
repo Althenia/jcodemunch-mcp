@@ -2,6 +2,30 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.105] - 2026-07-06 - Audit V9: index-write lock on the delta paths + load_index corruption guard
+
+### Fixed
+
+- **`incremental_save`, `save_branch_delta`, and SCIP ingest now hold the
+  `indexwrite` process lock (V9a).** The full `save_index` serialises against
+  concurrent writers from other MCP processes via that lock, but the three delta
+  write paths opened their own connection and `BEGIN` with no lock — so a
+  watcher-driven incremental write (or a branch-delta / `import-scip`) could
+  interleave its DELETE/INSERT batches with a full reindex of the same `.db`
+  from another process and corrupt the index. Each now acquires the same lock,
+  keyed identically (`indexwrite` / `owner/name` / storage root) so they
+  actually serialise against `save_index` and each other. Implemented by
+  extracting `_incremental_save_locked` / `_save_branch_delta_locked` inner
+  bodies (mirroring `_save_index_locked`) and wrapping the SCIP ingest at its
+  `import_scip` caller.
+- **`load_index` no longer raises a raw traceback on a corrupt database (V9b).**
+  `inspect_index` already guarded `sqlite3.DatabaseError`, but `load_index` did
+  not, so a corrupt `.db` surfaced as an unhandled traceback out of every
+  retrieval tool. `load_index` now returns `None` on `DatabaseError`; callers
+  routed through `load_repo_index_or_error` fall through to `inspect_index` and
+  get a structured `sqlite_corrupt` status plus a re-index hint. New tests in
+  `tests/test_v1_108_105.py`. No `INDEX_VERSION` bump.
+
 ## [1.108.104] - 2026-07-06 - Close the `index_dependency` gap in the counter's state-change gate
 
 ### Fixed
