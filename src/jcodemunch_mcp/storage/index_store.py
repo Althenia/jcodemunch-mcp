@@ -784,6 +784,7 @@ class IndexStore:
         file_blob_shas: Optional[dict[str, str]] = None,
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
+        package_names: Optional[list[str]] = None,
     ) -> Optional[CodeIndex]:
         """Incrementally update via SQLite backend."""
         # Compute file_languages for changed/new files using existing logic.
@@ -804,7 +805,7 @@ class IndexStore:
             file_summaries=file_summaries, file_languages=merged_file_languages,
             imports=imports, context_metadata=context_metadata,
             file_blob_shas=file_blob_shas, file_hashes=file_hashes,
-            file_mtimes=file_mtimes,
+            file_mtimes=file_mtimes, package_names=package_names,
         )
 
     def save_branch_delta(self, owner: str, name: str, branch: str, **kwargs) -> None:

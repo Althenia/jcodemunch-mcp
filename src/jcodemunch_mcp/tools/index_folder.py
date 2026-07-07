@@ -1509,6 +1509,9 @@ def index_folder(
                         context_metadata=incr_context_metadata,
                         file_hashes=subset_hashes,
                         file_mtimes=all_mtimes,
+                        # Refresh the package registry so a manifest add/rename on
+                        # the incremental path isn't stale until a full reindex (W7).
+                        package_names=_extract_package_names(str(folder_path)),
                     )
 
                 # Fire daemon thread for deferred summarization — index is already saved
@@ -1971,6 +1974,9 @@ def index_folder(
                     context_metadata=incr_context_metadata,
                     file_hashes=subset_hashes,
                     file_mtimes=updated_mtimes,
+                    # Refresh the package registry so a manifest add/rename on
+                    # the incremental path isn't stale until a full reindex (W7).
+                    package_names=_extract_package_names(str(folder_path)),
                 )
 
             result = {

@@ -2,6 +2,25 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.106] - 2026-07-06 - Audit W7: incremental_save refreshes package_names
+
+### Fixed
+
+- **The cross-repo package registry no longer goes stale after an incremental
+  reindex.** `save_index` persisted each repo's published `package_names` (read
+  by `find_importers`, `get_blast_radius`, `get_cross_repo_map`, and
+  `get_dependency_graph`) into the meta table, but `incremental_save` never
+  updated it. So after a delta write that added or renamed a package manifest,
+  cross-repo features saw the old package name until the next full reindex.
+  `incremental_save` now accepts `package_names` and writes it to meta (and
+  refreshes the returned/cached index); the two content-updating call sites in
+  `index_folder` recompute it via `extract_package_names`. Passing `None` (the
+  common delta that didn't touch a manifest, and the git-head/summary/mtime-only
+  refresh paths) preserves the existing value. Branch deltas are intentionally
+  not plumbed: they don't write base meta and the registry reads base indexes,
+  so a branch-scoped `package_names` has no consumer. New tests in
+  `tests/test_v1_108_106.py`. No `INDEX_VERSION` bump.
+
 ## [1.108.105] - 2026-07-06 - Audit V9: index-write lock on the delta paths + load_index corruption guard
 
 ### Fixed

@@ -1596,6 +1596,7 @@ class SQLiteIndexStore:
         file_blob_shas: Optional[dict[str, str]] = None,
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
+        package_names: Optional[list[str]] = None,
     ) -> Optional["CodeIndex"]:
         """Incrementally update an existing index (delta write).
 
@@ -1626,7 +1627,7 @@ class SQLiteIndexStore:
                 owner, name, changed_files, new_files, deleted_files,
                 new_symbols, raw_files, languages, git_head, file_summaries,
                 file_languages, imports, context_metadata, file_blob_shas,
-                file_hashes, file_mtimes,
+                file_hashes, file_mtimes, package_names,
             )
 
     def _incremental_save_locked(
@@ -1647,6 +1648,7 @@ class SQLiteIndexStore:
         file_blob_shas: Optional[dict[str, str]] = None,
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
+        package_names: Optional[list[str]] = None,
     ) -> Optional["CodeIndex"]:
         """Inner body of incremental_save; runs under the indexwrite lock."""
         db_path = self._db_path(owner, name)
@@ -1738,6 +1740,16 @@ class SQLiteIndexStore:
                 conn.execute(
                     "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                     ("context_metadata", json.dumps(context_metadata)),
+                )
+            # Refresh the published-package registry entry when the caller
+            # recomputed it (e.g. a manifest was added/renamed). Without this a
+            # delta write left the old package_names in meta, so cross-repo
+            # features saw a stale registry until the next full reindex (audit
+            # W7). None = caller didn't recompute → preserve the existing value.
+            if package_names is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("package_names", json.dumps(package_names)),
                 )
 
             # Recompute languages from files table
@@ -1839,6 +1851,13 @@ class SQLiteIndexStore:
                             sym["_tf"] = old_sym["_tf"]
                         if "_dl" in old_sym:
                             sym["_dl"] = old_sym["_dl"]
+
+        # Keep the returned/cached index consistent with the meta write above.
+        # The fast (patch) path carries package_names from the old cached index,
+        # so an in-place refresh here is needed; the cold path already rebuilt it
+        # from the freshly-written meta, so this is a harmless no-op there.
+        if package_names is not None:
+            index.package_names = list(package_names)
 
         # Pre-warm cache so the next load_index() is instant
         # Touch .db mtime BEFORE caching so the cached mtime matches what
