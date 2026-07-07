@@ -864,7 +864,7 @@ Then index a repo, ask your agent what it has indexed, and have it retrieve code
 
 jCodeMunch is an MCP server — it plugs into **every major agent and IDE that speaks MCP**:
 
-**Claude Code · Claude Desktop · Cursor · Windsurf · Codex CLI · Continue · Cline · Roo Code · Zed · Goose · Hermes Agent · Paperclip** — and more.
+**Claude Code · Claude Desktop · Cursor · Windsurf · Codex CLI · Continue · Cline · Roo Code · Zed · Goose · Hermes Agent · Paperclip · Gemini CLI · Qwen Code · Kiro** — and more.
 
 Tested configurations:
 
@@ -873,6 +873,9 @@ Tested configurations:
 | **Claude Code / Claude Desktop** | `jcodemunch-mcp init` (auto-detects and patches config) |
 | **Cursor / Windsurf / Continue** | `jcodemunch-mcp init` or manual `mcp.json` |
 | **Antigravity (Google)** | Add a `jcodemunch` entry to `~/.gemini/config/mcp_config.json` (shared by Antigravity 2.0 / IDE / CLI). See below. |
+| **Gemini CLI (Google)** | Add a `jcodemunch` entry under `mcpServers` in `~/.gemini/settings.json` (or project `.gemini/settings.json`) — a *different file* from Antigravity's `~/.gemini/config/mcp_config.json` above. *(config per [vendor docs](https://geminicli.com/docs/tools/mcp-server/))* |
+| **Qwen Code** | Add under `mcpServers` in `~/.qwen/settings.json` (or project `.qwen/settings.json`). *(config per [vendor docs](https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/))* |
+| **Kiro (AWS)** | Add under `mcpServers` in `.kiro/settings/mcp.json` (workspace) or `~/.kiro/settings/mcp.json` (user). *(config per [vendor docs](https://kiro.dev/docs/mcp/configuration/))* |
 | **OpenAI Codex CLI** | Add `[mcp_servers.jcodemunch]` block to `~/.codex/config.toml` (see below) |
 | **Cline / Roo Code** | Add via the MCP marketplace UI or paste `command: uvx`, `args: ["jcodemunch-mcp"]` |
 | **Zed** | Add to `settings.json` under `context_servers` |
