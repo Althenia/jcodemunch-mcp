@@ -2237,11 +2237,19 @@ class SQLiteIndexStore:
             return None
 
     def _write_cached_text(self, path: Path, content: str) -> None:
-        """Write cached text without newline translation.
+        """Write cached text atomically, without newline translation.
 
         Honors ``cache_mode`` config: when set to ``"metadata_only"``, source
         bodies are not persisted to disk. The symbol table still gets
         populated normally; only the ``bodies/`` directory stays empty. P1.4.
+
+        The write goes to a sibling temp file that is swapped in with
+        ``os.replace`` (audit WS-5). A crash or disk-full mid-write then leaves
+        the temp file, not a truncated body at ``path`` — readers never serve a
+        half-written file as real source. The swap is same-directory so the
+        rename is atomic on every platform; the indexwrite lock (V9) already
+        serialises concurrent writers to a repo, so the pid-suffixed temp name
+        cannot collide.
         """
         try:
             from .. import config as _cfg
@@ -2249,8 +2257,18 @@ class SQLiteIndexStore:
                 return  # skip body persistence; symbol table still written
         except Exception:
             pass  # config unavailable, fall through to default full-cache behavior
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(content)
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                if tmp.exists():
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     def _read_cached_text(self, path: Path) -> Optional[str]:
         """Read cached text without newline normalization."""

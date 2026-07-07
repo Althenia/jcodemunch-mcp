@@ -2,6 +2,28 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.108] - 2026-07-06 - Audit WS-5 tail: atomic content-body writes + four-path persistence test
+
+### Fixed
+
+- **Cached source bodies are written atomically.** `_write_cached_text` wrote
+  the body straight to its final path, so a crash or disk-full mid-write left a
+  truncated file that the source-dump tools would serve as real source. It now
+  writes to a sibling temp file and swaps it in with `os.replace` (same
+  directory, so the rename is atomic on every platform), cleaning up the temp on
+  failure and leaving any existing body untouched. This covers all three
+  content-write sites (full save, incremental save, migrate).
+
+### Added
+
+- **One parametrized persistence test drives all four store-writing paths.**
+  `save_index`, `incremental_save`, `save_branch_delta`, and the SCIP ingest all
+  mutate a repo's `.db` and must serialise via the `indexwrite` lock (v1.108.105
+  / V9); a single parametrized test now asserts that shared invariant across all
+  four, so a future path added without the lock fails loudly. Plus atomic-write
+  regression tests. New tests in `tests/test_v1_108_108.py`. No `INDEX_VERSION`
+  bump. This closes workstream WS-5 of the excellence audit.
+
 ## [1.108.107] - 2026-07-06 - Audit W1: the watcher fast path re-enriches changed symbols
 
 ### Fixed
