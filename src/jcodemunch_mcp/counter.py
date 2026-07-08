@@ -222,6 +222,38 @@ def search_catalog(
 # (compiled_pattern, action, why). Kept deterministic and legible -- this is a
 # curated map, not a learned model, consistent with the read-only charter.
 _INTENT_RULES: list[tuple[re.Pattern, str, str]] = [
+    # --- stateful: session / recent-change intents --------------------------- #
+    # Read the session journal / working-tree delta, not the whole index.
+    # Placed FIRST: stateful phrasings ("affected by my recent changes") carry
+    # trigger words for the impact/reference rules below, so they must win first.
+    (re.compile(r"\b(uncommitted|working tree|staged changes|since (the )?last commit|"
+                r"changed (since|today|in the last)|what changed|different from main|"
+                r"diff of what|what i modified|recently modified|"
+                r"my (last|recent) (edit|change|changes)|last thing i edited|"
+                r"renamed just now|(edits?|changes?) (are )?pending|pending (edits?|changes?)|"
+                r"did i (just )?(change|edit)|just changed?)\b", re.I),
+     "get_changed_symbols", "List symbols changed since the last commit or in the working tree."),
+    (re.compile(r"\b(this session|we (touched|made|worked|work on)|left off|pick up where|"
+                r"recap|so far|a minute ago|i was editing|(in the )?last hour)\b", re.I),
+     "get_session_context", "Recap what this session has touched so far."),
+
+    # --- mutate: edit/execute intents ---------------------------------------- #
+    # jcm is read-only by charter and performs NO edit. When the task is a
+    # COMMAND to change code, route recognizes it and recommends the read-only
+    # PREP tool for that edit kind; the agent then applies the change with its
+    # own editor. Anchored to a LEADING imperative verb so a question about an
+    # edit ("what breaks if I rename X") falls through to the impact rules and is
+    # NOT captured here. There is no auto-execute for these (no _QUERY_ARG entry):
+    # jcm recommends the preflight, it never presumes to run a mutation flow.
+    (re.compile(r"^\s*rename\b", re.I),
+     "check_rename_safe", "jcm is read-only; verify a rename is safe, then apply it with your editor."),
+    (re.compile(r"^\s*(delete|remove)\b", re.I),
+     "check_delete_safe", "jcm is read-only; check what breaks before you delete, then remove it with your editor."),
+    (re.compile(r"^\s*(refactor|extract|move|inline)\b", re.I),
+     "plan_refactoring", "jcm is read-only; get an edit-ready refactor plan, then apply it with your editor."),
+    (re.compile(r"^\s*(add|write|create|implement|fix|update|convert|reformat|change|wrap|generate|apply)\b", re.I),
+     "check_edit_safe", "jcm is read-only; preflight the edit's risk, then modify with your editor."),
+
     (re.compile(r"\b(who )?calls?\b|\bcallers?\b|\bcall(ed)? by\b|\bcall (graph|hierarchy)\b", re.I),
      "get_call_hierarchy", "Trace callers/callees of a symbol."),
     (re.compile(r"\bused? (by|where)\b|\breferences?\b|\bwhere is .* used\b", re.I),

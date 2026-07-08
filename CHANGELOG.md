@@ -2,6 +2,30 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.114] - 2026-07-08 - route(): mutate + stateful intent buckets
+
+### Added
+
+- **`route()` now recognizes two intent classes it previously dropped** — edit/execute
+  commands and session/recent-change queries. Before, both fell through to
+  `search_symbols` or matched nothing:
+  - **stateful** — "what did I just change", "uncommitted edits", "different from
+    main", "recap this session" route to `get_changed_symbols` /
+    `get_session_context` (the working-tree delta and session journal, not the
+    whole index). Placed first in the rule order because these phrasings carry
+    trigger words for the impact/reference rules.
+  - **mutate** — "rename X", "delete the dead code", "refactor the auth module",
+    "add a retry" are recognized as edit commands. jcm is read-only by charter and
+    performs no edit, so route recommends the matching **read-only prep tool**
+    (`check_rename_safe` / `check_delete_safe` / `plan_refactoring` /
+    `check_edit_safe`) and the agent applies the change with its own editor.
+    Anchored to a leading imperative verb, so a *question* about an edit
+    ("what breaks if I rename X") still falls through to the impact rules.
+- Mutate recommendations are recognize-and-redirect only — no `_QUERY_ARG` entry,
+  so `route(execute=true)` never auto-runs a mutation flow from a free-form task.
+- New `tests/test_v1_108_114.py` (9). No INDEX_VERSION bump; pure routing logic in
+  `counter.py`, no schema/tool-count change.
+
 ## [1.108.113] - 2026-07-07 - New tool: get_architecture_metrics (Gini / Lakos depth / DSM)
 
 ### Added
