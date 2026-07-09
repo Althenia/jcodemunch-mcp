@@ -100,6 +100,49 @@ def _global_storage_path() -> Path:
     return Path(os.environ.get("CODE_INDEX_PATH", str(Path.home() / ".code-index")))
 
 
+def _is_first_ever_install(storage_dir: "Path") -> bool:
+    """True only for a genuinely first-ever install of jcodemunch.
+
+    Signalled by the absence of any prior index/telemetry state in the storage
+    directory. Used to decide whether a freshly-created config should default to
+    the token-lean ``tool_surface="counter"`` front door. On ANY uncertainty we
+    return False (preserve the historical ``full`` surface) so that an existing
+    user who merely lacks a config file is never silently collapsed to the front
+    door on a package update. The cost of a false negative is only reduced
+    token savings, never a surprising surface change.
+    """
+    try:
+        if not storage_dir.exists():
+            return True
+        for entry in storage_dir.iterdir():
+            name = entry.name.lower()
+            if name.endswith((".db", ".sqlite", ".sqlite3")):
+                return False  # prior index/telemetry state → existing install
+        return True
+    except OSError:
+        return False  # unsure → treat as existing, keep the full surface
+
+
+def _fresh_config_content(storage_dir: "Path") -> str:
+    """Template content for a newly-created config.
+
+    Genuinely first-ever installs get ``tool_surface="counter"`` baked in (the
+    token-lean 3-tool front door) so a new user experiences maximal savings out
+    of the box. The key is written ONLY here (never into ``generate_template``),
+    so ``upgrade_config`` — which back-injects template keys — can never add it
+    to an existing user's config on a package update.
+    """
+    template = generate_template()
+    if _is_first_ever_install(storage_dir):
+        template = set_string_key(
+            template,
+            "tool_surface",
+            "counter",
+            comment='new-install default; set "full" to advertise all tool schemas',
+        )
+    return template
+
+
 _LANG_BLOCK_RE = re.compile(
     r'("languages"\s*:\s*)(\[.*?\]|null)',
     re.DOTALL
@@ -296,6 +339,12 @@ DEFAULTS = {
     "languages": None,  # None = all languages
     "languages_adaptive": False,
     "tool_profile": "full",  # "core", "standard", or "full"
+    # DEFAULT for existing installs. The template ships this key COMMENTED, so an
+    # existing user who lacks it (or gets it back-injected by upgrade_config)
+    # stays on "full". Only a genuinely first-ever install has it ACTIVATED to
+    # "counter" by _fresh_config_content — so a package update never silently
+    # collapses a user's tool surface.
+    "tool_surface": "full",  # "full" or "counter"
     "tool_tier_bundles": {
         "core": [
             "index_repo", "index_folder", "index_file",
@@ -443,6 +492,7 @@ CONFIG_TYPES = {
     "languages": (list, type(None)),
     "languages_adaptive": bool,
     "tool_profile": str,
+    "tool_surface": str,
     "tool_tier_bundles": dict,
     "model_tier_map": dict,
     "adaptive_tiering": bool,
@@ -644,12 +694,19 @@ def load_config(storage_path: str | None = None) -> None:
     else:
         config_path = _global_config_path()
 
-    # Auto-create default config if missing
+    # Auto-create default config if missing. A genuinely first-ever install
+    # defaults to the token-lean "counter" front door; an existing install that
+    # merely lacks a config file keeps the historical "full" surface, so a
+    # package update never silently collapses a user's tool surface.
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        template = generate_template()
-        config_path.write_text(template, encoding="utf-8")
-        logger.info("Created default config at %s", config_path)
+        content = _fresh_config_content(config_path.parent)
+        config_path.write_text(content, encoding="utf-8")
+        logger.info(
+            "Created default config at %s (tool_surface=%s)",
+            config_path,
+            "counter" if _is_first_ever_install(config_path.parent) else "full",
+        )
 
     # Load config
     _explicit_keys: set[str] = set()  # Track keys explicitly set in config file
@@ -1365,6 +1422,31 @@ def set_bool_key(content: str, key: str, value: bool) -> str:
     return _inject_blocks_before_closing_brace(content, [f'  "{key}": {new_literal},'])
 
 
+def set_string_key(content: str, key: str, value: str, comment: str | None = None) -> str:
+    """Set a string key in JSONC config content to an explicit active value.
+
+    Mirrors :func:`set_bool_key` for string values. Handles the commented
+    template form, an existing active form, and an entirely-absent key (appended
+    before the closing brace, with an optional inline ``// comment``). The value
+    is emitted as a JSON string literal so quoting/escaping is always valid.
+    """
+    import re
+
+    new_literal = json.dumps(value)  # safely-quoted JSON string literal
+    pattern = re.compile(
+        r'^(?P<indent>[ \t]*)(?://[ \t]*)?"' + re.escape(key)
+        + r'"[ \t]*:[ \t]*"[^"]*"[ \t]*,?[ \t]*$',
+        re.MULTILINE,
+    )
+
+    if pattern.search(content):
+        return pattern.sub(rf'\g<indent>"{key}": {new_literal},', content, count=1)
+
+    # Key absent — inject before the closing brace, with an optional comment.
+    suffix = f"  // {comment}" if comment else ""
+    return _inject_blocks_before_closing_brace(content, [f'  "{key}": {new_literal},{suffix}'])
+
+
 def apply_share_savings(value: bool, storage_path: "Path | str | None" = None) -> "Path":
     """Apply an explicit share_savings setting to the user's config.jsonc.
 
@@ -1382,7 +1464,7 @@ def apply_share_savings(value: bool, storage_path: "Path | str | None" = None) -
 
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(generate_template(), encoding="utf-8")
+        config_path.write_text(_fresh_config_content(config_path.parent), encoding="utf-8")
 
     content = config_path.read_text(encoding="utf-8")
     updated = set_bool_key(content, "share_savings", value)
@@ -1624,7 +1706,7 @@ def set_config_value(key: str, raw: Any, storage_path: "Path | str | None" = Non
         config_path = Path(storage_path) / "config.jsonc"
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text(generate_template(), encoding="utf-8")
+        config_path.write_text(_fresh_config_content(config_path.parent), encoding="utf-8")
 
     original = config_path.read_text(encoding="utf-8")
     updated = set_key(original, key, value)
@@ -1939,6 +2021,14 @@ def generate_template() -> str:
   //   "full"     — all tools including refactoring, session, and diagnostics (default).
   // Tip: "core" saves ~5-6k schema tokens per session.
   // "tool_profile": "full",
+
+  // === Tool Surface ===
+  // Selects how tools are presented to the LLM. "full" advertises every tool
+  // schema (composes with tool_profile above). "counter" collapses the surface
+  // to a 3-tool front door (order/menu/route) that dispatches any tool on
+  // demand — maximum token savings, all capability preserved. New installs
+  // default to "counter"; set "full" here to advertise all tool schemas.
+  // "tool_surface": "full",
 
   // === Compact Schemas ===
   // When true, strips rarely-used advanced parameters (debug, fusion, semantic_*,

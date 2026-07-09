@@ -2,6 +2,32 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.115] - 2026-07-09 - New installs default to the `counter` tool surface
+
+### Changed
+
+- **A genuinely first-ever install now defaults to `tool_surface="counter"`** — the
+  3-tool front door (`order`/`menu`/`route`) — so a new, curious user experiences
+  maximal token savings out of the box (resident tool schemas drop ≈21.6k → ≈0.9k
+  tokens, ~24×), with every tool one `menu()`/`route()` call away.
+- **Existing installs are never silently collapsed on an update.** The safety
+  property is enforced structurally, not by luck:
+  - The code-level default stays `"full"`, so any user without an explicit
+    `tool_surface` key keeps the historical surface.
+  - The `counter` default is written **only** into a freshly-created config, and
+    **only** when the install is genuinely first-ever (no prior index/telemetry
+    `.db` in the storage dir — an existing user who merely lacks a config file
+    stays on `full`).
+  - The key ships **commented** in the template, so `upgrade_config` can only
+    back-inject the inactive form — running `config --upgrade` never activates
+    `counter` on an existing user.
+- New helpers `_is_first_ever_install()` / `_fresh_config_content()` /
+  `set_string_key()` (config.py); `tool_surface` registered in `DEFAULTS` +
+  `CONFIG_TYPES` (was previously env-only) so an explicit config value is honored,
+  and documented under a new `=== Tool Surface ===` template section. Env var
+  `JCODEMUNCH_TOOL_SURFACE` still wins over everything. NO INDEX_VERSION bump; tool
+  count unchanged. New `tests/test_v1_108_115.py` (16).
+
 ## [1.108.114] - 2026-07-08 - route(): mutate + stateful intent buckets
 
 ### Added

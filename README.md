@@ -746,9 +746,9 @@ When `adaptive_tiering` is false, `plan_turn(model=...)` and `announce_model(...
 
 #### The Counter — collapse to a 3-tool front door (`tool_surface`)
 
-For the most token-sensitive setups, `tool_surface` goes further than tiering: it collapses the resident tool list to a **three-tool front door** that fronts the entire catalog without losing any capability. Every turn the host serializes each resident tool's schema into context; the front door shrinks that fixed per-turn cost and removes the "pick one of N" dispatch dilution.
+`tool_surface` goes further than tiering: it collapses the resident tool list to a **three-tool front door** that fronts the entire catalog without losing any capability. Every turn the host serializes each resident tool's schema into context; the front door shrinks that fixed per-turn cost (≈21.6k → ≈0.9k tokens, ~24×) and removes the "pick one of N" dispatch dilution.
 
-Set it in `config.jsonc` (or the `JCODEMUNCH_TOOL_SURFACE` env var, which wins):
+**New installs default to `counter`** so a first-time user gets maximal token savings out of the box, with every tool one `menu()` / `route()` call away. This default is applied only to a genuinely first-ever install: an **existing install keeps its surface across upgrades** — if you never set `tool_surface`, a package update leaves you on `full` exactly as before, never silently collapsing your tool list. Set it explicitly any time:
 
 ```jsonc
 "tool_surface": "counter"
@@ -758,7 +758,7 @@ Set it in `config.jsonc` (or the `JCODEMUNCH_TOOL_SURFACE` env var, which wins):
 - **`menu(query?)`** — search/browse the action catalog (compact rows: action, summary, required args, `state_changing`), so the full set of schemas needn't stay resident in context.
 - **`route(task, repo?, execute?)`** — map a natural-language task to the best action(s); with `execute=true`, dispatch the top recommendation in the same call. Recommends `assemble_task_context` / `plan_turn` for context-gathering intents.
 
-`counter` keeps the always-present controls (`set_tool_tier`, `announce_model`, `jcodemunch_guide`) alongside the front door. Any other value (default `full`) leaves the existing behavior unchanged — the front-door tools stay hidden (still callable), so upgrading changes nothing until you opt in. The two mechanisms compose: under `counter`, `order` / `route` still reach every action regardless of the active `core` / `standard` / `full` tier.
+`counter` keeps the always-present controls (`set_tool_tier`, `announce_model`, `jcodemunch_guide`) alongside the front door. Setting `full` advertises every tool schema (the pre-`counter` behavior). The two mechanisms compose: under `counter`, `order` / `route` still reach every action regardless of the active `core` / `standard` / `full` tier. Seeing only three tools in your client's tool list is expected under `counter` — call `menu()` to list the full catalog.
 
 #### `disabled_tools` precedence
 
