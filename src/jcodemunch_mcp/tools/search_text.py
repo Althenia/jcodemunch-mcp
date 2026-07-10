@@ -189,6 +189,14 @@ def search_text(
     tokens_saved = estimate_savings(raw_bytes, response_bytes)
     total_saved = record_savings(tokens_saved, tool_name="search_text")
 
+    from ..retrieval.verdict import build_verdict as _build_verdict
+    _vres = _build_verdict(
+        result_count=result_count,
+        scanned_files=files_searched,
+        query_terms=(query.lower().split() if not is_regex else None),
+        source_files=index.source_files,
+        timed_out=timed_out,
+    )
     return {
         "result_count": result_count,
         "results": results,
@@ -199,6 +207,7 @@ def search_text(
             "timed_out": timed_out,
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
+            "verdict": _vres["verdict"],
             **cost_avoided(tokens_saved, total_saved),
         },
     }

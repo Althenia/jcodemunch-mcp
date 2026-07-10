@@ -942,7 +942,8 @@ def search_symbols(
 
     elapsed = (time.perf_counter() - start) * 1000
 
-    # Feature 1: Negative evidence — tell the AI when nothing was found
+    # Feature 1: Negative evidence / retrieval verdict — computed after the
+    # freshness probe below so the verdict can report index staleness.
     negative_evidence: Optional[dict] = None
     _ne_threshold = _NEGATIVE_EVIDENCE_THRESHOLD
     try:
@@ -950,27 +951,6 @@ def search_symbols(
         _ne_threshold = _cfg.get("negative_evidence_threshold", _NEGATIVE_EVIDENCE_THRESHOLD)
     except Exception:
         pass
-    if not scored_results or max_bm25_score < _ne_threshold:
-        # Find files whose names partially match query terms
-        query_lower = query.lower()
-        related_existing: list[str] = []
-        for f in index.source_files:
-            fname = f.lower().split("/")[-1].split("\\")[-1]
-            for term in query_terms:
-                if term in fname:
-                    related_existing.append(f)
-                    break
-        related_existing = related_existing[:5]  # cap at 5
-
-        verdict = "no_implementation_found" if not scored_results else "low_confidence_matches"
-        negative_evidence = {
-            "verdict": verdict,
-            "scanned_symbols": candidates_scored if candidates_scored > 0 else len(index.symbols),
-            "scanned_files": len(seen_files) if seen_files else len(index.source_files),
-            "best_match_score": round(max_bm25_score, 3) if max_bm25_score > 0 else 0.0,
-        }
-        if related_existing:
-            negative_evidence["related_existing"] = related_existing
 
     meta = {
         "timing_ms": round(elapsed, 1),
@@ -1030,6 +1010,21 @@ def search_symbols(
         repo_is_stale=_probe.repo_is_stale,
         **_feat,
     )
+
+    from ..retrieval.verdict import build_verdict as _build_verdict
+    _vres = _build_verdict(
+        result_count=len(scored_results),
+        scanned_symbols=candidates_scored if candidates_scored > 0 else len(index.symbols),
+        scanned_files=len(seen_files) if seen_files else len(index.source_files),
+        best_score=max_bm25_score,
+        threshold=_ne_threshold,
+        query_terms=query_terms,
+        source_files=index.source_files,
+        semantic_requested=bool(semantic or semantic_only),
+        index_stale=_probe.repo_is_stale,
+    )
+    negative_evidence = _vres["negative_evidence"]
+    meta["verdict"] = _vres["verdict"]
 
     # Feature 1: Add negative_evidence if present
     if negative_evidence is not None:

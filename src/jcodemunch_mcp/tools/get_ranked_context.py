@@ -320,30 +320,15 @@ def get_ranked_context(
             **_compact_fields(sym, adj_score, item_tokens),
         })
 
-    # Negative evidence for low-confidence or empty results
+    # Retrieval verdict threshold. The verdict itself is computed after the
+    # freshness probe below so it can report index staleness.
     _ne_threshold = _NEGATIVE_EVIDENCE_THRESHOLD
     try:
         from .. import config as _cfg
         _ne_threshold = _cfg.get("negative_evidence_threshold", _NEGATIVE_EVIDENCE_THRESHOLD)
     except Exception:
         pass
-
     negative_evidence = None
-    if not context_items or max_bm25 < _ne_threshold:
-        verdict = "no_implementation_found" if not context_items else "low_confidence_matches"
-        related_existing = [
-            f for f in index.source_files
-            if any(t in f.lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-                   for t in query_terms)
-        ][:5]
-        negative_evidence = {
-            "verdict": verdict,
-            "scanned_symbols": items_considered,
-            "scanned_files": len(set(s.get("file", "") for _, _, _, s in scored)),
-            "best_match_score": round(max_bm25, 3),
-        }
-        if related_existing:
-            negative_evidence["related_existing"] = related_existing
 
     # Token savings estimate
     raw_bytes = sum(
@@ -381,6 +366,20 @@ def get_ranked_context(
     _probe.annotate(context_items)
     result["_meta"]["freshness"] = _probe.summary(context_items)
     _attach_confidence(result, context_items, is_stale=_probe.repo_is_stale)
+    from ..retrieval.verdict import build_verdict as _build_verdict
+    _vres = _build_verdict(
+        result_count=len(context_items),
+        scanned_symbols=items_considered,
+        scanned_files=len(set(s.get("file", "") for _, _, _, s in scored)),
+        best_score=max_bm25,
+        threshold=_ne_threshold,
+        query_terms=query_terms,
+        source_files=index.source_files,
+        semantic_requested=False,
+        index_stale=_probe.repo_is_stale,
+    )
+    negative_evidence = _vres["negative_evidence"]
+    result["_meta"]["verdict"] = _vres["verdict"]
     _record_ranking_event(
         tool="get_ranked_context",
         repo=f"{owner}/{name}",

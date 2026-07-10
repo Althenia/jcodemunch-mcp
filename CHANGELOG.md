@@ -2,6 +2,37 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.116] - 2026-07-10 - Unified retrieval verdict (`_meta.verdict`)
+
+### Added
+
+- **A unified `_meta.verdict` on the retrieval tools** — one honesty contract with a
+  complete taxonomy: `ok` / `low_confidence` / `absent` / `degraded`. A weak or empty
+  result is positive, token-saving evidence: grounded symbolic retrieval can prove
+  "this is not here," so the agent stops reformulating a query for something the index
+  provably does not contain. Each verdict carries the scan counts that back an absence
+  claim, per-channel status (`lexical` / `semantic` / `index`), and near-miss
+  `did_you_mean` suggestions.
+- **`degraded` is a new state** that fires when a requested retrieval channel was
+  silently downgraded — semantic search requested with no embedding provider
+  configured, or a cut-short (`timed_out`) text scan — so a partial result is never
+  mistaken for a proof of absence.
+- **`search_text` now emits `_meta.verdict`** (previously it returned silent empties
+  with no absent/ok signal).
+
+### Changed
+
+- The previously-duplicated `negative_evidence` computation in `search_symbols` and
+  `get_ranked_context` is unified into one helper, `retrieval/verdict.py::build_verdict`.
+  The legacy top-level `negative_evidence` dict and `⚠ warning` string are produced from
+  the same computation on the **unchanged** trigger (empty result, or best score below
+  `negative_evidence_threshold`), so existing consumers and the injected agent policy
+  are unaffected — `_meta.verdict` is purely additive.
+
+NO INDEX_VERSION bump; no tool-count or input-schema change; inline compute, no new
+background or network behavior. New `retrieval/verdict.py`; `tests/test_negative_evidence.py`
+extended (10 new cases across the four states, `did_you_mean`, and legacy parity).
+
 ## [1.108.115] - 2026-07-09 - New installs default to the `counter` tool surface
 
 ### Changed
