@@ -6,7 +6,7 @@
 > **335B+ tokens saved** · **48,000+ developers** · **$1.69M+ in AI spend avoided** · **40,000+ kg CO₂ prevented**
 > Live telemetry at **[jcodemunch.com](https://jcodemunch.com/)** — benchmark: **95% average token reduction** (15 tasks / 3 repos, 99.8% peak).
 
-Works with **Claude Code**, **Cursor**, **VS Code**, **Codex CLI**, **Continue**, **Windsurf**, and any MCP-compatible client.
+Works with **Autohand Code**, **Claude Code**, **Cursor**, **VS Code**, **Codex CLI**, **Continue**, **Windsurf**, and any MCP-compatible client.
 
 ---
 
@@ -870,6 +870,7 @@ Tested configurations:
 
 | Platform | Config |
 |----------|--------|
+| **Autohand Code** | `autohand mcp add jcodemunch uvx jcodemunch-mcp` ([CLI details](https://github.com/autohandai/code-cli/)); add `--scope project` before `jcodemunch` for project configuration |
 | **Claude Code / Claude Desktop** | `jcodemunch-mcp init` (auto-detects and patches config) |
 | **Cursor / Windsurf / Continue** | `jcodemunch-mcp init` or manual `mcp.json` |
 | **Antigravity (Google)** | Add a `jcodemunch` entry to `~/.gemini/config/mcp_config.json` (shared by Antigravity 2.0 / IDE / CLI). See below. |
