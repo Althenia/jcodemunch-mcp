@@ -1052,6 +1052,28 @@ functions, classes, importers, blast radius, class hierarchies — rather than
 returning fuzzy chunks (RAG) or raw line matches (grep) that the agent still has
 to read and reason over. Index once, query exactly what you need.
 
+## License
+
+jCodeMunch-MCP is released under the **jCodeMunch-MCP Dual-Use License** — see
+[LICENSE](LICENSE) for the authoritative terms. It is **free for non-commercial
+use**; [commercial use requires a paid license](#commercial-licenses).
+
+Conditions on all uses:
+
+1. The above copyright notice and this permission notice must be retained in all
+   copies or substantial portions of the Software.
+
+2. Any modifications made to the Software must clearly indicate that they are
+   derived from the original work, and the name of the original author
+   (J. Gravelle) must remain intact. He's kinda full of himself.
+
+3. Redistributions of the Software in source code form must include a prominent
+   notice describing any modifications from the original version.
+
+The Software may not be renamed, rebranded, or published to any public package
+registry, and it is provided "AS IS" without warranty of any kind. The full,
+controlling terms are in [LICENSE](LICENSE).
+
 ## Star History
 
 <a href="https://www.star-history.com/?repos=jgravelle%2Fjcodemunch-mcp&type=date&legend=top-left">
