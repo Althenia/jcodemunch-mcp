@@ -7,6 +7,7 @@ from typing import Optional
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ..parser import Symbol, build_symbol_tree
+from ..retrieval.verdict import file_verdict_for_index
 from ._utils import load_repo_index_or_error
 
 
@@ -26,6 +27,11 @@ def _get_file_outline_single(
             "language": "",
             "file_summary": "",
             "symbols": [],
+            "_meta": {
+                "verdict": file_verdict_for_index(
+                    index, present=False, requested_path=file_path
+                )
+            },
         }
 
     # Filter symbols to this file
@@ -57,6 +63,9 @@ def _get_file_outline_single(
                 "tokens_saved": tokens_saved,
                 "total_tokens_saved": total_saved,
                 **cost_avoided(tokens_saved, total_saved),
+                "verdict": file_verdict_for_index(
+                    index, present=True, empty_symbols=True
+                ),
                 "tip": "Tip: use file_paths=[...] to query multiple files in one call.",
             },
         }
@@ -84,6 +93,7 @@ def _get_file_outline_single(
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
             **cost_avoided(tokens_saved, total_saved),
+            "verdict": file_verdict_for_index(index, present=True),
             "tip": "Tip: use file_paths=[...] to query multiple files in one call.",
         },
     }

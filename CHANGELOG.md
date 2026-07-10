@@ -2,6 +2,37 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.117] - 2026-07-10 - `_meta.verdict` on the file & symbol read tools
+
+### Added
+
+- **`get_file_content`, `get_file_outline`, and `get_symbol_source` now emit
+  `_meta.verdict`** — the same honesty contract that already covers the search tools now
+  covers the read tools, where an agent most often burns tokens chasing a path or symbol
+  id that isn't there. A miss returns `state: "absent"` plus a `did_you_mean` list of
+  near-miss candidates, so the agent corrects the target instead of retrying the same
+  wrong one.
+- **Path near-misses** rank an exact-basename match in a different directory (right
+  filename, wrong folder) ahead of stem substring matches. **Symbol near-misses** rank a
+  same-name symbol in another file/kind ahead of substring matches. Both are computed
+  only on the miss path.
+- **`get_file_outline` distinguishes "file not indexed" from "file indexed but exposes no
+  symbols"** — the latter is a real `absent` (a data/config file, or constructs the parser
+  does not surface) with no suggestions, so the agent does not re-request the outline
+  expecting a different result.
+
+### Changed
+
+- The file/symbol verdict logic lives in the same `retrieval/verdict.py` module as the
+  search verdict (`build_file_verdict` / `build_symbol_verdict` plus index-aware
+  `file_verdict_for_index` / `symbol_verdict_for_index` wrappers). Successful reads now
+  also carry `_meta.verdict: {state: "ok"}` so the field is present on every outcome,
+  matching `search_symbols`. All additive — error strings and existing keys are unchanged.
+
+NO INDEX_VERSION bump; no tool-count or input-schema change; inline compute, no new
+background or network behavior. `tests/test_negative_evidence.py` extended (13 new cases:
+path/symbol near-miss ranking, the three file-tool states, and the batch/single symbol paths).
+
 ## [1.108.116] - 2026-07-10 - Unified retrieval verdict (`_meta.verdict`)
 
 ### Added

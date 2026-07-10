@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from ..retrieval.verdict import suggest_symbol_ids, symbol_verdict_for_index
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided as _cost_avoided
 from ._utils import index_status_to_tool_error, resolve_repo, resolve_fqn
 
@@ -282,7 +283,11 @@ def get_symbol_source(
         symbol = index.get_symbol(sid)
 
         if not symbol:
-            errors_out.append({"id": sid, "error": f"Symbol not found: {sid}"})
+            err = {"id": sid, "error": f"Symbol not found: {sid}"}
+            _sug = suggest_symbol_ids(sid, index.symbols)
+            if _sug:
+                err["did_you_mean"] = _sug
+            errors_out.append(err)
             continue
 
         source = store.get_symbol_content(owner, name, sid, _index=index)
@@ -420,15 +425,26 @@ def get_symbol_source(
     if batch_mode:
         meta["symbol_count"] = len(symbols_out)
         meta["freshness"] = _probe.summary(symbols_out)
+        meta["verdict"] = symbol_verdict_for_index(
+            index,
+            found_count=len(symbols_out),
+            requested_id=(ids[0] if len(ids) == 1 else None),
+        )
         if _runtime_summary:
             meta["runtime_freshness"] = _runtime_summary
         return {"symbols": symbols_out, "errors": errors_out, "_meta": meta}
 
     # Single mode: flat object or error
     if errors_out:
-        return {"error": errors_out[0]["error"]}
+        verdict = symbol_verdict_for_index(
+            index, found_count=0, requested_id=errors_out[0]["id"]
+        )
+        return {"error": errors_out[0]["error"], "_meta": {"verdict": verdict}}
     result = symbols_out[0]
     meta["hint"] = "Use get_context_bundle(symbol_id) to retrieve source + imports in one call"
+    meta["verdict"] = symbol_verdict_for_index(
+        index, found_count=len(symbols_out), requested_id=symbol_id
+    )
     meta["freshness"] = _probe.summary(symbols_out)
     if _runtime_summary:
         meta["runtime_freshness"] = _runtime_summary

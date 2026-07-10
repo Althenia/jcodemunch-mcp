@@ -312,3 +312,148 @@ class TestVerdictOnTools:
 
         miss = search_text(repo=repo, query="no_such_string_zzz", storage_path=storage)
         assert miss["_meta"]["verdict"]["state"] == "absent"
+
+
+class TestFileToolVerdictUnit:
+    """Pure-function coverage of the file/symbol verdict helpers (Phase 2)."""
+
+    def test_suggest_paths_exact_basename_first(self):
+        from jcodemunch_mcp.retrieval.verdict import suggest_paths
+        # Right filename, wrong directory -> exact basename ranks first.
+        out = suggest_paths(
+            "lib/auth.py",
+            ["src/auth.py", "src/authz_helper.py", "src/other.py"],
+        )
+        assert out[0] == "src/auth.py"
+        assert "src/authz_helper.py" in out  # stem substring, ranked after
+
+    def test_suggest_paths_normalizes_separators_and_excludes_self(self):
+        from jcodemunch_mcp.retrieval.verdict import suggest_paths
+        out = suggest_paths("src\\auth.py", ["src/auth.py"])
+        assert out == []  # identical path is never its own suggestion
+
+    def test_suggest_paths_empty_inputs(self):
+        from jcodemunch_mcp.retrieval.verdict import suggest_paths
+        assert suggest_paths(None, ["a.py"]) == []
+        assert suggest_paths("a.py", None) == []
+
+    def test_suggest_symbol_ids_same_name_first(self):
+        from jcodemunch_mcp.retrieval.verdict import suggest_symbol_ids
+        symbols = [
+            {"id": "src/a.py::login#function", "name": "login"},
+            {"id": "src/b.py::login_user#function", "name": "login_user"},
+            {"id": "src/c.py::logout#function", "name": "logout"},
+        ]
+        out = suggest_symbol_ids("wrong/path.py::login#function", symbols)
+        assert out[0] == "src/a.py::login#function"
+        assert "src/b.py::login_user#function" in out
+        assert "src/c.py::logout#function" not in out
+
+    def test_build_file_verdict_absent_with_suggestions(self):
+        from jcodemunch_mcp.retrieval.verdict import build_file_verdict
+        v = build_file_verdict(
+            present=False,
+            requested_path="lib/auth.py",
+            source_files=["src/auth.py"],
+        )
+        assert v["state"] == "absent"
+        assert v["did_you_mean"] == ["src/auth.py"]
+
+    def test_build_file_verdict_empty_symbols_is_absent_no_suggestions(self):
+        from jcodemunch_mcp.retrieval.verdict import build_file_verdict
+        v = build_file_verdict(present=True, empty_symbols=True)
+        assert v["state"] == "absent"
+        assert "did_you_mean" not in v
+
+    def test_build_file_verdict_ok(self):
+        from jcodemunch_mcp.retrieval.verdict import build_file_verdict
+        v = build_file_verdict(present=True)
+        assert v["state"] == "ok"
+
+    def test_build_symbol_verdict_absent_and_ok(self):
+        from jcodemunch_mcp.retrieval.verdict import build_symbol_verdict
+        symbols = [{"id": "src/a.py::login#function", "name": "login"}]
+        absent = build_symbol_verdict(
+            found_count=0, requested_id="x::login#function", symbols=symbols
+        )
+        assert absent["state"] == "absent"
+        assert absent["did_you_mean"] == ["src/a.py::login#function"]
+        ok = build_symbol_verdict(found_count=2)
+        assert ok["state"] == "ok"
+        assert "did_you_mean" not in ok
+
+
+class TestFileVerdictOnTools:
+    """The _meta.verdict is emitted by the file/symbol read tools (Phase 2)."""
+
+    def _index(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.index_folder import index_folder
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "auth_handler.py").write_text(
+            "def login():\n    return True\n"
+        )
+        (src / "empty.json").write_text('{"k": 1}\n')
+        storage = str(tmp_path / "idx")
+        repo = index_folder(
+            path=str(tmp_path), use_ai_summaries=False, storage_path=storage
+        )["repo"]
+        return repo, storage
+
+    def test_get_file_content_absent_suggests_path(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_file_content import get_file_content
+        repo, storage = self._index(tmp_path)
+        res = get_file_content(
+            repo=repo, file_path="lib/auth_handler.py", storage_path=storage
+        )
+        assert "error" in res
+        v = res["_meta"]["verdict"]
+        assert v["state"] == "absent"
+        assert any("auth_handler.py" in p for p in v.get("did_you_mean", []))
+
+    def test_get_file_content_ok(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_file_content import get_file_content
+        repo, storage = self._index(tmp_path)
+        res = get_file_content(
+            repo=repo, file_path="src/auth_handler.py", storage_path=storage
+        )
+        assert res["_meta"]["verdict"]["state"] == "ok"
+
+    def test_get_file_outline_absent_path(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_file_outline import get_file_outline
+        repo, storage = self._index(tmp_path)
+        res = get_file_outline(
+            repo=repo, file_path="nope/auth_handler.py", storage_path=storage
+        )
+        assert res["_meta"]["verdict"]["state"] == "absent"
+        assert any("auth_handler.py" in p for p in res["_meta"]["verdict"].get("did_you_mean", []))
+
+    def test_get_file_outline_present_ok(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_file_outline import get_file_outline
+        repo, storage = self._index(tmp_path)
+        res = get_file_outline(
+            repo=repo, file_path="src/auth_handler.py", storage_path=storage
+        )
+        assert res["_meta"]["verdict"]["state"] == "ok"
+
+    def test_get_symbol_source_absent_suggests_id(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_symbol import get_symbol_source
+        repo, storage = self._index(tmp_path)
+        res = get_symbol_source(
+            repo=repo, symbol_id="wrong/file.py::login#function", storage_path=storage
+        )
+        assert "error" in res
+        v = res["_meta"]["verdict"]
+        assert v["state"] == "absent"
+        assert any("login" in sid for sid in v.get("did_you_mean", []))
+
+    def test_get_symbol_source_ok(self, tmp_path: Path):
+        from jcodemunch_mcp.tools.get_file_outline import get_file_outline
+        from jcodemunch_mcp.tools.get_symbol import get_symbol_source
+        repo, storage = self._index(tmp_path)
+        outline = get_file_outline(
+            repo=repo, file_path="src/auth_handler.py", storage_path=storage
+        )
+        sid = outline["symbols"][0]["id"]
+        res = get_symbol_source(repo=repo, symbol_id=sid, storage_path=storage)
+        assert res["_meta"]["verdict"]["state"] == "ok"

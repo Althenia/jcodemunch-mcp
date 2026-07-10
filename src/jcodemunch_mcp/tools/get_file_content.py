@@ -3,6 +3,7 @@
 import time
 from typing import Optional
 
+from ..retrieval.verdict import file_verdict_for_index
 from ..storage import IndexStore, cost_avoided, estimate_savings, record_savings
 from ._utils import index_status_to_tool_error, resolve_repo
 
@@ -28,7 +29,15 @@ def get_file_content(
     if not index:
         return index_status_to_tool_error(store.inspect_index(owner, name))
     if not index.has_source_file(file_path):
-        return {"error": f"File not found: {file_path}"}
+        return {
+            "error": f"File not found: {file_path}",
+            "file": file_path,
+            "_meta": {
+                "verdict": file_verdict_for_index(
+                    index, present=False, requested_path=file_path
+                )
+            },
+        }
 
     content = store.get_file_content(owner, name, file_path, _index=index)
     if content is None:
@@ -89,5 +98,6 @@ def get_file_content(
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
             **cost_avoided(tokens_saved, total_saved),
+            "verdict": file_verdict_for_index(index, present=True),
         },
     }
