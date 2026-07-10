@@ -1073,13 +1073,3 @@ Conditions on all uses:
 The Software may not be renamed, rebranded, or published to any public package
 registry, and it is provided "AS IS" without warranty of any kind. The full,
 controlling terms are in [LICENSE](LICENSE).
-
-## Star History
-
-<a href="https://www.star-history.com/?repos=jgravelle%2Fjcodemunch-mcp&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=jgravelle/jcodemunch-mcp&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=jgravelle/jcodemunch-mcp&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=jgravelle/jcodemunch-mcp&type=date&legend=top-left" />
- </picture>
-</a>
