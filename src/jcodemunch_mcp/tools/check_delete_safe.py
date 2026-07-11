@@ -10,6 +10,7 @@ Verdict tiers (most-permissive first):
   - internal_only          — refs exist only within the symbol's own file
   - internal_uses_blocking — referenced by other symbols in this repo (refactor first)
   - external_uses_blocking — imported by other files in this repo
+  - scip_referenced        — compiler-verified references (SCIP) the import graph + text search missed
   - cross_repo_blocking    — used by other indexed repos (highest static severity)
   - runtime_observed       — Phase 7 traces show this code runs (red flag regardless of static refs)
   - entry_point            — decorator/main pattern suggests external invocation
@@ -33,6 +34,7 @@ logger = logging.getLogger(__name__)
 _SEVERITY_CROSS_REPO = 5
 _SEVERITY_RUNTIME = 5
 _SEVERITY_ENTRY_POINT = 5
+_SEVERITY_SCIP = 5           # compiler-verified reference — proven external use
 _SEVERITY_EXTERNAL_IMPORT = 4
 _SEVERITY_INTERNAL_REF = 3
 _SEVERITY_TEST_ONLY = 2
@@ -296,10 +298,40 @@ def check_delete_safe(
             "severity": _SEVERITY_RUNTIME,
         })
 
+    # ── Signal 6: SCIP compiler-verified references (compile-time evidence) ──
+    # Files the compiler proved reference the target but the import graph + text
+    # search missed (dynamic dispatch, barrel re-exports). A non-test external
+    # one is proof the symbol is used — it flips an otherwise safe_to_delete
+    # verdict to blocked. Honest no-op without ingested SCIP.
+    from ._scip_consume import scip_reference_files, scip_meta_block  # noqa: PLC0415
+    scip_external_count = 0
+    scip_test_count = 0
+    scip_block: Optional[dict] = None
+    _scip_files, _scip_meta, _scip_stale = scip_reference_files(store, owner, name, target_id)
+    _scip_files.pop(target_file, None)  # self-references are not external uses
+    for _f in sorted(_scip_files):
+        if _is_test_file(_f):
+            scip_test_count += 1
+            blockers.append({
+                "kind": "scip_test_reference", "file": _f,
+                "severity": _SEVERITY_TEST_ONLY, "verification": "compiler_verified",
+            })
+        else:
+            scip_external_count += 1
+            blockers.append({
+                "kind": "scip_reference", "file": _f,
+                "severity": _SEVERITY_SCIP, "verification": "compiler_verified",
+            })
+    if _scip_files:
+        scip_block = scip_meta_block(
+            _scip_meta, _scip_stale,
+            verified_external_refs=scip_external_count, verified_test_refs=scip_test_count,
+        )
+
     # ── Verdict selection ──────────────────────────────────────────────
     # Order matters — most restrictive first. Tests are counted separately
     # from external imports so test-only consumption downgrades the verdict.
-    total_test_signals = test_ref_count + test_import_count
+    total_test_signals = test_ref_count + test_import_count + scip_test_count
     total_external_signals = external_import_count
     total_internal_signals = internal_ref_count
 
@@ -309,6 +341,8 @@ def check_delete_safe(
         verdict = "entry_point"
     elif cross_repo_count > 0:
         verdict = "cross_repo_blocking"
+    elif scip_external_count > 0:
+        verdict = "scip_referenced"
     elif total_external_signals > 0:
         verdict = "external_uses_blocking"
     elif total_internal_signals > 0:
@@ -334,6 +368,8 @@ def check_delete_safe(
         confidence = 0.05  # nearly certain unsafe
     elif verdict == "cross_repo_blocking":
         confidence = 0.10
+    elif verdict == "scip_referenced":
+        confidence = 0.10  # compiler-proven external use
     elif verdict == "entry_point":
         confidence = 0.20
     elif verdict == "external_uses_blocking":
@@ -368,6 +404,11 @@ def check_delete_safe(
         ),
         "external_uses_blocking": (
             f"{external_import_count} other file(s) in this repo import this. Update importers first."
+        ),
+        "scip_referenced": (
+            f"{scip_external_count} file(s) carry a compiler-verified reference to this symbol "
+            "(SCIP) that the import graph and text search didn't surface — dynamic dispatch or "
+            "barrel re-exports. Update those call sites before deleting."
         ),
         "cross_repo_blocking": (
             f"{cross_repo_count} other repo(s) in the suite depend on this. Coordinate a deprecation."
@@ -412,6 +453,8 @@ def check_delete_safe(
             "cross_repo_count": cross_repo_count,
             "internal_ref_count": internal_ref_count,
             "test_ref_count": test_ref_count,
+            "scip_external_ref_count": scip_external_count,
+            "scip_test_ref_count": scip_test_count,
             "dead_code_confidence": round(dead_code_conf, 3),
             "entry_point": entry_signal,
         },
@@ -422,6 +465,8 @@ def check_delete_safe(
             **cost_avoided(tokens_saved, total_saved),
         },
     }
+    if scip_block is not None:
+        result["_meta"]["scip"] = scip_block
     if runtime_hits is not None:
         result["signals"]["runtime_hits"] = runtime_hits
     if include_runtime:

@@ -61,6 +61,41 @@ def scip_meta_and_stale(conn: sqlite3.Connection) -> tuple[dict, bool]:
     return scip_meta, stale
 
 
+def scip_reference_files(store, owner: str, name: str, target_id: str):
+    """Files carrying a compiler-verified ``reference`` edge INTO ``target_id``.
+
+    Returns ``({file: count}, scip_meta, stale)`` — the files whose symbols the
+    compiler proved reference the target, which is exactly the "who uses this"
+    signal the delete/edit-safety preflights need (it catches dynamic-dispatch
+    and barrel-re-export call sites the import graph and text search miss).
+    Excluding the target's own file is the caller's job. Honest-empty
+    ``({}, {}, False)`` when no SCIP data has been ingested.
+    """
+    if not target_id:
+        return {}, {}, False
+    conn = open_scip_reader(store, owner, name)
+    if conn is None:
+        return {}, {}, False
+    try:
+        scip_meta, stale = scip_meta_and_stale(conn)
+        rows = conn.execute(
+            """
+            SELECT s_from.file AS ref_file, SUM(e.count) AS n
+            FROM scip_edges e
+            JOIN symbols s_from ON s_from.id = e.from_symbol_id
+            WHERE e.kind = 'reference' AND e.to_symbol_id = ?
+            GROUP BY s_from.file
+            """,
+            (target_id,),
+        ).fetchall()
+        files = {r["ref_file"]: int(r["n"] or 0) for r in rows if r["ref_file"]}
+        return files, scip_meta, stale
+    except Exception:
+        return {}, {}, False
+    finally:
+        conn.close()
+
+
 def scip_meta_block(scip_meta: dict, stale: bool, **counts) -> dict:
     """Build the ``_meta.scip`` summary block: caller-supplied counts + tool /
     ingested_at provenance + a staleness note."""

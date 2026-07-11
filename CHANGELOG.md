@@ -2,6 +2,36 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.120] - 2026-07-11 - Compile-time evidence in the safety preflights
+
+### Added
+
+- **`check_delete_safe` and `check_edit_safe` now treat compiler-verified
+  references (SCIP) as blockers.** When a repo has ingested SCIP data
+  (`jcodemunch-mcp import-scip`), a file the compiler proved references the
+  target — but the import graph and text search both missed (dynamic dispatch,
+  barrel re-exports) — is real evidence of use:
+  - `check_delete_safe` gains a `scip_referenced` verdict tier (confidence 0.10)
+    that flips an otherwise `safe_to_delete` result to blocked, with
+    `scip_reference` blockers (`verification: "compiler_verified"`, severity 5)
+    and `signals.scip_external_ref_count`. Compiler-verified *test-file*
+    references downgrade to `test_coverage_only`, mirroring the existing
+    test-only handling.
+  - `check_edit_safe` folds compiler-verified external references into its
+    `signature_impact` signal, so a symbol whose only caller is dynamically
+    dispatched still reports the contract must be preserved.
+- Both attach a `_meta.scip` block with the verified counts and a staleness flag.
+
+### Notes
+
+- Honest no-op without ingested SCIP (including pre-v17 databases). Read-only; no
+  new tool, no schema/tool-count change, no `INDEX_VERSION` bump.
+- New shared reader `scip_reference_files` in `tools/_scip_consume.py`. New
+  `tests/test_v1_108_120.py` (7, including integration tests that prove the
+  safe→blocked flip after injecting a compiler-verified reference the heuristic
+  channels can't see). Final P2 graph-consumer increment (completes the set with
+  1.108.118 and 1.108.119).
+
 ## [1.108.119] - 2026-07-11 - Compile-time evidence in find_implementations
 
 ### Added
