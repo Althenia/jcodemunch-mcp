@@ -2,6 +2,30 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.119] - 2026-07-11 - Compile-time evidence in find_implementations
+
+### Added
+
+- **`find_implementations` gains a SCIP channel (confidence 1.0)** — when a repo
+  has ingested SCIP data (`jcodemunch-mcp import-scip`), compiler-verified
+  `A implements B` relationships surface the concrete implementations the AST and
+  duck-typed channels can't see (e.g. an interface with no declared
+  subclassing). Each such implementation is emitted with
+  `relationship: "interface_impl"`, `source: "scip"`, `confidence: 1.0`, and
+  `verification: "compiler_verified"`; it wins the cross-channel dedup over
+  lower-confidence heuristics. A `_meta.scip` block reports the count and a
+  staleness flag.
+
+### Notes
+
+- Honest no-op when no SCIP data is ingested (including pre-v17 databases).
+  Read-only; no new tool, no schema/tool-count change, no `INDEX_VERSION` bump.
+- New reader `_scip_implementation_ids` (uses the shared
+  `tools/_scip_consume.py`). New `tests/test_v1_108_119.py` (6, including an
+  integration test proving the channel surfaces an implementation the AST
+  misses). Second of the three P2 graph-consumer increments (after
+  blast_radius/call_hierarchy in 1.108.118).
+
 ## [1.108.118] - 2026-07-11 - Compile-time evidence in the graph tools
 
 ### Added
