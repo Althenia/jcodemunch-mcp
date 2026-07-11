@@ -12,6 +12,93 @@ from .package_registry import extract_root_package_from_specifier
 from ._call_graph import build_symbols_by_file, bfs_callers
 from .find_dead_code import _is_test_file
 from .decision_context import resolve_decision_context
+from ._scip_consume import open_scip_reader, scip_meta_and_stale, scip_meta_block
+
+
+def _attach_scip_to_blast(result: dict, store, owner: str, name: str) -> dict:
+    """Union SCIP compiler-verified reference files into a blast-radius result.
+
+    Files whose symbols carry a compiler-verified reference to the focal symbol
+    gain ``verification: "compiler_verified"`` on their ``confirmed`` entry; files
+    the compiler proved but the import graph missed (dynamic dispatch, barrel
+    re-exports) are appended to ``confirmed`` as ``source: "scip"`` rows.
+    ``confirmed_count`` is refreshed and ``_meta.scip`` summarises. Byte-identical
+    no-op when no SCIP data has been ingested; idempotent across the result cache
+    (guarded so it never double-appends). ``importer_count`` is left untouched —
+    it counts import-graph importers, and SCIP-only files are by definition the
+    ones the import graph missed.
+    """
+    if "error" in result:
+        return result
+    sym = result.get("symbol") or {}
+    target_id = sym.get("id") or ""
+    target_name = sym.get("name") or ""
+    if not target_id and not target_name:
+        return result
+    conn = open_scip_reader(store, owner, name)
+    if conn is None:
+        return result
+    try:
+        scip_meta, stale = scip_meta_and_stale(conn)
+        if target_id:
+            rows = conn.execute(
+                """
+                SELECT s_from.file AS ref_file, SUM(e.count) AS n
+                FROM scip_edges e
+                JOIN symbols s_from ON s_from.id = e.from_symbol_id
+                WHERE e.kind = 'reference' AND e.to_symbol_id = ?
+                GROUP BY s_from.file
+                """,
+                (target_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT s_from.file AS ref_file, SUM(e.count) AS n
+                FROM scip_edges e
+                JOIN symbols s_to ON s_to.id = e.to_symbol_id
+                JOIN symbols s_from ON s_from.id = e.from_symbol_id
+                WHERE e.kind = 'reference' AND s_to.name = ? COLLATE NOCASE
+                GROUP BY s_from.file
+                """,
+                (target_name,),
+            ).fetchall()
+        files = {r["ref_file"]: r["n"] for r in rows if r["ref_file"]}
+        # A symbol referencing itself in its own file is not an affected importer.
+        files.pop(sym.get("file"), None)
+        if not files:
+            return result
+        confirmed = result.setdefault("confirmed", [])
+        import_files = {c.get("file") for c in confirmed if c.get("source") != "scip"}
+        already_scip = {c.get("file") for c in confirmed if c.get("source") == "scip"}
+        for c in confirmed:
+            if c.get("source") != "scip" and c.get("file") in files:
+                c["verification"] = "compiler_verified"
+        for f in sorted(f for f in files if f not in import_files):
+            if f in already_scip:
+                continue
+            confirmed.append({
+                "file": f,
+                "reference_count": files[f],
+                "verification": "compiler_verified",
+                "source": "scip",
+            })
+        result["confirmed_count"] = len(confirmed)
+        # Counts derive from final list state → idempotent across the cache.
+        verified_files = sum(
+            1 for c in confirmed
+            if c.get("source") != "scip" and c.get("verification") == "compiler_verified"
+        )
+        scip_only_files = sum(1 for c in confirmed if c.get("source") == "scip")
+        result.setdefault("_meta", {})["scip"] = scip_meta_block(
+            scip_meta, stale,
+            verified_files=verified_files, scip_only_files=scip_only_files,
+        )
+    except Exception:
+        return result
+    finally:
+        conn.close()
+    return result
 
 
 def _build_reverse_adjacency(
@@ -184,6 +271,10 @@ def get_blast_radius(
     except ValueError as e:
         return {"error": str(e)}
 
+    # Store constructed before the cache check so the cache-hit path can also
+    # attach SCIP evidence (construction is cheap and side-effect-free).
+    store = IndexStore(base_path=storage_path)
+
     # Check session cache before the expensive BFS + content scans
     repo_key = f"{owner}/{name}"
     specific_key = (symbol, depth, call_depth, bool(cross_repo), include_depth_scores, decorator_filter, include_source, source_budget, include_decisions)
@@ -193,9 +284,8 @@ def get_blast_radius(
         result["_meta"] = {**cached["_meta"],
                            "timing_ms": round((time.perf_counter() - start) * 1000, 1),
                            "cache_hit": True}
-        return result
+        return _attach_scip_to_blast(result, store, owner, name)
 
-    store = IndexStore(base_path=storage_path)
     index = store.load_index(owner, name)
     if not index:
         return index_status_to_tool_error(store.inspect_index(owner, name))
@@ -480,4 +570,4 @@ def get_blast_radius(
         )
 
     result_cache_put("get_blast_radius", repo_key, specific_key, result)
-    return result
+    return _attach_scip_to_blast(result, store, owner, name)

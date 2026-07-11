@@ -2,6 +2,38 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.118] - 2026-07-11 - Compile-time evidence in the graph tools
+
+### Added
+
+- **`get_blast_radius` and `get_call_hierarchy` now union compiler-verified
+  reference edges** from ingested SCIP data (`jcodemunch-mcp import-scip`), the
+  same evidence channel `find_references` already consumes. When a repo has
+  ingested a `.scip` index:
+  - `get_blast_radius` tags affected files the compiler also proved with
+    `verification: "compiler_verified"`, and **appends files the import graph
+    missed** (dynamic dispatch, barrel re-exports) to `confirmed` as
+    `source: "scip"` rows. `importer_count` is left untouched — SCIP-only files
+    are by definition the ones the import graph didn't see; the additions show
+    up in `confirmed_count` and `_meta.scip`.
+  - `get_call_hierarchy` surfaces callers the AST call graph can't see as
+    depth-1 entries with `resolution: "scip_reference"` +
+    `verification: "compiler_verified"`, and marks an existing AST caller the
+    compiler also proved as `compiler_verified`. Only the callers direction is
+    touched.
+- Both carry a `_meta.scip` summary (verified/scip-only counts, ingesting tool,
+  ingested-at, and a **staleness flag** when SCIP was ingested at a different
+  index HEAD).
+
+### Notes
+
+- Byte-identical no-op when no `.scip` has been ingested (including pre-v17
+  databases) and idempotent across the result cache. Read-only; no new tool, no
+  schema/tool-count change, no `INDEX_VERSION` bump.
+- New shared reader `tools/_scip_consume.py` (`open_scip_reader` /
+  `scip_meta_and_stale` / `scip_meta_block`) so each graph consumer writes only
+  its own union logic. New `tests/test_v1_108_118.py` (12).
+
 ## [1.108.117] - 2026-07-10 - `_meta.verdict` on the file & symbol read tools
 
 ### Added

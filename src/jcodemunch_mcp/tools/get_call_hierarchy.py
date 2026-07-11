@@ -7,6 +7,90 @@ from ..storage import IndexStore
 from ._utils import index_status_to_tool_error, resolve_repo
 from .get_blast_radius import _build_reverse_adjacency, _find_symbol
 from ._call_graph import build_symbols_by_file, bfs_callers, bfs_callees
+from ._scip_consume import open_scip_reader, scip_meta_and_stale, scip_meta_block
+
+
+def _attach_scip_to_hierarchy(response: dict, store, owner: str, name: str) -> dict:
+    """Add SCIP compiler-verified callers to a call-hierarchy response.
+
+    Reference edges the AST call graph can't see (string dispatch, barrel
+    re-exports) surface as depth-1 callers tagged ``resolution: "scip_reference"``
+    + ``verification: "compiler_verified"``; an existing AST caller the compiler
+    also proved gains the ``compiler_verified`` verification. ``caller_count`` and
+    the resolution-tier histogram are refreshed and ``_meta.scip`` summarises.
+    Honest no-op when no SCIP data; only the callers direction is touched.
+    """
+    if "error" in response:
+        return response
+    if response.get("direction") not in ("callers", "both"):
+        return response
+    sym = response.get("symbol") or {}
+    target_id = sym.get("id") or ""
+    if not target_id:
+        return response
+    conn = open_scip_reader(store, owner, name)
+    if conn is None:
+        return response
+    try:
+        scip_meta, stale = scip_meta_and_stale(conn)
+        rows = conn.execute(
+            """
+            SELECT s.id AS id, s.name AS name, s.kind AS kind, s.file AS file,
+                   s.line AS line, SUM(e.count) AS n
+            FROM scip_edges e
+            JOIN symbols s ON s.id = e.from_symbol_id
+            WHERE e.kind = 'reference' AND e.to_symbol_id = ?
+            GROUP BY s.id
+            """,
+            (target_id,),
+        ).fetchall()
+        # A symbol referencing itself is not a caller.
+        rows = [r for r in rows if r["id"] != target_id]
+        if not rows:
+            return response
+        callers = response.setdefault("callers", [])
+        by_id = {c.get("id"): c for c in callers}
+        added = 0
+        for r in rows:
+            existing = by_id.get(r["id"])
+            if existing is not None:
+                if existing.get("source") != "scip":
+                    existing["verification"] = "compiler_verified"
+                continue
+            entry = {
+                "id": r["id"],
+                "name": r["name"] or "",
+                "kind": r["kind"] or "",
+                "file": r["file"] or "",
+                "line": r["line"] or 0,
+                "depth": 1,
+                "resolution": "scip_reference",
+                "verification": "compiler_verified",
+                "source": "scip",
+            }
+            callers.append(entry)
+            by_id[r["id"]] = entry
+            added += 1
+        response["caller_count"] = len(callers)
+        meta = response.setdefault("_meta", {})
+        tiers = meta.get("resolution_tiers")
+        if isinstance(tiers, dict) and added:
+            tiers["scip_reference"] = tiers.get("scip_reference", 0) + added
+        # Counts derive from final list state → stable if ever re-attached.
+        verified_callers = sum(
+            1 for c in callers
+            if c.get("source") != "scip" and c.get("verification") == "compiler_verified"
+        )
+        scip_only_callers = sum(1 for c in callers if c.get("source") == "scip")
+        meta["scip"] = scip_meta_block(
+            scip_meta, stale,
+            verified_callers=verified_callers, scip_only_callers=scip_only_callers,
+        )
+    except Exception:
+        return response
+    finally:
+        conn.close()
+    return response
 
 
 def get_call_hierarchy(
@@ -211,4 +295,8 @@ def get_call_hierarchy(
     _summary = _attach_runtime(_stamped, _db_path_str, id_field="id")
     if _summary:
         response["_meta"]["runtime_freshness"] = _summary
+
+    # Compile-time evidence (SCIP): union compiler-verified callers the AST missed.
+    # Honest no-op when no .scip was ingested.
+    response = _attach_scip_to_hierarchy(response, store, owner, name)
     return response
