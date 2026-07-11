@@ -6,11 +6,14 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
 from .. import config as _config
 from ..parser.symbols import Symbol
+
+if TYPE_CHECKING:
+    from ..openai_oauth import OpenAIOAuthCredential
 
 logger = logging.getLogger(__name__)
 
@@ -479,20 +482,25 @@ class OpenAIBatchSummarizer(BaseSummarizer):
     model: str = "qwen3-coder"
     api_base: Optional[str] = None
     api_key: str = "local-llm"
+    oauth_credential: "OpenAIOAuthCredential | None" = None
 
     def __post_init__(self):
         self.client = None
         self.extra_body = {}
-        self.wire_api = (
-            os.environ.get("OPENAI_WIRE_API", "chat").strip().lower() or "chat"
-        )
+        self.wire_api = os.environ.get("OPENAI_WIRE_API", "chat").strip().lower() or "chat"
+        if self.oauth_credential is not None:
+            from ..openai_oauth import CODEX_API_BASE
+
+            self.api_base = CODEX_API_BASE
+            self.api_key = self.oauth_credential.access_token
+            self.wire_api = "responses"
         api_base = self.api_base or os.environ.get("OPENAI_API_BASE")
         self.api_base = api_base.rstrip("/") if api_base else None
         if self.api_base:
             # Strip trailing slash if present
             # Security: restrict to localhost unless explicitly overridden
             allow_remote = _config.get("allow_remote_summarizer", False, repo=self.repo)
-            if not _is_localhost_url(self.api_base) and not allow_remote:
+            if not _is_localhost_url(self.api_base) and not allow_remote and self.oauth_credential is None:
                 logger.warning(
                     "OPENAI_API_BASE points to non-localhost URL (%s). "
                     "Ignoring for security. Set JCODEMUNCH_ALLOW_REMOTE_SUMMARIZER=1 to allow.",
@@ -532,6 +540,9 @@ class OpenAIBatchSummarizer(BaseSummarizer):
                 timeout = 60.0
 
             headers = {"Authorization": f"Bearer {self.api_key}"}
+            account_id = self.oauth_credential.account_id if self.oauth_credential else None
+            if account_id:
+                headers["ChatGPT-Account-Id"] = account_id
             self.client = httpx.Client(timeout=timeout, headers=headers)
         except ImportError:
             self.client = None
@@ -746,11 +757,22 @@ def _create_summarizer(repo: Optional[str] = None) -> Optional[BaseSummarizer]:
         s = GeminiBatchSummarizer(repo=repo)
         return s if s.client else None
     if name == "openai":
+        oauth_credential = None
+        try:
+            from .. import openai_oauth
+        except ImportError as error:
+            logger.warning("OpenAI OAuth credential unavailable: %s", error)
+        else:
+            try:
+                oauth_credential = openai_oauth.load_credential()
+            except (ImportError, ValueError, OSError, RuntimeError, openai_oauth.httpx.HTTPError) as error:
+                logger.warning("OpenAI OAuth credential unavailable: %s", error)
         s = _make_openai_compat(
-            api_key=os.environ.get("OPENAI_API_KEY", "local-llm"),
-            base_url=os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
-            model=model_override or os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+            api_key=oauth_credential.access_token if oauth_credential else os.environ.get("OPENAI_API_KEY", "local-llm"),
+            base_url=openai_oauth.CODEX_API_BASE if oauth_credential else os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1"),
+            model=model_override or os.environ.get("OPENAI_MODEL", "gpt-5.4-mini" if oauth_credential else "gpt-4o-mini"),
             repo=repo,
+            oauth_credential=oauth_credential,
         )
         return s if s.client else None
     if name == "minimax":
@@ -813,11 +835,12 @@ def _make_openai_compat(
     base_url: str,
     model: str,
     repo: Optional[str] = None,
+    oauth_credential: "OpenAIOAuthCredential | None" = None,
 ) -> OpenAIBatchSummarizer:
     """Factory helper for OpenAI-compatible providers."""
     if not api_key:
         raise ValueError("Missing API key for OpenAI-compatible summarizer")
-    return OpenAIBatchSummarizer(model=model, api_base=base_url, api_key=api_key, repo=repo)
+    return OpenAIBatchSummarizer(model=model, api_base=base_url, api_key=api_key, repo=repo, oauth_credential=oauth_credential)
 
 
 def _docstring_summaries_enabled(repo: Optional[str] = None) -> bool:

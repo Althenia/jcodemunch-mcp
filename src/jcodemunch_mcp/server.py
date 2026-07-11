@@ -8125,6 +8125,15 @@ def main(argv: Optional[list[str]] = None):
     keyring_del_p.add_argument("name", help="Env-var name the credential maps to")
     keyring_sub.add_parser("list", help="List the credential env-var names jcodemunch recognises for keyring lookup.")
 
+    # --- auth ---
+    auth_parser = subparsers.add_parser(
+        "auth", help="Authenticate an AI provider using a subscription account."
+    )
+    auth_parser.add_argument("provider", choices=["openai"], help="Provider to authenticate")
+    auth_parser.add_argument(
+        "--headless", action="store_true", help="Use OpenAI device authorization instead of a browser callback"
+    )
+
     # --- download-model ---
     dm_parser = subparsers.add_parser(
         "download-model",
@@ -8175,7 +8184,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "health", "file-risk", "observatory", "keyring"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "health", "file-risk", "observatory", "keyring", "auth"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -8207,7 +8216,7 @@ def main(argv: Optional[list[str]] = None):
     # os.environ.get("ANTHROPIC_API_KEY") etc. sees the resolved value.
     # Skipped for the `keyring` subcommand itself (no point resolving env
     # vars when the user is about to manage them).
-    if getattr(args, "command", None) != "keyring":
+    if getattr(args, "command", None) not in {"keyring", "auth"}:
         try:
             from . import credentials as _creds
             _creds.resolve_credentials_in_env()
@@ -8526,6 +8535,25 @@ def main(argv: Optional[list[str]] = None):
             sys.exit(1)
         except Exception as e:
             print(f"keyring {action} failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.command == "auth":
+        from . import openai_oauth
+
+        try:
+            if args.provider == "openai":
+                if args.headless:
+                    openai_oauth.authorize_headless()
+                else:
+                    openai_oauth.authorize_browser()
+                print("OpenAI subscription authentication complete.")
+                print("Set JCODEMUNCH_SUMMARIZER_PROVIDER=openai to use it for AI summaries.")
+                sys.exit(0)
+        except ImportError as error:
+            print(f"auth openai: {error}", file=sys.stderr)
+            sys.exit(1)
+        except (openai_oauth.httpx.HTTPError, OSError, RuntimeError, TimeoutError, ValueError) as error:
+            print(f"auth openai failed: {error}", file=sys.stderr)
             sys.exit(1)
 
     if args.command == "download-model":

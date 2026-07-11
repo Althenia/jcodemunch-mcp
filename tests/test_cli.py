@@ -5,6 +5,19 @@ import pytest
 from jcodemunch_mcp.server import main
 
 
+def test_auth_openai_headless_dispatches(monkeypatch, capsys):
+    """auth openai --headless uses the device authorization flow."""
+    from jcodemunch_mcp import openai_oauth
+
+    monkeypatch.setattr(openai_oauth, "authorize_headless", lambda: None)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["auth", "openai", "--headless"])
+
+    assert exc.value.code == 0
+    assert "OpenAI subscription authentication complete" in capsys.readouterr().out
+
+
 def test_config_init_creates_template(monkeypatch, tmp_path, capsys):
     """config --init should create a template config.jsonc file."""
     from jcodemunch_mcp import config as config_module

@@ -422,6 +422,7 @@ pip install jcodemunch-mcp
 > pip install "jcodemunch-mcp[anthropic]"   # Claude
 > pip install "jcodemunch-mcp[gemini]"      # Gemini
 > pip install "jcodemunch-mcp[openai]"      # OpenAI-compatible
+> pip install "jcodemunch-mcp[keyring]"     # ChatGPT Plus/Pro subscription OAuth
 > pip install "jcodemunch-mcp[all]"         # all providers + local embeddings
 > ```
 >
@@ -818,6 +819,8 @@ The following env vars still work but are deprecated. Config file values take pr
 AI provider keys (`ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `OPENAI_API_BASE`, `MINIMAX_API_KEY`, `ZHIPUAI_API_KEY`, etc.), `JCODEMUNCH_SUMMARIZER_PROVIDER`, and `CODE_INDEX_PATH` are **always** read from env vars — they are never placed in config files.
 
 AI provider priority in auto-detect mode: Anthropic → Gemini → OpenAI-compatible (`OPENAI_API_BASE`) → MiniMax → GLM-5 → signature fallback. Set `JCODEMUNCH_SUMMARIZER_PROVIDER` to force `anthropic`, `gemini`, `openai`, `minimax`, `glm`, or `none`. `jcodemunch-mcp config` shows which provider is active.
+
+To use a ChatGPT Plus or Pro subscription for summaries instead of an OpenAI Platform API key, install the `[keyring]` extra and run `jcodemunch-mcp auth openai`. The default browser flow uses a loopback callback; use `jcodemunch-mcp auth openai --headless` on a remote machine. The OAuth credential is stored in the system keyring and refreshed automatically. Set `JCODEMUNCH_SUMMARIZER_PROVIDER=openai` to select it. Subscription requests are sent to the ChatGPT Codex Responses service, not `api.openai.com`.
 
 `allow_remote_summarizer` only affects OpenAI-compatible HTTP endpoints. When `false`, jcodemunch accepts only localhost-style endpoints such as Ollama or LM Studio on `127.0.0.1` and rejects remote hosts like `api.minimax.io`. When a remote endpoint is rejected, AI summarization falls back to docstrings or signatures instead of sending source code to that provider. Set `allow_remote_summarizer: true` in `config.jsonc` if you intentionally want to use a hosted OpenAI-compatible provider such as MiniMax or GLM-5.
 
