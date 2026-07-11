@@ -172,11 +172,16 @@ def _is_validated(key: str, storage_path: Optional[str] = None) -> dict:
 def check_gate(*, storage_path: Optional[str] = None) -> dict:
     """Decide whether org-rollup may run. Returns a dict:
 
-        {allowed, mode, reason, tier, grace_days_left, get_license, key_masked}
+        {allowed, mode, reason, tier, grace_days_left, get_license, key_masked,
+         key_valid, feature}
 
-    ``mode`` ∈ {"licensed", "grace", "blocked"}. Starts the grace clock on the
-    first unlicensed call (persisted), so the evaluation window is real-time, not
-    install-time."""
+    ``mode`` ∈ {"licensed", "grace", "blocked"} and describes ORG-ROLLUP
+    entitlement specifically (``feature`` == "org-rollup"), NOT whether the key
+    itself is valid. ``key_valid`` is the separate signal a caller needs to say
+    "your Builder license is recognized, org-rollup just isn't in that tier"
+    rather than "unlicensed" — a valid Builder key is ``key_valid=True`` but
+    ``mode="grace"``/"blocked". Starts the grace clock on the first unlicensed
+    call (persisted), so the evaluation window is real-time, not install-time."""
     key = _license_key()
     res = _is_validated(key, storage_path)
     tier = (res.get("tier") or "").lower()
@@ -190,6 +195,8 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
             "grace_days_left": None,
             "get_license": None,
             "key_masked": mask_key(key) if key else "",
+            "key_valid": True,
+            "feature": "org-rollup",
         }
 
     # Not entitled. Two shapes: (a) no/invalid key, or (b) a VALID license whose
@@ -227,6 +234,8 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
             "grace_days_left": days_left,
             "get_license": GET_LICENSE_URL,
             "key_masked": mask_key(key) if key else "",
+            "key_valid": bool(res["valid"]),
+            "feature": "org-rollup",
         }
 
     requirement = ("a Studio or Platform license" if insufficient_tier else "a license")
@@ -238,4 +247,6 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
         "grace_days_left": 0,
         "get_license": GET_LICENSE_URL,
         "key_masked": mask_key(key) if key else "",
+        "key_valid": bool(res["valid"]),
+        "feature": "org-rollup",
     }

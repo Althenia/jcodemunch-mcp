@@ -72,6 +72,35 @@ def test_no_key_starts_grace(monkeypatch):
     assert gate["get_license"]
 
 
+def test_key_valid_flag_distinguishes_licensed_shape(monkeypatch):
+    # #364 follow-up: key_valid is a separate signal from org-rollup entitlement,
+    # so a valid Builder license reads as "licensed" not "unlicensed" in the CLI.
+    # (a) valid multi-seat key: key_valid True, entitled.
+    monkeypatch.setenv("JCODEMUNCH_LICENSE_KEY", "STUDIOKEY001")
+    _server(monkeypatch, {"valid": True, "tier": "studio", "error": None})
+    g = lic.check_gate()
+    assert g["key_valid"] is True and g["mode"] == "licensed"
+    assert g["feature"] == "org-rollup"
+
+    # (b) valid Builder key: key_valid True even though org-rollup is in grace.
+    monkeypatch.setenv("JCODEMUNCH_LICENSE_KEY", "BUILDERKEY01")
+    _server(monkeypatch, {"valid": True, "tier": "builder", "error": None})
+    g = lic.check_gate()
+    assert g["key_valid"] is True and g["mode"] == "grace"
+
+    # (c) no key: key_valid False.
+    monkeypatch.delenv("JCODEMUNCH_LICENSE_KEY", raising=False)
+    _server(monkeypatch, None)
+    g = lic.check_gate()
+    assert g["key_valid"] is False and g["mode"] == "grace"
+
+    # (d) invalid key: key_valid False.
+    monkeypatch.setenv("JCODEMUNCH_LICENSE_KEY", "BOGUSKEY0001")
+    _server(monkeypatch, {"valid": False, "tier": None, "error": "not found"})
+    g = lic.check_gate()
+    assert g["key_valid"] is False
+
+
 def test_grace_expires_then_blocks(monkeypatch):
     # First call starts the clock; rewind it past the window.
     lic.check_gate()

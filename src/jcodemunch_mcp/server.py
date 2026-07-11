@@ -2889,6 +2889,9 @@ def _build_tools_list() -> list[Tool]:
         Tool(
             name="get_delivery_metrics",
             description=(
+                "Call this when you want a cost-per-outcome read on a codebase — how much "
+                "AI spend produced durable change over a window, not raw commit or token "
+                "volume. "
                 "Quantify durable-change delivery over a window: of the non-merge commits "
                 "in the last window_days, how many landed and stuck (commits_durable) vs were "
                 "reverted or re-touched within rework_horizon_days (churn-back). commits_durable "
@@ -2926,6 +2929,9 @@ def _build_tools_list() -> list[Tool]:
         Tool(
             name="get_parity_map",
             description=(
+                "Use when migrating or porting code from one tree or repo to another and "
+                "you need to know what's already moved, what silently diverged, and what's "
+                "still unported. "
                 "Map migration/port parity between a SOURCE symbol tree and a TARGET tree "
                 "(two subpaths of one repo, or two repos). For each source function/method/class "
                 "it reports: ported (equivalent counterpart exists), ported_diverged (counterpart "
@@ -8336,17 +8342,34 @@ def main(argv: Optional[list[str]] = None):
             print(json.dumps(gate, indent=2))
         else:
             mode = gate["mode"]
-            label = {"licensed": "licensed", "grace": "evaluation (unlicensed)", "blocked": "unlicensed"}[mode]
-            print(f"License: {label}")
+            # gate.mode describes org-rollup entitlement, NOT whether the key is
+            # valid. Present the two separately so a valid Builder license doesn't
+            # read as "unlicensed" just because org-rollup needs Studio/Platform
+            # (issue #364 follow-up).
+            key_valid = gate.get("key_valid", mode == "licensed")
+            tier = gate.get("tier")
+            if key_valid:
+                print("License: licensed" + (f" ({tier})" if tier else ""))
+            elif gate.get("key_masked"):
+                print("License: key not recognized")
+            else:
+                print("License: unlicensed (no key set)")
             if gate.get("key_masked"):
-                print(f"  Key:   {gate['key_masked']}")
-            if gate.get("tier"):
-                print(f"  Tier:  {gate['tier']}")
-            if mode == "grace":
-                print(f"  Trial: {gate['grace_days_left']} day(s) left")
-            print(f"  {gate['reason']}")
+                print(f"  Key: {gate['key_masked']}")
+            # org-rollup is the only license-gated feature; everything else is free.
+            if mode == "licensed":
+                print("  org-rollup: included")
+            elif mode == "grace":
+                if key_valid:
+                    print(f"  org-rollup: not in your tier — {gate['grace_days_left']} day(s) evaluation left")
+                else:
+                    print(f"  org-rollup: {gate['grace_days_left']} day(s) evaluation left")
+            else:  # blocked
+                print("  org-rollup: evaluation ended")
             if gate.get("get_license"):
-                print(f"  Get a license: {gate['get_license']}")
+                action = "Upgrade" if key_valid else "Get a license"
+                print(f"  {action}: {gate['get_license']}")
+            print("  (all other jCodeMunch features are free and need no license)")
             if key:
                 print("  (set JCODEMUNCH_LICENSE_KEY or config `license_key` to persist this key)")
         return

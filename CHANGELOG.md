@@ -2,6 +2,31 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.122] - 2026-07-11 - License CLI stops calling a valid license "unlicensed"
+
+### Fixed
+
+- **`jcodemunch-mcp license` no longer reports a valid Builder license as
+  "evaluation (unlicensed)"** (#364 follow-up, @domis86). The command's mode
+  (`licensed`/`grace`/`blocked`) describes *org-rollup* entitlement — the one
+  license-gated feature — but the CLI presented it as overall license status.
+  A holder of a valid single-seat Builder license (which doesn't include
+  org-rollup) saw "License: evaluation (unlicensed)" and "Trial: 14 day(s) left",
+  as if their key wasn't recognized at all. The output now separates the two
+  facts: whether the key is valid (`License: licensed (builder)`) and whether
+  org-rollup is included (`org-rollup: not in your tier — N day(s) evaluation
+  left`), plus a note that all other features are free.
+- `check_gate()` gains two additive fields — `key_valid` (is the key itself
+  valid, independent of org-rollup entitlement) and `feature` (`"org-rollup"`) —
+  so the CLI and other consumers (e.g. jMunch Console) can distinguish a valid
+  license from feature entitlement. Existing fields unchanged.
+
+### Changed
+
+- Two tool descriptions gained explicit "reach for this when…" trigger clauses
+  (`get_delivery_metrics`, `get_parity_map`) for better model tool-selection.
+  Both are standard-tier; `core_compact` schema budget unchanged.
+
 ## [1.108.121] - 2026-07-11 - License CLI reads the config-file `license_key`
 
 ### Fixed
