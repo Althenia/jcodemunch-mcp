@@ -2,6 +2,21 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.121] - 2026-07-11 - License CLI reads the config-file `license_key`
+
+### Fixed
+
+- **`jcodemunch-mcp license` now recognizes a `license_key` set in
+  `~/.code-index/config.jsonc`** (#364, reported by @domis86). The `license`
+  subcommand returned before the shared `load_config()` call that runs later in
+  `main()`, so `_GLOBAL_CONFIG` still held module defaults when `check_gate()`
+  read the key — a persisted `license_key` was invisible and the command
+  reported "unlicensed evaluation (no license key)" despite a valid key on disk.
+  Only the `JCODEMUNCH_LICENSE_KEY` env var and the `--key` flag (which set the
+  env var directly) worked. Fix: `load_config()` is called at the top of the
+  `license` handler so the config-file key is loaded before the gate check. No
+  INDEX_VERSION bump; no behavior change for env/`--key` users.
+
 ## [1.108.120] - 2026-07-11 - Compile-time evidence in the safety preflights
 
 ### Added

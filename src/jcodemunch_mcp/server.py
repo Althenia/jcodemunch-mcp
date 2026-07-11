@@ -8323,6 +8323,11 @@ def main(argv: Optional[list[str]] = None):
 
     if args.command == "license":
         from .org.license import check_gate
+        # Load config.jsonc so a persisted `license_key` is visible. This handler
+        # returns before the shared load_config() call further down in main(), so
+        # without this an installed license key would be ignored and only the
+        # JCODEMUNCH_LICENSE_KEY env var / --key would work (issue #364).
+        config_module.load_config()
         key = getattr(args, "key", None)
         if key:
             os.environ["JCODEMUNCH_LICENSE_KEY"] = key  # validate this key for this run
