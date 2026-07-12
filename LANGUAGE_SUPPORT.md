@@ -7,7 +7,7 @@
 | Language          | Extensions                                      | Parser                        | Symbol Types                                                                               | Decorators     | Docstrings                    | Notes / Limitations                                                                         |
 | ----------------- | ----------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------ | -------------- | ----------------------------- | ------------------------------------------------------------------------------------------- |
 | Python            | `.py`                                           | tree-sitter-python            | function, class, method, constant, type, field                                             | `@decorator`   | Triple-quoted strings         | Type aliases require Python 3.12+ syntax; `field` symbols emitted for dataclass / attrs / Pydantic class fields |
-| JavaScript        | `.js`, `.jsx`                                   | tree-sitter-javascript        | function, class, method, constant                                                          | —              | `//` and `/** */` comments    | Anonymous arrow functions without assigned names are not indexed                            |
+| JavaScript        | `.js`, `.mjs`, `.cjs`, `.jsx`                   | tree-sitter-javascript        | function, class, method, constant                                                          | —              | `//` and `/** */` comments    | Anonymous arrow functions without assigned names are not indexed                            |
 | TypeScript        | `.ts`                                           | tree-sitter-typescript        | function, class, method, constant, type                                                    | `@decorator`   | `//` and `/** */` comments    | Decorator extraction depends on Stage-3 decorator syntax                                    |
 | TSX               | `.tsx`                                          | tree-sitter-tsx               | function, class, method, type (interface/enum/alias)                                       | `@decorator`   | `//` and `/** */` comments    | JSX-aware TypeScript; separate grammar from `.ts`                                           |
 | Go                | `.go`                                           | tree-sitter-go                | function, method, type, constant                                                           | —              | `//` comments                 | No class hierarchy (language limitation)                                                    |
@@ -206,7 +206,7 @@ This inspection process helps identify the correct `symbol_node_types`, `name_fi
 Map additional file extensions to languages at startup without modifying source:
 
 ```
-JCODEMUNCH_EXTRA_EXTENSIONS=".cgi:perl,.psgi:perl,.mjs:javascript"
+JCODEMUNCH_EXTRA_EXTENSIONS=".cgi:perl,.psgi:perl,.jsm:javascript"
 ```
 
 - Comma-separated `.ext:lang` pairs

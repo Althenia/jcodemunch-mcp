@@ -2,6 +2,31 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.125] - 2026-07-12 - Native `.mjs` / `.cjs` indexing
+
+`.mjs` (ES module) and `.cjs` (CommonJS) files resolved to no language and were
+dropped at discovery as `wrong_extension`, so agents fell back to raw scans to
+read them. Every downstream layer already recognised the extensions (import
+graph, dead-code, PreToolUse hooks); the only gap was the core
+extension-to-language map.
+
+### Fixed
+
+- `.mjs` and `.cjs` now index as JavaScript. Added both to `LANGUAGE_EXTENSIONS`
+  (`parser/languages.py`) and to the fallback extension map in
+  `storage/sqlite_store.py`. Previously-skipped files gain symbols on a re-index;
+  purely additive, no `INDEX_VERSION` bump. (#365, reported by @oderwat.)
+
+### Changed
+
+- `LANGUAGE_SUPPORT.md`: JavaScript row lists `.mjs`/`.cjs`; the
+  `JCODEMUNCH_EXTRA_EXTENSIONS` example no longer uses `.mjs` (now native).
+
+### Tests
+
+- New `tests/test_v1_108_125.py` (3): registration, path resolution, and symbol
+  extraction from `.mjs`/`.cjs` bodies.
+
 ## [1.108.124] - 2026-07-12 - Tool-use examples on the Counter's menu/route surface
 
 The Counter (`order`/`menu`/`route`) discovers catalog actions without keeping

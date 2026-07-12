@@ -56,6 +56,8 @@ class LanguageSpec:
 LANGUAGE_EXTENSIONS = {
     ".py": "python",
     ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
     ".jsx": "javascript",
     ".ts": "typescript",
     ".tsx": "tsx",
