@@ -8296,6 +8296,10 @@ def main(argv: Optional[list[str]] = None):
 
         # org-rollup is the team-SKU (paid) feature — gate it. Individual tools
         # are untouched; seat reporting stays free so trial data accrues.
+        # Load config first so a persisted `license_key` is visible — this handler
+        # returns before the shared load_config() later in main(), same trap the
+        # license handler hit in #364.
+        config_module.load_config()
         gate = check_gate()
         if not gate["allowed"]:
             if as_json:
@@ -8341,37 +8345,9 @@ def main(argv: Optional[list[str]] = None):
         if getattr(args, "json", False):
             print(json.dumps(gate, indent=2))
         else:
-            mode = gate["mode"]
-            # gate.mode describes org-rollup entitlement, NOT whether the key is
-            # valid. Present the two separately so a valid Builder license doesn't
-            # read as "unlicensed" just because org-rollup needs Studio/Platform
-            # (issue #364 follow-up).
-            key_valid = gate.get("key_valid", mode == "licensed")
-            tier = gate.get("tier")
-            if key_valid:
-                print("License: licensed" + (f" ({tier})" if tier else ""))
-            elif gate.get("key_masked"):
-                print("License: key not recognized")
-            else:
-                print("License: unlicensed (no key set)")
-            if gate.get("key_masked"):
-                print(f"  Key: {gate['key_masked']}")
-            # org-rollup is the only license-gated feature; everything else is free.
-            if mode == "licensed":
-                print("  org-rollup: included")
-            elif mode == "grace":
-                if key_valid:
-                    print(f"  org-rollup: not in your tier — {gate['grace_days_left']} day(s) evaluation left")
-                else:
-                    print(f"  org-rollup: {gate['grace_days_left']} day(s) evaluation left")
-            else:  # blocked
-                print("  org-rollup: evaluation ended")
-            if gate.get("get_license"):
-                action = "Upgrade" if key_valid else "Get a license"
-                print(f"  {action}: {gate['get_license']}")
-            print("  (all other jCodeMunch features are free and need no license)")
-            if key:
-                print("  (set JCODEMUNCH_LICENSE_KEY or config `license_key` to persist this key)")
+            from .org.license import format_license_status
+            for line in format_license_status(gate, key_provided=bool(key)):
+                print(line)
         return
 
     if args.command == "list-repos":
@@ -8568,6 +8544,8 @@ def main(argv: Optional[list[str]] = None):
             sys.exit(1)
 
     if args.command == "install-pack":
+        # run_install_pack resolves --license → env → config `license_key` so a
+        # premium-pack entitlement set in config.jsonc is honored (not just --license).
         from .cli.install_pack import run_install_pack
         sys.exit(run_install_pack(
             pack_id=args.pack_id,

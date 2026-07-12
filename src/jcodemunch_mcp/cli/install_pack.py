@@ -38,6 +38,27 @@ def _storage_path() -> Path:
     return Path(os.environ.get("CODE_INDEX_PATH", str(Path.home() / ".code-index")))
 
 
+def resolve_effective_license_key(explicit: Optional[str]) -> Optional[str]:
+    """Resolve the license key for a premium-pack download.
+
+    Premium packs are a licensed entitlement (e.g. a Builder tier), so honor the
+    same key sources as every other license consumer: an explicit ``--license``
+    wins, else the ``JCODEMUNCH_LICENSE_KEY`` env var, else the config
+    ``license_key``. Without this, a customer who set ``license_key`` in
+    ``config.jsonc`` (rather than passing ``--license`` every time) silently
+    can't download the packs they paid for.
+    """
+    if explicit:
+        return explicit
+    try:
+        from ..config import load_config
+        from ..org.license import _license_key
+        load_config()  # idempotent; makes the config `license_key` visible
+        return _license_key() or None
+    except Exception:
+        return None
+
+
 def _mask_license(key: str) -> str:
     """Mask a license key for display: first 4 + last 4 chars."""
     if len(key) <= 8:
@@ -263,4 +284,5 @@ def run_install_pack(
     """Entry point for the install-pack subcommand."""
     if list_packs or not pack_id:
         return _list_packs()
-    return _install_pack(pack_id, license_key=license_key, force=force)
+    effective_key = resolve_effective_license_key(license_key)
+    return _install_pack(pack_id, license_key=effective_key, force=force)
