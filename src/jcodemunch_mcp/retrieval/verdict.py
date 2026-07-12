@@ -20,6 +20,33 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
+
+def index_truncation_meta(cap: Optional[dict]) -> Optional[dict]:
+    """Query-time ``_meta.index_truncated`` block from a persisted cap status (#366).
+
+    ``cap`` is ``CodeIndex.file_cap_status``. Returns None unless the index was
+    truncated by the max_folder_files walk cap, in which case it warns that whole
+    files are missing from the corpus these results were drawn from — so an empty
+    or thin result may be truncation, not genuine absence.
+    """
+    if not cap or not cap.get("truncated"):
+        return None
+    return {
+        "truncated": True,
+        "files_discovered": cap.get("files_discovered"),
+        "files_indexed": cap.get("files_indexed"),
+        "files_skipped_cap": cap.get("files_skipped_cap"),
+        "max_folder_files": cap.get("max_folder_files"),
+        "note": (
+            "This index is incomplete: the max_folder_files cap dropped "
+            f"{cap.get('files_skipped_cap')} file(s) at index time, so entire files "
+            "are absent from search. A missing or thin result may be truncation, not "
+            "absence. Raise max_folder_files in config.jsonc (or set "
+            "JCODEMUNCH_MAX_FOLDER_FILES) and re-index."
+        ),
+    }
+
+
 # Emitted as verdict["state"].
 STATE_OK = "ok"
 STATE_LOW_CONFIDENCE = "low_confidence"

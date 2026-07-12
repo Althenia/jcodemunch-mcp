@@ -184,6 +184,7 @@ class CodeIndex:
     psr4_map: dict[str, str] = field(default_factory=dict)  # PHP PSR-4 namespace map from composer.json; auto-loaded from source_root
     package_names: list[str] = field(default_factory=list)    # Package names published by this repo (from manifest files)
     branch: str = ""                 # Git branch name at index time (empty = base/default branch or non-git)
+    file_cap_status: dict = field(default_factory=dict)  # v1.108.126: {truncated, files_discovered, files_indexed, files_skipped_cap, max_folder_files} when the max_folder_files walk cap dropped files; {"truncated": False} otherwise. Empty = pre-v1.108.126 index (unknown).
 
     def __post_init__(self) -> None:
         if not self.display_name:
@@ -587,6 +588,7 @@ class IndexStore:
         package_names: Optional[list[str]] = None,
         git_root: str = "",
         source_roots: Optional[list[str]] = None,
+        file_cap_status: Optional[dict] = None,
     ) -> "CodeIndex":
         """Save index via SQLite backend."""
         # Validate owner/name for path separators (before any slug computation)
@@ -617,7 +619,7 @@ class IndexStore:
             imports=imports, context_metadata=context_metadata,
             file_blob_shas=file_blob_shas, file_mtimes=file_mtimes,
             package_names=package_names, git_root=git_root,
-            source_roots=source_roots,
+            source_roots=source_roots, file_cap_status=file_cap_status,
         )
 
         # Clean up any legacy JSON now that data is safely in SQLite.
@@ -785,6 +787,7 @@ class IndexStore:
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
         package_names: Optional[list[str]] = None,
+        file_cap_status: Optional[dict] = None,
     ) -> Optional[CodeIndex]:
         """Incrementally update via SQLite backend."""
         # Compute file_languages for changed/new files using existing logic.
@@ -806,6 +809,7 @@ class IndexStore:
             imports=imports, context_metadata=context_metadata,
             file_blob_shas=file_blob_shas, file_hashes=file_hashes,
             file_mtimes=file_mtimes, package_names=package_names,
+            file_cap_status=file_cap_status,
         )
 
     def save_branch_delta(self, owner: str, name: str, branch: str, **kwargs) -> None:

@@ -1917,7 +1917,10 @@ def generate_template() -> str:
 
   // "max_folder_files": 2000,
   //   Maximum number of files to index when indexing a local folder.
-  //   Prevents accidental massive indexing jobs.
+  //   Prevents accidental massive indexing jobs. Monorepos often exceed this;
+  //   when the cap drops files the index result, resolve_repo, and search _meta
+  //   all report `truncated` with the discovered/indexed counts. Raise this and
+  //   re-index if files are missing from results.
 
   // "gitignore_warn_threshold": 500,
   //   Emit a warning during index_folder when no root .gitignore is found

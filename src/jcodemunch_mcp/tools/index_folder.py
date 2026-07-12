@@ -42,6 +42,45 @@ from ..path_map import parse_path_map, remap
 
 SKIP_FILES_REGEX = re.compile("(" + "|".join(re.escape(p) for p in SKIP_FILES) + ")$")
 
+
+def _file_cap_report(skip_counts: dict, max_files: int) -> dict:
+    """Summarise whether the max_folder_files walk cap dropped files (#366).
+
+    Returns the full truncation block when the cap was hit, else
+    ``{"truncated": False}``. Always a dict so it can be persisted on every
+    save path and self-heal (a re-index under a raised cap writes False).
+    """
+    dropped = int((skip_counts or {}).get("file_limit", 0) or 0)
+    if dropped <= 0:
+        return {"truncated": False}
+    return {
+        "truncated": True,
+        "files_discovered": max_files + dropped,
+        "files_indexed": max_files,
+        "files_skipped_cap": dropped,
+        "max_folder_files": max_files,
+    }
+
+
+def _attach_cap_report(result: dict, cap: Optional[dict]) -> None:
+    """Surface a file-cap truncation in an index result dict (#366).
+
+    No-op when the walk wasn't truncated, so a healthy index is unchanged.
+    """
+    if not isinstance(result, dict) or not cap or not cap.get("truncated"):
+        return
+    result["truncated"] = True
+    result["files_discovered"] = cap["files_discovered"]
+    result["files_indexed"] = cap["files_indexed"]
+    result["files_skipped_cap"] = cap["files_skipped_cap"]
+    result.setdefault("warnings", []).append(
+        f"File cap reached: {cap['files_discovered']} files discovered, "
+        f"{cap['files_indexed']} indexed, {cap['files_skipped_cap']} dropped "
+        f"(max_folder_files={cap['max_folder_files']}). Entire files are missing "
+        f"from the index. Raise max_folder_files in config.jsonc (or set "
+        f"JCODEMUNCH_MAX_FOLDER_FILES) and re-index, or narrow the path."
+    )
+
 def _build_skip_dirs_regex() -> re.Pattern:
     """Build regex from config-filtered skip directories (called per-index)."""
     dirs = get_skip_directories()
@@ -1641,6 +1680,11 @@ def index_folder(
         warnings.extend(discover_warnings)
         logger.info("Discovery skip counts: %s", skip_counts)
 
+        # Truncation status for this walk (#366). Persisted on every save path so a
+        # silently-capped index is loud in the index result, in resolve_repo, and
+        # in query _meta. Always a dict (self-heals when a raised cap clears it).
+        _cap_status = _file_cap_report(skip_counts, max_files)
+
         # Warn when no root .gitignore is present and the file count is large —
         # a common cause of bloated indexes that then overflow get_file_tree.
         # Project-overridable (#301): big monorepos vs small repos want different thresholds.
@@ -1900,7 +1944,7 @@ def index_folder(
                     store, owner, repo_name, folder_path,
                     existing_index.git_head if existing_index else None,
                 )
-                return {
+                _no_change_result = {
                     "success": True,
                     "message": "No changes detected",
                     "repo": f"{owner}/{repo_name}",
@@ -1908,6 +1952,10 @@ def index_folder(
                     "changed": 0, "new": 0, "deleted": 0,
                     "duration_seconds": round(time.monotonic() - t0, 2),
                 }
+                # This ran a full discovery walk, so a still-truncated index
+                # stays loud even when nothing changed (#366).
+                _attach_cap_report(_no_change_result, _cap_status)
+                return _no_change_result
 
             # Read changed + new files into memory
             files_to_parse = set(changed) | set(new)
@@ -2007,6 +2055,9 @@ def index_folder(
                     # Refresh the package registry so a manifest add/rename on
                     # the incremental path isn't stale until a full reindex (W7).
                     package_names=_extract_package_names(str(folder_path)),
+                    # This path did a full discovery walk, so refresh the cap
+                    # status (self-heals when a raised cap now clears it) (#366).
+                    file_cap_status=_cap_status,
                 )
 
             result = {
@@ -2027,6 +2078,7 @@ def index_folder(
                 result["branch_delta"] = True
             if warnings:
                 result["warnings"] = warnings
+            _attach_cap_report(result, _cap_status)
             _maybe_apply_adaptive(folder_path, result)
             return result
 
@@ -2247,6 +2299,7 @@ def index_folder(
                     display_name=folder_path.name, imports=file_imports,
                     context_metadata=full_context_metadata, file_mtimes=file_mtimes,
                     package_names=_pkg_names, git_root=_git_root,
+                    file_cap_status=_cap_status,
                 )
         else:
             # v1.96: when an existing v1.96-format index covers the same
@@ -2323,6 +2376,7 @@ def index_folder(
                 package_names=_save_pkg_names,
                 git_root=_git_root,
                 source_roots=_save_source_roots,
+                file_cap_status=_cap_status,
             )
 
         # Identify languages that were indexed (symbols found) but have no import extractor
@@ -2369,17 +2423,7 @@ def index_folder(
         if warnings:
             result["warnings"] = warnings
 
-        files_skipped_cap = skip_counts.get("file_limit", 0)
-        if files_skipped_cap > 0:
-            files_discovered = max_files + files_skipped_cap
-            result["files_discovered"] = files_discovered
-            result["files_indexed"] = max_files
-            result["files_skipped_cap"] = files_skipped_cap
-            cap_warning = (
-                f"File cap reached: {files_discovered} files discovered, {max_files} indexed, "
-                f"{files_skipped_cap} dropped. Raise JCODEMUNCH_MAX_FOLDER_FILES or narrow the path."
-            )
-            result.setdefault("warnings", []).append(cap_warning)
+        _attach_cap_report(result, _cap_status)
 
         _maybe_apply_adaptive(folder_path, result)
         return result

@@ -1160,6 +1160,7 @@ class SQLiteIndexStore:
             file_sizes=composed_sizes,
             package_names=getattr(base_index, "package_names", []),
             branch=branch,
+            file_cap_status=getattr(base_index, "file_cap_status", {}) or {},
         )
 
     def _symbol_to_dict_for_delta(self, symbol: "Symbol") -> dict:
@@ -1206,6 +1207,7 @@ class SQLiteIndexStore:
         package_names: Optional[list[str]] = None,
         git_root: str = "",
         source_roots: Optional[list[str]] = None,
+        file_cap_status: Optional[dict] = None,
     ) -> "CodeIndex":
         """Save a full index to SQLite. Replaces all existing data.
 
@@ -1270,6 +1272,7 @@ class SQLiteIndexStore:
             file_mtimes=file_mtimes or {},
             file_sizes=file_sizes,
             package_names=package_names or [],
+            file_cap_status=file_cap_status or {},
         )
 
         db_path = self._db_path(owner, name)
@@ -1597,6 +1600,7 @@ class SQLiteIndexStore:
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
         package_names: Optional[list[str]] = None,
+        file_cap_status: Optional[dict] = None,
     ) -> Optional["CodeIndex"]:
         """Incrementally update an existing index (delta write).
 
@@ -1627,7 +1631,7 @@ class SQLiteIndexStore:
                 owner, name, changed_files, new_files, deleted_files,
                 new_symbols, raw_files, languages, git_head, file_summaries,
                 file_languages, imports, context_metadata, file_blob_shas,
-                file_hashes, file_mtimes, package_names,
+                file_hashes, file_mtimes, package_names, file_cap_status,
             )
 
     def _incremental_save_locked(
@@ -1649,6 +1653,7 @@ class SQLiteIndexStore:
         file_hashes: Optional[dict[str, str]] = None,
         file_mtimes: Optional[dict[str, int]] = None,
         package_names: Optional[list[str]] = None,
+        file_cap_status: Optional[dict] = None,
     ) -> Optional["CodeIndex"]:
         """Inner body of incremental_save; runs under the indexwrite lock."""
         db_path = self._db_path(owner, name)
@@ -1750,6 +1755,14 @@ class SQLiteIndexStore:
                 conn.execute(
                     "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
                     ("package_names", json.dumps(package_names)),
+                )
+            # Refresh the file-cap truncation status so a re-index that newly
+            # hits (or newly clears) the max_folder_files cap is reflected in
+            # queries. None = caller didn't recompute → preserve existing (#366).
+            if file_cap_status is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("file_cap_status", json.dumps(file_cap_status)),
                 )
 
             # Recompute languages from files table
@@ -2001,6 +2014,30 @@ class SQLiteIndexStore:
         except Exception:
             logger.debug("Failed to get source_root for %s/%s", owner, name, exc_info=True)
             return None
+
+    def get_file_cap_status(self, owner: str, name: str) -> dict:
+        """Fast metadata-only read of the max_folder_files truncation status (#366).
+
+        Returns ``{}`` when unknown (repo not indexed, or indexed before
+        v1.108.126 which didn't record it). A recorded status is
+        ``{"truncated": False}`` or the full ``{truncated, files_discovered,
+        files_indexed, files_skipped_cap, max_folder_files}`` block.
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return {}
+        try:
+            conn = self._connect(db_path)
+            try:
+                meta = self._read_meta(conn)
+            finally:
+                conn.close()
+            return json.loads(meta.get("file_cap_status", "{}")) or {}
+        except Exception:
+            logger.debug("Failed to get file_cap_status for %s/%s", owner, name, exc_info=True)
+            return {}
 
     def list_repos(self) -> list[dict]:
         """List all indexed repositories (scans .db files only)."""
@@ -2512,6 +2549,14 @@ class SQLiteIndexStore:
 
         new_ctx = context_metadata if context_metadata is not None else old.context_metadata
 
+        if "file_cap_status" in meta:
+            try:
+                new_file_cap_status = json.loads(meta.get("file_cap_status", "{}")) or {}
+            except (json.JSONDecodeError, ValueError):
+                new_file_cap_status = getattr(old, "file_cap_status", {})
+        else:
+            new_file_cap_status = getattr(old, "file_cap_status", {})
+
         return CodeIndex(
             repo=old.repo,
             owner=old.owner,
@@ -2535,6 +2580,7 @@ class SQLiteIndexStore:
             file_mtimes=new_file_mtimes,
             file_sizes=new_file_sizes,
             package_names=getattr(old, "package_names", []),
+            file_cap_status=new_file_cap_status,
         )
 
     def _build_index_from_rows(
@@ -2599,6 +2645,10 @@ class SQLiteIndexStore:
             package_names = json.loads(package_names_raw) if package_names_raw else []
         except Exception:
             package_names = []
+        try:
+            file_cap_status = json.loads(meta.get("file_cap_status", "{}")) or {}
+        except (json.JSONDecodeError, ValueError):
+            file_cap_status = {}
 
         return CodeIndex(
             repo=meta.get("repo", f"{owner}/{name}"),
@@ -2623,6 +2673,7 @@ class SQLiteIndexStore:
             file_mtimes=file_mtimes,
             file_sizes=file_sizes,
             package_names=package_names,
+            file_cap_status=file_cap_status,
         )
 
     def _write_meta(self, conn: sqlite3.Connection, index: "CodeIndex") -> None:
@@ -2643,6 +2694,7 @@ class SQLiteIndexStore:
             "context_metadata": json.dumps(index.context_metadata or {}),
             "package_names": json.dumps(getattr(index, "package_names", []) or []),
             "base_branch": getattr(index, "branch", "") or "",
+            "file_cap_status": json.dumps(getattr(index, "file_cap_status", {}) or {}),
         }
         conn.executemany(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",

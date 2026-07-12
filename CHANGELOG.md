@@ -2,6 +2,42 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.126] - 2026-07-12 - Loud, persisted max_folder_files truncation
+
+When the `max_folder_files` walk cap (default 2000) dropped files, the index
+looked healthy while whole subdirectories were silently missing from
+`search_text` / `search_symbols`. Nothing in the index result or query
+responses indicated truncation. Nasty for monorepos, whose file counts often
+exceed the cap.
+
+### Fixed
+
+- Truncation is now surfaced on **every** index path, not just the fresh
+  full-index one. The re-index (incremental) path and the "No changes detected"
+  path now report it too.
+- Truncation status is **persisted** in the index (a `file_cap_status` meta key,
+  no `INDEX_VERSION` bump) and **self-heals**: re-indexing under a raised cap
+  clears it.
+- **`resolve_repo`** (the session-start indexed check) now reports `truncated`
+  plus the discovered/indexed counts and a `truncation_warning` when a repo's
+  index was capped — up front, before an agent queries a quietly-incomplete
+  index.
+- **`search_text`** and **`search_symbols`** attach `_meta.index_truncated`
+  (with a note that a missing or thin result may be truncation, not absence)
+  when the queried index was capped.
+- The index result gains a `truncated: true` flag alongside the existing
+  `files_discovered` / `files_indexed` / `files_skipped_cap`, with an actionable
+  warning naming `max_folder_files`. (#366, reported by @oderwat.)
+
+### Notes
+
+- The default `max_folder_files` (2000) is unchanged — raising it silently would
+  trade one surprise for another. It's a one-line config bump
+  (`config.jsonc` or `JCODEMUNCH_MAX_FOLDER_FILES`) once you know you need it,
+  and truncation is now loud enough to tell you.
+- New `tests/test_v1_108_126.py` (8): report helpers, index-result/resolve/search
+  surfacing, and the re-index self-heal.
+
 ## [1.108.125] - 2026-07-12 - Native `.mjs` / `.cjs` indexing
 
 `.mjs` (ES module) and `.cjs` (CommonJS) files resolved to no language and were

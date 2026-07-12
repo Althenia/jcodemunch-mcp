@@ -167,6 +167,27 @@ def _build_indexed_response(
     for key, value in metadata.items():
         if value is not None and value != "":
             result[key] = value
+
+    # Surface a max_folder_files truncation up front (#366): a silently capped
+    # index looks healthy while quietly missing files. Cheap metadata-only read.
+    if hasattr(store, "_sqlite"):
+        try:
+            cap = store._sqlite.get_file_cap_status(owner, name)
+        except Exception:
+            cap = {}
+        if cap.get("truncated"):
+            result["truncated"] = True
+            result["files_discovered"] = cap.get("files_discovered")
+            result["files_indexed"] = cap.get("files_indexed")
+            result["files_skipped_cap"] = cap.get("files_skipped_cap")
+            result["truncation_warning"] = (
+                f"Index truncated by the file cap: {cap.get('files_discovered')} files "
+                f"discovered, {cap.get('files_indexed')} indexed, "
+                f"{cap.get('files_skipped_cap')} dropped (max_folder_files="
+                f"{cap.get('max_folder_files')}). Entire files are missing from search "
+                f"results. Raise max_folder_files in config.jsonc (or set "
+                f"JCODEMUNCH_MAX_FOLDER_FILES) and re-index."
+            )
     return result
 
 

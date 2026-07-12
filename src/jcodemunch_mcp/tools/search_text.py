@@ -190,6 +190,7 @@ def search_text(
     total_saved = record_savings(tokens_saved, tool_name="search_text")
 
     from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_truncation_meta as _index_truncation_meta
     _vres = _build_verdict(
         result_count=result_count,
         scanned_files=files_searched,
@@ -197,17 +198,21 @@ def search_text(
         source_files=index.source_files,
         timed_out=timed_out,
     )
+    _meta = {
+        "timing_ms": round(elapsed, 1),
+        "files_searched": files_searched,
+        "truncated": truncated,
+        "timed_out": timed_out,
+        "tokens_saved": tokens_saved,
+        "total_tokens_saved": total_saved,
+        "verdict": _vres["verdict"],
+        **cost_avoided(tokens_saved, total_saved),
+    }
+    _cap = getattr(index, "file_cap_status", None)
+    if _cap and _cap.get("truncated"):
+        _meta["index_truncated"] = _index_truncation_meta(_cap)
     return {
         "result_count": result_count,
         "results": results,
-        "_meta": {
-            "timing_ms": round(elapsed, 1),
-            "files_searched": files_searched,
-            "truncated": truncated,
-            "timed_out": timed_out,
-            "tokens_saved": tokens_saved,
-            "total_tokens_saved": total_saved,
-            "verdict": _vres["verdict"],
-            **cost_avoided(tokens_saved, total_saved),
-        },
+        "_meta": _meta,
     }
