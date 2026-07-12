@@ -2,6 +2,32 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.124] - 2026-07-12 - Tool-use examples on the Counter's menu/route surface
+
+The Counter (`order`/`menu`/`route`) discovers catalog actions without keeping
+every tool schema resident. JSON Schema states an action's parameters but not a
+concrete call, which is where wrong-argument mistakes come from. This adds a
+curated example invocation to the highest-traffic actions, surfaced only when an
+agent discovers them, so the example costs nothing until it's needed.
+
+### Added
+
+- **Curated example invocations for the highest-traffic catalog actions**
+  (`counter.EXAMPLES`). `menu` rows now carry an `example` (the arg object you'd
+  hand to `order(action, args)`) for actions that have one, and `route` uses the
+  curated example as its `args_template` when it can't auto-shape args from the
+  task (instead of a bare "see menu for args" hint). Examples appear only on the
+  on-demand discovery surface, so resident tool schemas — and `core_compact` —
+  are unchanged.
+- Examples are correctness-gated: `tests/test_counter.py` validates every
+  example's keys against the LIVE `inputSchema` of its action (unknown args and
+  unmet required args both fail), so a renamed or wrong parameter can't ship.
+
+### Notes
+
+- No new tool, no schema/tool-count change, no INDEX_VERSION bump. New
+  `counter.example_for()` helper; +6 tests in `tests/test_counter.py`.
+
 ## [1.108.123] - 2026-07-11 - Licensing hardening sweep (no strike three)
 
 Full audit of the licensing surface after two field reports on a paid account,

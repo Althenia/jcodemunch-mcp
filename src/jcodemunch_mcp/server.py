@@ -4396,7 +4396,11 @@ async def _handle_route(arguments: dict) -> list[TextContent] | CallToolResult:
             recs.append({"action": r["action"], "why": r["summary"]})
     for r in recs:
         tmpl = _counter.shape_execute_args(r["action"], repo, task)
-        r["args_template"] = tmpl if tmpl is not None else {"repo": repo or "<repo>", "_hint": "see menu for args"}
+        if tmpl is None:
+            # No auto-shaped args; prefer a curated example over a bare hint.
+            ex = _counter.example_for(r["action"])
+            tmpl = ex if ex is not None else {"repo": repo or "<repo>", "_hint": "see menu for args"}
+        r["args_template"] = tmpl
         r["state_changing"] = _counter.is_state_changing(r["action"])
     payload = {"tool": "route", "task": task, "recommended": recs}
     if not recs:
