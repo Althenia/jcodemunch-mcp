@@ -2,6 +2,25 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.127] - 2026-07-13 - Fix index_repo full re-index crash (#367)
+
+A non-incremental (full) `index_repo` re-index crashed with
+`{"success": false, "error": "Indexing failed: 'dict' object has no attribute 'summary'"}`.
+The local-folder path (`index_folder`) succeeded on the same repo, isolating the
+bug to `index_repo`.
+
+### Fixed
+
+- The full re-index path's summary-preservation map read the existing index's
+  symbols by attribute (`s.summary` / `s.file` / `s.name` / `s.kind`), but loaded
+  indexes carry symbols as **dicts** (`SQLiteIndexStore._build_index_from_rows`
+  builds them via `_row_to_symbol_dict`). Any unchanged file with a stored AI
+  summary triggered the `AttributeError`. `index_repo` now uses key access,
+  matching `index_folder` (which was already correct — the reason it never
+  crashed). Pure read path; no `INDEX_VERSION` bump. New
+  `tests/test_v1_108_127.py` (2: no-AttributeError full re-index over a
+  pre-seeded index + the loaded-symbols-are-dicts contract guard).
+
 ## [1.108.126] - 2026-07-12 - Loud, persisted max_folder_files truncation
 
 When the `max_folder_files` walk cap (default 2000) dropped files, the index

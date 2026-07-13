@@ -534,9 +534,9 @@ async def index_repo(
             }
             if _unchanged_files:
                 _existing_summaries = {
-                    (s.file, s.name, s.kind): s.summary
+                    (s["file"], s["name"], s["kind"]): s["summary"]
                     for s in existing_index.symbols
-                    if s.summary and s.file in _unchanged_files
+                    if s.get("summary") and s.get("file") in _unchanged_files
                 }
                 logger.info(
                     "index_repo full — %d/%d files unchanged, %d summaries preserved",
