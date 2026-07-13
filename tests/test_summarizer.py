@@ -229,6 +229,7 @@ def test_get_provider_name_unknown_falls_back_to_auto(monkeypatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("JCODEMUNCH_SUMMARIZER_PROVIDER", "unknown-provider")
     monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     assert get_provider_name() == "minimax"
 
 
@@ -260,6 +261,7 @@ def test_get_provider_name_auto_detect_minimax(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     assert get_provider_name() == "minimax"
 
 
@@ -274,6 +276,7 @@ def test_get_provider_name_auto_detect_glm(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("ZHIPUAI_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     assert get_provider_name() == "glm"
 
 
@@ -289,6 +292,7 @@ def test_get_provider_name_auto_detect_openrouter(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     assert get_provider_name() == "openrouter"
 
 
@@ -1162,6 +1166,7 @@ def test_create_summarizer_auto_mode_detects_provider(monkeypatch):
     for key in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_BASE", "MINIMAX_API_KEY", "ZHIPUAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("ZHIPUAI_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     from jcodemunch_mcp import config as _cfg_module
     _sentinel = object()
     _orig = _cfg_module._GLOBAL_CONFIG.get("allow_remote_summarizer", _sentinel)
@@ -1193,6 +1198,7 @@ def test_create_summarizer_model_override_applied_to_glm(monkeypatch):
     for key in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_BASE", "MINIMAX_API_KEY", "ZHIPUAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("ZHIPUAI_API_KEY", "test-key")
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
     from jcodemunch_mcp import config as _cfg_module
     _sentinel = object()
     _orig = _cfg_module._GLOBAL_CONFIG.get("allow_remote_summarizer", _sentinel)
@@ -1327,6 +1333,7 @@ def test_minimax_model_override_via_config(monkeypatch):
     monkeypatch.setenv("MINIMAX_API_KEY", "mm-test-key")
     for key in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OPENAI_API_BASE", "ZHIPUAI_API_KEY", "OPENROUTER_API_KEY"):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "1")  # paid auto-detect is opt-in (v1.108.128)
 
     from jcodemunch_mcp import config as _cfg_module
 

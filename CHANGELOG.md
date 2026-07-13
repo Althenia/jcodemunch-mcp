@@ -2,6 +2,32 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.128] - 2026-07-13 - Never auto-bill a paid cloud provider from a bare env key
+
+A bare cloud API key in the environment (e.g. `ANTHROPIC_API_KEY`) silently
+enabled AI summarization, billing the account on **every** index — one call per
+symbol. With `use_ai_summaries` at its default (`"auto"`), `get_provider_name`
+walked the auto-detect order and selected the first provider whose key was
+present, no prompt, no opt-in. A stray key in a shell/global environment (common
+when an editor also runs on OAuth) quietly spent real money.
+
+### Fixed
+
+- **Auto-detect no longer selects a PAID cloud provider from a bare env key.**
+  `anthropic` / `gemini` / `minimax` / `glm` / `openrouter` — and remote OpenAI
+  (`OPENAI_API_BASE` pointing off-localhost) — are now suppressed in auto mode
+  unless the user explicitly opts in. Free/local endpoints (a localhost
+  `OPENAI_API_BASE`) still auto-enable. Indexing continues with
+  signature/docstring summaries and logs a one-time warning naming the exact
+  setting to enable.
+- **Opt-in is explicit**: name the provider (`summarizer_provider=<name>` /
+  `JCODEMUNCH_SUMMARIZER_PROVIDER`) — that already bypasses auto-detect and is
+  unchanged — or set the new `JCODEMUNCH_ALLOW_PAID_SUMMARIES=1` /
+  `allow_paid_summaries` config key to restore legacy auto-select.
+- New `allow_paid_summaries` config key (DEFAULTS/CONFIG_TYPES/template/env
+  mapping). No `INDEX_VERSION` bump. New `tests/test_v1_108_128.py` (9);
+  7 existing auto-detect tests updated to set the opt-in flag.
+
 ## [1.108.127] - 2026-07-13 - Fix index_repo full re-index crash (#367)
 
 A non-incremental (full) `index_repo` re-index crashed with

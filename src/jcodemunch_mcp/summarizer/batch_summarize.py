@@ -25,6 +25,44 @@ _AUTO_DETECT_ORDER = [
 ]
 _VALID_PROVIDERS = {"anthropic", "gemini", "openai", "minimax", "glm", "openrouter", "none"}
 
+# Providers that bill a remote cloud account per call. A bare env key for any of
+# these must NEVER auto-enable summarization — that silently spends real money
+# during indexing (a stray ANTHROPIC_API_KEY in the environment was doing exactly
+# this). Paid-cloud auto-selection requires explicit opt-in; see
+# _paid_summaries_allowed. "openai" is handled separately because OPENAI_API_BASE
+# may point at a free local endpoint (Ollama / LM Studio).
+_PAID_CLOUD_PROVIDERS = frozenset({"anthropic", "gemini", "minimax", "glm", "openrouter"})
+_WARNED_SUPPRESSED_PAID: set[str] = set()
+
+
+def _paid_summaries_allowed(repo: Optional[str] = None) -> bool:
+    """Whether the user has explicitly opted in to paid-cloud auto-summaries.
+
+    Off by default: an ambient cloud API key never bills on its own. Turn on with
+    JCODEMUNCH_ALLOW_PAID_SUMMARIES=1 or the `allow_paid_summaries` config key.
+    Naming a provider explicitly (`summarizer_provider`) is always honored and does
+    not need this flag — that IS the opt-in.
+    """
+    env = os.environ.get("JCODEMUNCH_ALLOW_PAID_SUMMARIES", "").strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return bool(_config.get("allow_paid_summaries", False, repo=repo))
+    except Exception:
+        return False
+
+
+def _auto_entry_is_paid_cloud(env_var: str, name: str) -> bool:
+    """True if auto-selecting this provider from a bare env key would bill a
+    remote cloud account. 'openai' bills only when OPENAI_API_BASE is a
+    non-localhost endpoint (default https://api.openai.com/v1 is remote)."""
+    if name in _PAID_CLOUD_PROVIDERS:
+        return True
+    if name == "openai":
+        base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+        return not _is_localhost_url(base)
+    return False
+
 # When a summarization run finishes and at least this fraction of graded
 # symbols fell back to generic signatures DESPITE successful responses,
 # emit a degradation warning (#323 — thinking models burning the output
@@ -802,9 +840,27 @@ def get_provider_name(repo: Optional[str] = None) -> Optional[str]:
     if explicit in _VALID_PROVIDERS:
         return None if explicit == "none" else explicit
 
+    # Auto-detect by env key — but NEVER auto-bill a paid cloud provider from a
+    # bare key. A stray ANTHROPIC_API_KEY / GOOGLE_API_KEY / etc. in the
+    # environment must not silently spend during indexing. Paid-cloud
+    # auto-selection requires explicit opt-in; naming the provider bypasses this
+    # (handled above). Free/local endpoints still auto-enable.
+    allow_paid = _paid_summaries_allowed(repo)
     for env_var, name in _AUTO_DETECT_ORDER:
-        if os.environ.get(env_var):
-            return name
+        if not os.environ.get(env_var):
+            continue
+        if not allow_paid and _auto_entry_is_paid_cloud(env_var, name):
+            if name not in _WARNED_SUPPRESSED_PAID:
+                _WARNED_SUPPRESSED_PAID.add(name)
+                logger.warning(
+                    "%s is set but paid-cloud AI summaries are opt-in — NOT billing "
+                    "%s automatically. To enable, set summarizer_provider=%s (or "
+                    "JCODEMUNCH_ALLOW_PAID_SUMMARIES=1). Indexing continues with "
+                    "signature/docstring summaries.",
+                    env_var, name, name,
+                )
+            continue
+        return name
     return None
 
 
