@@ -2,6 +2,305 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.128] - 2026-07-13 - Never auto-bill a paid cloud provider from a bare env key
+
+A bare cloud API key in the environment (e.g. `ANTHROPIC_API_KEY`) silently
+enabled AI summarization, billing the account on **every** index — one call per
+symbol. With `use_ai_summaries` at its default (`"auto"`), `get_provider_name`
+walked the auto-detect order and selected the first provider whose key was
+present, no prompt, no opt-in. A stray key in a shell/global environment (common
+when an editor also runs on OAuth) quietly spent real money.
+
+### Fixed
+
+- **Auto-detect no longer selects a PAID cloud provider from a bare env key.**
+  `anthropic` / `gemini` / `minimax` / `glm` / `openrouter` — and remote OpenAI
+  (`OPENAI_API_BASE` pointing off-localhost) — are now suppressed in auto mode
+  unless the user explicitly opts in. Free/local endpoints (a localhost
+  `OPENAI_API_BASE`) still auto-enable. Indexing continues with
+  signature/docstring summaries and logs a one-time warning naming the exact
+  setting to enable.
+- **Opt-in is explicit**: name the provider (`summarizer_provider=<name>` /
+  `JCODEMUNCH_SUMMARIZER_PROVIDER`) — that already bypasses auto-detect and is
+  unchanged — or set the new `JCODEMUNCH_ALLOW_PAID_SUMMARIES=1` /
+  `allow_paid_summaries` config key to restore legacy auto-select.
+- New `allow_paid_summaries` config key (DEFAULTS/CONFIG_TYPES/template/env
+  mapping). No `INDEX_VERSION` bump. New `tests/test_v1_108_128.py` (9);
+  7 existing auto-detect tests updated to set the opt-in flag.
+
+## [1.108.127] - 2026-07-13 - Fix index_repo full re-index crash (#367)
+
+A non-incremental (full) `index_repo` re-index crashed with
+`{"success": false, "error": "Indexing failed: 'dict' object has no attribute 'summary'"}`.
+The local-folder path (`index_folder`) succeeded on the same repo, isolating the
+bug to `index_repo`.
+
+### Fixed
+
+- The full re-index path's summary-preservation map read the existing index's
+  symbols by attribute (`s.summary` / `s.file` / `s.name` / `s.kind`), but loaded
+  indexes carry symbols as **dicts** (`SQLiteIndexStore._build_index_from_rows`
+  builds them via `_row_to_symbol_dict`). Any unchanged file with a stored AI
+  summary triggered the `AttributeError`. `index_repo` now uses key access,
+  matching `index_folder` (which was already correct — the reason it never
+  crashed). Pure read path; no `INDEX_VERSION` bump. New
+  `tests/test_v1_108_127.py` (2: no-AttributeError full re-index over a
+  pre-seeded index + the loaded-symbols-are-dicts contract guard).
+
+## [1.108.126] - 2026-07-12 - Loud, persisted max_folder_files truncation
+
+When the `max_folder_files` walk cap (default 2000) dropped files, the index
+looked healthy while whole subdirectories were silently missing from
+`search_text` / `search_symbols`. Nothing in the index result or query
+responses indicated truncation. Nasty for monorepos, whose file counts often
+exceed the cap.
+
+### Fixed
+
+- Truncation is now surfaced on **every** index path, not just the fresh
+  full-index one. The re-index (incremental) path and the "No changes detected"
+  path now report it too.
+- Truncation status is **persisted** in the index (a `file_cap_status` meta key,
+  no `INDEX_VERSION` bump) and **self-heals**: re-indexing under a raised cap
+  clears it.
+- **`resolve_repo`** (the session-start indexed check) now reports `truncated`
+  plus the discovered/indexed counts and a `truncation_warning` when a repo's
+  index was capped — up front, before an agent queries a quietly-incomplete
+  index.
+- **`search_text`** and **`search_symbols`** attach `_meta.index_truncated`
+  (with a note that a missing or thin result may be truncation, not absence)
+  when the queried index was capped.
+- The index result gains a `truncated: true` flag alongside the existing
+  `files_discovered` / `files_indexed` / `files_skipped_cap`, with an actionable
+  warning naming `max_folder_files`. (#366, reported by @oderwat.)
+
+### Notes
+
+- The default `max_folder_files` (2000) is unchanged — raising it silently would
+  trade one surprise for another. It's a one-line config bump
+  (`config.jsonc` or `JCODEMUNCH_MAX_FOLDER_FILES`) once you know you need it,
+  and truncation is now loud enough to tell you.
+- New `tests/test_v1_108_126.py` (8): report helpers, index-result/resolve/search
+  surfacing, and the re-index self-heal.
+
+## [1.108.125] - 2026-07-12 - Native `.mjs` / `.cjs` indexing
+
+`.mjs` (ES module) and `.cjs` (CommonJS) files resolved to no language and were
+dropped at discovery as `wrong_extension`, so agents fell back to raw scans to
+read them. Every downstream layer already recognised the extensions (import
+graph, dead-code, PreToolUse hooks); the only gap was the core
+extension-to-language map.
+
+### Fixed
+
+- `.mjs` and `.cjs` now index as JavaScript. Added both to `LANGUAGE_EXTENSIONS`
+  (`parser/languages.py`) and to the fallback extension map in
+  `storage/sqlite_store.py`. Previously-skipped files gain symbols on a re-index;
+  purely additive, no `INDEX_VERSION` bump. (#365, reported by @oderwat.)
+
+### Changed
+
+- `LANGUAGE_SUPPORT.md`: JavaScript row lists `.mjs`/`.cjs`; the
+  `JCODEMUNCH_EXTRA_EXTENSIONS` example no longer uses `.mjs` (now native).
+
+### Tests
+
+- New `tests/test_v1_108_125.py` (3): registration, path resolution, and symbol
+  extraction from `.mjs`/`.cjs` bodies.
+
+## [1.108.124] - 2026-07-12 - Tool-use examples on the Counter's menu/route surface
+
+The Counter (`order`/`menu`/`route`) discovers catalog actions without keeping
+every tool schema resident. JSON Schema states an action's parameters but not a
+concrete call, which is where wrong-argument mistakes come from. This adds a
+curated example invocation to the highest-traffic actions, surfaced only when an
+agent discovers them, so the example costs nothing until it's needed.
+
+### Added
+
+- **Curated example invocations for the highest-traffic catalog actions**
+  (`counter.EXAMPLES`). `menu` rows now carry an `example` (the arg object you'd
+  hand to `order(action, args)`) for actions that have one, and `route` uses the
+  curated example as its `args_template` when it can't auto-shape args from the
+  task (instead of a bare "see menu for args" hint). Examples appear only on the
+  on-demand discovery surface, so resident tool schemas — and `core_compact` —
+  are unchanged.
+- Examples are correctness-gated: `tests/test_counter.py` validates every
+  example's keys against the LIVE `inputSchema` of its action (unknown args and
+  unmet required args both fail), so a renamed or wrong parameter can't ship.
+
+### Notes
+
+- No new tool, no schema/tool-count change, no INDEX_VERSION bump. New
+  `counter.example_for()` helper; +6 tests in `tests/test_counter.py`.
+
+## [1.108.123] - 2026-07-11 - Licensing hardening sweep (no strike three)
+
+Full audit of the licensing surface after two field reports on a paid account,
+to guarantee no remaining path calls a valid license invalid or ignores a
+config-file key.
+
+### Fixed
+
+- **`org-rollup` CLI ignored a config-file `license_key`** — the same
+  missing-`load_config()` trap fixed for the `license` command in 1.108.121.
+  A Studio/Platform team license set in `config.jsonc` (not the env var) was
+  invisible, so org-rollup wrongly reported "unavailable". Now loads config
+  before the gate check.
+- **`install-pack` ignored the env/config `license_key`** — it honored only an
+  explicit `--license`, so a customer whose entitlement is premium starter packs
+  (e.g. the Builder tier) couldn't download them with a persisted key. New
+  `resolve_effective_license_key()` resolves `--license` → `JCODEMUNCH_LICENSE_KEY`
+  → config `license_key`.
+- **A valid key that couldn't be verified (license server unreachable) no longer
+  reads as "key not recognized".** `check_gate()` gains `key_status`
+  (`valid` / `absent` / `rejected` / `unverified_offline`); the `license` CLI
+  distinguishes an unreachable server ("key present, not yet verified") from a
+  server rejection. Sticky-offline still keeps a previously-confirmed key valid.
+
+### Changed
+
+- The `license` CLI output is now generated by a pure, unit-tested
+  `format_license_status()` (in `org/license.py`) covering every key_status/mode
+  combination without the network. A valid non-team tier (Builder) shows
+  `org-rollup: optional team add-on` with no trial countdown — licensed, not
+  deficient — and the free-features line is accurate (core indexing/search are
+  free; premium packs and org-rollup are the licensed features).
+
+### Verified
+
+- `check_gate()` is the *only* licensing gate and is invoked solely from the two
+  CLI handlers — the MCP server gates no tool on license, so all indexing/search
+  works regardless of license state.
+- Backend contract re-checked against `validate.php`: returns
+  `{valid, tier}` (tier lowercased server-side) for `product=jcodemunch`.
+
+## [1.108.122] - 2026-07-11 - License CLI stops calling a valid license "unlicensed"
+
+### Fixed
+
+- **`jcodemunch-mcp license` no longer reports a valid Builder license as
+  "evaluation (unlicensed)"** (#364 follow-up, @domis86). The command's mode
+  (`licensed`/`grace`/`blocked`) describes *org-rollup* entitlement — the one
+  license-gated feature — but the CLI presented it as overall license status.
+  A holder of a valid single-seat Builder license (which doesn't include
+  org-rollup) saw "License: evaluation (unlicensed)" and "Trial: 14 day(s) left",
+  as if their key wasn't recognized at all. The output now separates the two
+  facts: whether the key is valid (`License: licensed (builder)`) and whether
+  org-rollup is included (`org-rollup: not in your tier — N day(s) evaluation
+  left`), plus a note that all other features are free.
+- `check_gate()` gains two additive fields — `key_valid` (is the key itself
+  valid, independent of org-rollup entitlement) and `feature` (`"org-rollup"`) —
+  so the CLI and other consumers (e.g. jMunch Console) can distinguish a valid
+  license from feature entitlement. Existing fields unchanged.
+
+### Changed
+
+- Two tool descriptions gained explicit "reach for this when…" trigger clauses
+  (`get_delivery_metrics`, `get_parity_map`) for better model tool-selection.
+  Both are standard-tier; `core_compact` schema budget unchanged.
+
+## [1.108.121] - 2026-07-11 - License CLI reads the config-file `license_key`
+
+### Fixed
+
+- **`jcodemunch-mcp license` now recognizes a `license_key` set in
+  `~/.code-index/config.jsonc`** (#364, reported by @domis86). The `license`
+  subcommand returned before the shared `load_config()` call that runs later in
+  `main()`, so `_GLOBAL_CONFIG` still held module defaults when `check_gate()`
+  read the key — a persisted `license_key` was invisible and the command
+  reported "unlicensed evaluation (no license key)" despite a valid key on disk.
+  Only the `JCODEMUNCH_LICENSE_KEY` env var and the `--key` flag (which set the
+  env var directly) worked. Fix: `load_config()` is called at the top of the
+  `license` handler so the config-file key is loaded before the gate check. No
+  INDEX_VERSION bump; no behavior change for env/`--key` users.
+
+## [1.108.120] - 2026-07-11 - Compile-time evidence in the safety preflights
+
+### Added
+
+- **`check_delete_safe` and `check_edit_safe` now treat compiler-verified
+  references (SCIP) as blockers.** When a repo has ingested SCIP data
+  (`jcodemunch-mcp import-scip`), a file the compiler proved references the
+  target — but the import graph and text search both missed (dynamic dispatch,
+  barrel re-exports) — is real evidence of use:
+  - `check_delete_safe` gains a `scip_referenced` verdict tier (confidence 0.10)
+    that flips an otherwise `safe_to_delete` result to blocked, with
+    `scip_reference` blockers (`verification: "compiler_verified"`, severity 5)
+    and `signals.scip_external_ref_count`. Compiler-verified *test-file*
+    references downgrade to `test_coverage_only`, mirroring the existing
+    test-only handling.
+  - `check_edit_safe` folds compiler-verified external references into its
+    `signature_impact` signal, so a symbol whose only caller is dynamically
+    dispatched still reports the contract must be preserved.
+- Both attach a `_meta.scip` block with the verified counts and a staleness flag.
+
+### Notes
+
+- Honest no-op without ingested SCIP (including pre-v17 databases). Read-only; no
+  new tool, no schema/tool-count change, no `INDEX_VERSION` bump.
+- New shared reader `scip_reference_files` in `tools/_scip_consume.py`. New
+  `tests/test_v1_108_120.py` (7, including integration tests that prove the
+  safe→blocked flip after injecting a compiler-verified reference the heuristic
+  channels can't see). Final P2 graph-consumer increment (completes the set with
+  1.108.118 and 1.108.119).
+
+## [1.108.119] - 2026-07-11 - Compile-time evidence in find_implementations
+
+### Added
+
+- **`find_implementations` gains a SCIP channel (confidence 1.0)** — when a repo
+  has ingested SCIP data (`jcodemunch-mcp import-scip`), compiler-verified
+  `A implements B` relationships surface the concrete implementations the AST and
+  duck-typed channels can't see (e.g. an interface with no declared
+  subclassing). Each such implementation is emitted with
+  `relationship: "interface_impl"`, `source: "scip"`, `confidence: 1.0`, and
+  `verification: "compiler_verified"`; it wins the cross-channel dedup over
+  lower-confidence heuristics. A `_meta.scip` block reports the count and a
+  staleness flag.
+
+### Notes
+
+- Honest no-op when no SCIP data is ingested (including pre-v17 databases).
+  Read-only; no new tool, no schema/tool-count change, no `INDEX_VERSION` bump.
+- New reader `_scip_implementation_ids` (uses the shared
+  `tools/_scip_consume.py`). New `tests/test_v1_108_119.py` (6, including an
+  integration test proving the channel surfaces an implementation the AST
+  misses). Second of the three P2 graph-consumer increments (after
+  blast_radius/call_hierarchy in 1.108.118).
+
+## [1.108.118] - 2026-07-11 - Compile-time evidence in the graph tools
+
+### Added
+
+- **`get_blast_radius` and `get_call_hierarchy` now union compiler-verified
+  reference edges** from ingested SCIP data (`jcodemunch-mcp import-scip`), the
+  same evidence channel `find_references` already consumes. When a repo has
+  ingested a `.scip` index:
+  - `get_blast_radius` tags affected files the compiler also proved with
+    `verification: "compiler_verified"`, and **appends files the import graph
+    missed** (dynamic dispatch, barrel re-exports) to `confirmed` as
+    `source: "scip"` rows. `importer_count` is left untouched — SCIP-only files
+    are by definition the ones the import graph didn't see; the additions show
+    up in `confirmed_count` and `_meta.scip`.
+  - `get_call_hierarchy` surfaces callers the AST call graph can't see as
+    depth-1 entries with `resolution: "scip_reference"` +
+    `verification: "compiler_verified"`, and marks an existing AST caller the
+    compiler also proved as `compiler_verified`. Only the callers direction is
+    touched.
+- Both carry a `_meta.scip` summary (verified/scip-only counts, ingesting tool,
+  ingested-at, and a **staleness flag** when SCIP was ingested at a different
+  index HEAD).
+
+### Notes
+
+- Byte-identical no-op when no `.scip` has been ingested (including pre-v17
+  databases) and idempotent across the result cache. Read-only; no new tool, no
+  schema/tool-count change, no `INDEX_VERSION` bump.
+- New shared reader `tools/_scip_consume.py` (`open_scip_reader` /
+  `scip_meta_and_stale` / `scip_meta_block`) so each graph consumer writes only
+  its own union logic. New `tests/test_v1_108_118.py` (12).
+
 ## [1.108.117] - 2026-07-10 - `_meta.verdict` on the file & symbol read tools
 
 ### Added

@@ -183,3 +183,62 @@ def test_state_changing_set_is_subset_of_catalog():
     catalog = server._catalog_names()
     missing = counter.STATE_CHANGING_ACTIONS - catalog
     assert missing == set(), f"state-changing names not in catalog (drift): {missing}"
+
+
+# --- Tool-use examples: validated against the LIVE inputSchema ------------- #
+
+def _catalog_schemas():
+    """{action_name: inputSchema} for every real (non-front-door) tool."""
+    return {
+        t.name: (t.inputSchema or {})
+        for t in server._raw_catalog_tools()
+        if t.name not in counter.FRONT_DOOR
+    }
+
+
+def test_examples_actions_exist_in_catalog():
+    names = set(_catalog_schemas())
+    unknown = set(counter.EXAMPLES) - names
+    assert unknown == set(), f"EXAMPLES references non-catalog actions: {unknown}"
+
+
+def test_examples_keys_are_valid_schema_properties():
+    """Every example arg must be a declared property AND satisfy required args,
+    so a curated example can never teach a wrong/renamed parameter."""
+    schemas = _catalog_schemas()
+    problems = {}
+    for action, example in counter.EXAMPLES.items():
+        schema = schemas.get(action, {})
+        props = set((schema.get("properties") or {}).keys())
+        required = set(schema.get("required") or [])
+        keys = set(example.keys())
+        unknown = keys - props
+        missing = required - keys
+        if unknown or missing:
+            problems[action] = {"unknown_args": sorted(unknown), "missing_required": sorted(missing)}
+    assert problems == {}, f"example/schema mismatches: {problems}"
+
+
+def test_example_for_returns_copy_or_none():
+    assert counter.example_for("search_symbols") is not None
+    a = counter.example_for("search_symbols")
+    a["repo"] = "mutated"
+    assert counter.example_for("search_symbols")["repo"] != "mutated"  # not shared state
+    assert counter.example_for("definitely_not_a_tool") is None
+
+
+def test_menu_surfaces_example_for_known_action():
+    out = _call("menu", {"query": "search symbols", "limit": 25})
+    by_name = {a["action"]: a for a in out["actions"]}
+    if "search_symbols" in by_name:
+        assert "example" in by_name["search_symbols"], "menu should surface a curated example"
+        assert by_name["search_symbols"]["example"].get("query")
+
+
+def test_route_template_falls_back_to_curated_example():
+    # find_implementations has no _QUERY_ARG shaper, so route can't auto-build
+    # its args -> the curated example should fill args_template (not a bare hint).
+    out = _call("route", {"task": "find implementations of the Store interface", "repo": "x"})
+    for rec in out["recommended"]:
+        if rec["action"] in counter.EXAMPLES and "_hint" in rec.get("args_template", {}):
+            pytest.fail(f"{rec['action']} had a curated example but route used a bare hint")

@@ -169,17 +169,107 @@ def _is_validated(key: str, storage_path: Optional[str] = None) -> dict:
 # The gate
 # --------------------------------------------------------------------------- #
 
+def format_license_status(gate: dict, *, key_provided: bool = False) -> list[str]:
+    """Human-readable ``license`` CLI lines from a ``check_gate()`` result.
+
+    Pure (no I/O) so every key_status/mode combination is unit-testable without
+    the network. The contract that matters for a paying customer:
+
+    * A valid key reads as **licensed**, never "unlicensed" — even on a Builder
+      tier that doesn't include org-rollup (org-rollup is framed as an optional
+      team add-on, not a deficiency, with no trial countdown).
+    * A key that merely couldn't be verified (server unreachable) reads as
+      "present, not yet verified", never "not recognized".
+    * Core indexing/search are stated as free so nobody thinks the product is
+      gated behind a key.
+    """
+    mode = gate.get("mode")
+    status = gate.get("key_status") or ("valid" if mode == "licensed" else "absent")
+    key_valid = status == "valid"
+    tier = gate.get("tier")
+    lines: list[str] = []
+
+    if status == "valid":
+        lines.append("License: licensed" + (f" ({tier})" if tier else ""))
+    elif status == "unverified_offline":
+        lines.append("License: key present, not yet verified (license server unreachable)")
+    elif status == "rejected":
+        lines.append("License: key not recognized by the license server")
+    else:  # absent
+        lines.append("License: no license key set")
+
+    if gate.get("key_masked"):
+        lines.append(f"  Key: {gate['key_masked']}")
+
+    # org-rollup (team dashboard) is the only feature this gate governs.
+    if mode == "licensed":
+        lines.append("  org-rollup: included in your tier")
+    elif key_valid:
+        # Valid but non-team tier (e.g. Builder): licensed; org-rollup is an
+        # optional upgrade, not a deficiency — no evaluation countdown shown.
+        lines.append("  org-rollup: optional team add-on — requires Studio or Platform")
+    elif mode == "grace":
+        lines.append(f"  org-rollup: {gate.get('grace_days_left')} day(s) evaluation left (team feature)")
+    else:  # blocked, no valid key
+        lines.append("  org-rollup: evaluation ended (team feature)")
+
+    if gate.get("get_license"):
+        if key_valid:
+            lines.append(f"  Upgrade for org-rollup: {gate['get_license']}")
+        else:
+            lines.append(f"  Get a license: {gate['get_license']}")
+
+    lines.append("  Core indexing and search are free and need no license.")
+    if status == "unverified_offline":
+        lines.append("  (your key will verify automatically once the license server is reachable)")
+    if key_provided:
+        lines.append("  (set JCODEMUNCH_LICENSE_KEY or config `license_key` to persist this key)")
+    return lines
+
+
+def _key_status(key: str, res: dict) -> str:
+    """Classify a key for honest presentation: "valid" | "absent" |
+    "unverified_offline" | "rejected".
+
+    ``unverified_offline`` is the distinction that protects a paying customer:
+    an unconfirmed key on a network failure is NOT a bad key — the server just
+    couldn't be reached — so a caller must never render it as "rejected"."""
+    if res.get("valid"):
+        return "valid"
+    if not (key or "").strip():
+        return "absent"
+    err = (res.get("error") or "").lower()
+    if "reach" in err or "could not reach" in err or "timeout" in err:
+        return "unverified_offline"
+    return "rejected"
+
+
 def check_gate(*, storage_path: Optional[str] = None) -> dict:
     """Decide whether org-rollup may run. Returns a dict:
 
-        {allowed, mode, reason, tier, grace_days_left, get_license, key_masked}
+        {allowed, mode, reason, tier, grace_days_left, get_license, key_masked,
+         key_valid, feature}
 
-    ``mode`` ∈ {"licensed", "grace", "blocked"}. Starts the grace clock on the
-    first unlicensed call (persisted), so the evaluation window is real-time, not
-    install-time."""
+    ``mode`` ∈ {"licensed", "grace", "blocked"} and describes ORG-ROLLUP
+    entitlement specifically (``feature`` == "org-rollup"), NOT whether the key
+    itself is valid. ``key_valid`` is the separate signal a caller needs to say
+    "your Builder license is recognized, org-rollup just isn't in that tier"
+    rather than "unlicensed" — a valid Builder key is ``key_valid=True`` but
+    ``mode="grace"``/"blocked".
+
+    ``key_status`` ∈ {"valid", "absent", "rejected", "unverified_offline"}
+    is finer than ``key_valid`` so a caller never tells a paying customer their
+    key is bad when the truth is only that the license server was unreachable —
+    a real, confirmed-valid key that briefly can't be re-checked stays "valid"
+    (sticky-offline), and an as-yet-unconfirmed key on a network blip reports
+    "unverified_offline", NOT "rejected".
+
+    Starts the grace clock on the first unlicensed call (persisted), so the
+    evaluation window is real-time, not install-time."""
     key = _license_key()
     res = _is_validated(key, storage_path)
     tier = (res.get("tier") or "").lower()
+    key_status = _key_status(key, res)
 
     if res["valid"] and tier in ORG_TIERS:
         return {
@@ -190,6 +280,9 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
             "grace_days_left": None,
             "get_license": None,
             "key_masked": mask_key(key) if key else "",
+            "key_valid": True,
+            "key_status": key_status,
+            "feature": "org-rollup",
         }
 
     # Not entitled. Two shapes: (a) no/invalid key, or (b) a VALID license whose
@@ -227,6 +320,9 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
             "grace_days_left": days_left,
             "get_license": GET_LICENSE_URL,
             "key_masked": mask_key(key) if key else "",
+            "key_valid": bool(res["valid"]),
+            "key_status": key_status,
+            "feature": "org-rollup",
         }
 
     requirement = ("a Studio or Platform license" if insufficient_tier else "a license")
@@ -238,4 +334,7 @@ def check_gate(*, storage_path: Optional[str] = None) -> dict:
         "grace_days_left": 0,
         "get_license": GET_LICENSE_URL,
         "key_masked": mask_key(key) if key else "",
+        "key_valid": bool(res["valid"]),
+        "key_status": key_status,
+        "feature": "org-rollup",
     }

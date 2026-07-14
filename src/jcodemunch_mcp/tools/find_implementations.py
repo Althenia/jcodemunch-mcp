@@ -21,6 +21,7 @@ from typing import Optional
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ._utils import index_status_to_tool_error, resolve_repo
 from .get_class_hierarchy import _build_class_maps
+from ._scip_consume import open_scip_reader, scip_meta_and_stale, scip_meta_block
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +29,46 @@ logger = logging.getLogger(__name__)
 # Confidence tiers
 # ---------------------------------------------------------------------------
 _CONF_LSP = 1.0
+_CONF_SCIP = 1.0   # compile-time SCIP evidence — compiler-grade, on par with LSP
 _CONF_AST = 0.85
 _CONF_DUCK = 0.65
 _CONF_DECORATOR = 0.45
+
+
+def _scip_implementation_ids(store, owner: str, name: str, target_id: str):
+    """Compiler-verified implementations of ``target_id`` from ingested SCIP data.
+
+    SCIP stores each ``A implements B`` relationship as an edge
+    ``(impl_id, iface_id, "implementation")``, so the implementations of an
+    interface are the ``from_symbol_id``s of the implementation edges pointing at
+    it. Returns ``(impl_ids, scip_meta, stale)``; honest-empty ``([], {}, False)``
+    when no SCIP data has been ingested (including pre-v17 databases).
+    """
+    if not target_id:
+        return [], {}, False
+    conn = open_scip_reader(store, owner, name)
+    if conn is None:
+        return [], {}, False
+    try:
+        scip_meta, stale = scip_meta_and_stale(conn)
+        rows = conn.execute(
+            """
+            SELECT from_symbol_id AS impl_id
+            FROM scip_edges
+            WHERE kind = 'implementation' AND to_symbol_id = ?
+            GROUP BY from_symbol_id
+            """,
+            (target_id,),
+        ).fetchall()
+        impl_ids = [
+            r["impl_id"] for r in rows
+            if r["impl_id"] and r["impl_id"] != target_id
+        ]
+        return impl_ids, scip_meta, stale
+    except Exception:
+        return [], {}, False
+    finally:
+        conn.close()
 
 # Decorators that suggest "this is implementing a registered handler protocol"
 _HANDLER_DECORATOR_PATTERNS = re.compile(
@@ -186,7 +224,7 @@ def find_implementations(
     impls_by_id: dict[str, dict] = {}
 
     def _add_impl(sym: dict, *, kind: str, confidence: float, source: str,
-                  via: Optional[str] = None) -> None:
+                  via: Optional[str] = None, verification: Optional[str] = None) -> None:
         if kind not in kinds_whitelist:
             return
         sid = sym.get("id", "")
@@ -210,6 +248,8 @@ def find_implementations(
         }
         if via:
             rec["via"] = via
+        if verification:
+            rec["verification"] = verification
         decs = _normalize_decorators_list(sym)
         if decs:
             rec["decorators"] = decs[:4]
@@ -217,10 +257,14 @@ def find_implementations(
 
     # Build a name → symbol lookup once for resolution speed
     sym_by_name: dict[str, list[dict]] = {}
+    sym_by_id: dict[str, dict] = {}
     for sym in index.symbols:
         n = sym.get("name", "")
         if n:
             sym_by_name.setdefault(n, []).append(sym)
+        sid = sym.get("id", "")
+        if sid:
+            sym_by_id.setdefault(sid, sym)
     symbols_by_file: dict[str, list[dict]] = {}
     for sym in index.symbols:
         f = sym.get("file", "")
@@ -371,6 +415,31 @@ def find_implementations(
                 confidence=_CONF_DECORATOR, source="decorator_match",
                 via=match_dec,
             )
+
+    # ── Channel 5: SCIP compiler-verified implementations ──────────────
+    # Static compile-time evidence (import-scip): impl→iface edges give the
+    # concrete implementations the compiler proved for this interface. 1.0
+    # confidence, on par with live LSP dispatch, and it surfaces implementations
+    # the AST/duck channels miss (e.g. an interface with no declared subclassing).
+    # Honest no-op without ingested SCIP. Wins the dedup over lower-confidence
+    # channels, tagging the record compiler_verified.
+    scip_block: Optional[dict] = None
+    _scip_impl_ids, _scip_meta, _scip_stale = _scip_implementation_ids(
+        store, owner, name, target_id
+    )
+    _scip_proven = 0
+    for _impl_id in _scip_impl_ids:
+        _impl_sym = sym_by_id.get(_impl_id)
+        if _impl_sym is None or _impl_sym.get("id") == target_id:
+            continue
+        _scip_proven += 1
+        _add_impl(
+            _impl_sym, kind="interface_impl", confidence=_CONF_SCIP,
+            source="scip", via=target_name or None,
+            verification="compiler_verified",
+        )
+    if _scip_proven:
+        scip_block = scip_meta_block(_scip_meta, _scip_stale, implementations=_scip_proven)
 
     # ── Optional: cross-repo discovery ─────────────────────────────────
     cross_repo_count = 0
@@ -530,6 +599,8 @@ def find_implementations(
             **cost_avoided(tokens_saved, total_saved),
         },
     }
+    if scip_block is not None:
+        result["_meta"]["scip"] = scip_block
     if cross_repo:
         result["cross_repo_count"] = cross_repo_count
     if not dispatch_edges and target_kind in ("method", "function"):

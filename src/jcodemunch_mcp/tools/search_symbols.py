@@ -63,6 +63,20 @@ def _result_cache_get(key: tuple) -> Optional[dict]:
     return None
 
 
+def _attach_index_truncation(meta: Optional[dict], index) -> None:
+    """Add ``_meta.index_truncated`` when the loaded index was cap-truncated (#366).
+
+    No-op on a complete index or a pre-v1.108.126 index (unknown status), so a
+    healthy result is unchanged.
+    """
+    if not isinstance(meta, dict):
+        return
+    from ..retrieval.verdict import index_truncation_meta as _itm
+    block = _itm(getattr(index, "file_cap_status", None))
+    if block:
+        meta["index_truncated"] = block
+
+
 def _get_cache_max() -> int:
     try:
         from .. import config as _cfg
@@ -1025,6 +1039,7 @@ def search_symbols(
     )
     negative_evidence = _vres["negative_evidence"]
     meta["verdict"] = _vres["verdict"]
+    _attach_index_truncation(meta, index)
 
     # Feature 1: Add negative_evidence if present
     if negative_evidence is not None:
@@ -1364,6 +1379,7 @@ def _search_symbols_semantic(
                 f"Verify before claiming this feature exists."
             )
 
+    _attach_index_truncation(result.get("_meta"), index)
     return result
 
 
@@ -1620,6 +1636,7 @@ def _search_symbols_fusion(
         **_feat,
     )
 
+    _attach_index_truncation(result.get("_meta"), index)
     if cacheable and cache_key is not None:
         _result_cache_put(cache_key, result)
 

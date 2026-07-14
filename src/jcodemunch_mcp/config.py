@@ -48,6 +48,7 @@ ENV_VAR_MAPPING = {
     "JCODEMUNCH_SUMMARIZER_CONCURRENCY": "summarizer_concurrency",
     "JCODEMUNCH_SUMMARIZER_MAX_FAILURES": "summarizer_max_failures",
     "JCODEMUNCH_ALLOW_REMOTE_SUMMARIZER": "allow_remote_summarizer",
+    "JCODEMUNCH_ALLOW_PAID_SUMMARIES": "allow_paid_summaries",
     "JCODEMUNCH_RATE_LIMIT": "rate_limit",
     "JCODEMUNCH_TRANSPORT": "transport",
     "JCODEMUNCH_HOST": "host",
@@ -447,6 +448,7 @@ DEFAULTS = {
     "summarizer_concurrency": 4,
     "summarizer_max_failures": 3,
     "allow_remote_summarizer": False,
+    "allow_paid_summaries": False,
     "openai_extra_body": {},
     "path_map": "",
     "cross_repo_default": False,
@@ -539,6 +541,7 @@ CONFIG_TYPES = {
     "summarizer_concurrency": int,
     "summarizer_max_failures": int,
     "allow_remote_summarizer": bool,
+    "allow_paid_summaries": bool,
     "openai_extra_body": dict,
     "path_map": str,
     "cross_repo_default": bool,
@@ -1917,7 +1920,10 @@ def generate_template() -> str:
 
   // "max_folder_files": 2000,
   //   Maximum number of files to index when indexing a local folder.
-  //   Prevents accidental massive indexing jobs.
+  //   Prevents accidental massive indexing jobs. Monorepos often exceed this;
+  //   when the cap drops files the index result, resolve_repo, and search _meta
+  //   all report `truncated` with the discovered/indexed counts. Raise this and
+  //   re-index if files are missing from results.
 
   // "gitignore_warn_threshold": 500,
   //   Emit a warning during index_folder when no root .gitignore is found
@@ -2401,6 +2407,12 @@ def generate_template() -> str:
   // "allow_remote_summarizer": false,
   //   Allow remote LLM endpoints for summarization (security risk).
   //   Default false blocks non-local summarization.
+  // "allow_paid_summaries": false,
+  //   Allow AUTO-detected PAID cloud providers (anthropic/gemini/minimax/glm/
+  //   openrouter, or remote OpenAI) to summarize just because their API key is
+  //   present in the environment. Default false so a stray cloud key never
+  //   silently bills during indexing. Naming a provider explicitly via
+  //   "summarizer_provider" is always honored and does NOT need this flag.
   // "path_map": "",
   //   Cross-platform path remapping. Format: "orig1=new1,orig2=new2".
   //   Allows indexes built on Linux to work on Windows and vice versa.

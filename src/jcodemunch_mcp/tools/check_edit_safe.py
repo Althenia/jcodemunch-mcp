@@ -9,7 +9,7 @@ recommended action. Read-only — never mutates the codebase.
 
 Verdict tiers (most-constraining first):
   - runtime_critical  — runs in production (traces show hits); edits are high-stakes
-  - signature_impact  — external/cross-repo callers depend on the signature; body edits OK, keep the contract
+  - signature_impact  — external/cross-repo callers (incl. compiler-verified SCIP refs) depend on the signature; body edits OK, keep the contract
   - complexity_risk   — high cyclomatic complexity; edits are regression-prone
   - untested          — referenced but no test coverage; add a characterization test first
   - safe_to_edit      — low complexity, no external callers; modify freely
@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _SEVERITY_RUNTIME = 5
 _SEVERITY_CROSS_REPO = 5
+_SEVERITY_SCIP = 5           # compiler-verified caller depends on the contract
 _SEVERITY_EXTERNAL_IMPORT = 4
 _SEVERITY_COMPLEXITY = 3
 _SEVERITY_INTERNAL_REF = 3
@@ -203,8 +204,32 @@ def check_edit_safe(
             "info": "this symbol executes in production traffic",
         })
 
+    # ── Signal 6: SCIP compiler-verified callers (compile-time evidence) ───
+    # A compiler-proven external reference is a caller that depends on the
+    # current contract, even when the import graph and text search miss it
+    # (dynamic dispatch, barrel re-exports). It raises the same signature_impact
+    # concern. Honest no-op without ingested SCIP.
+    from ._scip_consume import scip_reference_files, scip_meta_block  # noqa: PLC0415
+    scip_external_count = 0
+    scip_block: Optional[dict] = None
+    _scip_files, _scip_meta, _scip_stale = scip_reference_files(store, owner, name, target_id)
+    _scip_files.pop(target_file, None)
+    for _f in sorted(_scip_files):
+        if _is_test_file(_f):
+            continue  # test refs don't constrain a signature edit
+        scip_external_count += 1
+        blockers.append({
+            "kind": "scip_reference", "file": _f, "severity": _SEVERITY_SCIP,
+            "verification": "compiler_verified",
+            "info": "compiler-verified caller depends on the current contract",
+        })
+    if scip_external_count:
+        scip_block = scip_meta_block(
+            _scip_meta, _scip_stale, verified_external_refs=scip_external_count,
+        )
+
     # ── Verdict selection (most-constraining first) ────────────────────────
-    signature_impact = (external_import_count + cross_repo_count) > 0
+    signature_impact = (external_import_count + cross_repo_count + scip_external_count) > 0
 
     if runtime_hits and runtime_hits > 0:
         verdict = "runtime_critical"
@@ -229,7 +254,7 @@ def check_edit_safe(
         confidence = 0.95  # low complexity, no callers, and covered by tests
 
     # ── Recommended action ─────────────────────────────────────────────────
-    callers = external_import_count + cross_repo_count
+    callers = external_import_count + cross_repo_count + scip_external_count
     tests_note = "" if has_test_coverage else " No test coverage detected — add a characterization test first."
     actions = {
         "runtime_critical": (
@@ -284,6 +309,7 @@ def check_edit_safe(
             "test_import_count": test_import_count,
             "internal_ref_count": internal_ref_count,
             "test_ref_count": test_ref_count,
+            "scip_external_ref_count": scip_external_count,
             "cyclomatic": cyclomatic,
             "has_test_coverage": has_test_coverage,
         },
@@ -294,6 +320,8 @@ def check_edit_safe(
             **cost_avoided(tokens_saved, total_saved),
         },
     }
+    if scip_block is not None:
+        result["_meta"]["scip"] = scip_block
     if runtime_hits is not None:
         result["signals"]["runtime_hits"] = runtime_hits
     if include_runtime:

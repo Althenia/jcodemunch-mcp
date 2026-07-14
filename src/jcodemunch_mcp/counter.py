@@ -135,14 +135,72 @@ def _required_args(schema: dict) -> list[str]:
     return list(req) if isinstance(req, list) else []
 
 
+# Curated example invocations for the highest-traffic catalog actions. These are
+# the arg objects you'd hand to ``order(action, args)``, surfaced by ``menu``/
+# ``route`` (and ONLY there) so an agent sees a concrete, ready-to-adapt call
+# without paying for it in resident tool schemas. Correctness is not trusted to
+# review: ``tests/test_counter.py`` validates every key here against the LIVE
+# inputSchema of its action, so a wrong/renamed arg fails CI.
+EXAMPLES: dict[str, dict] = {
+    # discovery / bootstrap
+    "resolve_repo": {"path": "."},
+    "index_folder": {"path": "."},
+    "index_file": {"path": "/abs/path/to/file.py"},
+    "suggest_queries": {"repo": "owner/name"},
+    # symbol + text search
+    "search_symbols": {"repo": "owner/name", "query": "parse config", "kind": "function"},
+    "search_text": {"repo": "owner/name", "query": "TODO|FIXME", "is_regex": True, "context_lines": 2},
+    "search_columns": {"repo": "owner/name", "query": "user_id"},
+    "search_ast": {"repo": "owner/name", "pattern": "nesting:>4"},
+    # reading
+    "get_file_outline": {"repo": "owner/name", "file_path": "src/app.py"},
+    "get_symbol_source": {"repo": "owner/name", "symbol_id": "src/app.py::parse_config#function"},
+    "get_context_bundle": {"repo": "owner/name", "symbol_id": "src/app.py::Loader#class"},
+    "get_file_content": {"repo": "owner/name", "file_path": "src/app.py", "start_line": 1, "end_line": 40},
+    "get_ranked_context": {"repo": "owner/name", "query": "how is config loaded", "token_budget": 4000},
+    # structure / orientation
+    "get_repo_outline": {"repo": "owner/name"},
+    "get_repo_map": {"repo": "owner/name", "token_budget": 4000},
+    "get_file_tree": {"repo": "owner/name", "path_prefix": "src/"},
+    "digest": {"repo": "owner/name"},
+    # relationships / impact
+    "find_importers": {"repo": "owner/name", "file_path": "src/app.py"},
+    "find_references": {"repo": "owner/name", "identifier": "parse_config"},
+    "check_references": {"repo": "owner/name", "identifier": "parse_config"},
+    "get_blast_radius": {"repo": "owner/name", "symbol": "parse_config"},
+    "get_call_hierarchy": {"repo": "owner/name", "symbol_id": "src/app.py::main#function"},
+    "get_class_hierarchy": {"repo": "owner/name", "class_name": "Base"},
+    "find_implementations": {"repo": "owner/name", "symbol": "Store"},
+    "get_dependency_graph": {"repo": "owner/name", "file": "src/app.py"},
+    "find_dead_code": {"repo": "owner/name"},
+    "get_changed_symbols": {"repo": "owner/name"},
+    # safety preflights
+    "check_delete_safe": {"repo": "owner/name", "symbol": "parse_config"},
+    "check_edit_safe": {"repo": "owner/name", "symbol": "parse_config"},
+    # planning / context orchestration
+    "assemble_task_context": {"repo": "owner/name", "task": "add caching to the config loader"},
+    "plan_turn": {"repo": "owner/name", "query": "refactor config loading"},
+}
+
+
+def example_for(name: str) -> Optional[dict]:
+    """Curated example args for *name*, or None. Used by menu/route surfaces."""
+    ex = EXAMPLES.get(name)
+    return dict(ex) if ex is not None else None
+
+
 def catalog_entry(name: str, description: str, schema: dict) -> dict:
     """Compact, dense menu row for one action."""
-    return {
+    row = {
         "action": name,
         "summary": _first_sentence(description),
         "required": _required_args(schema),
         "state_changing": is_state_changing(name),
     }
+    ex = EXAMPLES.get(name)
+    if ex:
+        row["example"] = ex
+    return row
 
 
 def score_action(
