@@ -578,7 +578,7 @@ _COMPACT_STRIP_PARAMS: dict[str, set[str]] = {
         "max_source_bytes", "max_total_source_bytes",
     },
     "get_context_bundle": {"budget_strategy"},
-    "get_ranked_context": {"detail_level"},
+    "get_ranked_context": {"detail_level", "compress"},
     "get_blast_radius": {"cross_repo", "max_depth"},
     "get_endpoint_impact": {"include_infra"},
     "index_dependency": {"ecosystem", "max_files"},
@@ -3424,6 +3424,11 @@ def _build_tools_list() -> list[Tool]:
                         "description": "Enable multi-signal fusion (Weighted Reciprocal Rank) for ranking. Combines lexical, structural, and identity channels.",
                         "default": False,
                     },
+                    "compress": {
+                        "type": "boolean",
+                        "description": "Keystone-protected structural compression: prune low-signal lines from oversized bodies so more relevant symbols fit the budget (control-flow/returns/signatures always kept). Model-free; pruned items carry source_pruned + line counts. Default False.",
+                        "default": False,
+                    },
                 },
                 "required": ["repo", "query"],
             },
@@ -4878,6 +4883,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     include_kinds=arguments.get("include_kinds"),
                     scope=arguments.get("scope"),
                     fusion=arguments.get("fusion", False),
+                    compress=arguments.get("compress", False),
                     storage_path=storage_path,
                 )
             )
