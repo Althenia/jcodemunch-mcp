@@ -143,6 +143,27 @@ def test_openai_provider_uses_codex_responses_and_account_header(monkeypatch):
     assert summarizer.client.headers["ChatGPT-Account-Id"] == "acct"
 
 
+def test_openai_codex_request_omits_temperature_for_reasoning_model(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import _create_summarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    monkeypatch.setenv("JCODEMUNCH_SUMMARIZER_PROVIDER", "openai")
+    monkeypatch.setattr(openai_oauth, "load_credential", lambda: credential)
+
+    summarizer = _create_summarizer()
+    assert summarizer is not None
+
+    _, payload = summarizer._request_spec("Summarize this symbol.")
+
+    assert payload["model"] == "gpt-5.4-mini"
+    assert "temperature" not in payload
+
+
 def test_openai_provider_preserves_api_key_fallback_when_keyring_is_unavailable(monkeypatch):
     from jcodemunch_mcp.summarizer.batch_summarize import _create_summarizer
 

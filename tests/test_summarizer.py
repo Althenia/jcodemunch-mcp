@@ -422,7 +422,6 @@ def test_openai_summarizer_responses_api_mode():
         "model": "gpt-5.4-mini",
         "input": mock_client.post.call_args[1]["json"]["input"],
         "max_output_tokens": 500,
-        "temperature": 0.0,
     }
     assert (
         "Summarize each code symbol" in mock_client.post.call_args[1]["json"]["input"]

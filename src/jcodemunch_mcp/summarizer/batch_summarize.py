@@ -659,8 +659,8 @@ class OpenAIBatchSummarizer(BaseSummarizer):
                 "model": self.model,
                 "input": prompt,
                 "max_output_tokens": self.max_tokens_per_batch,
-                "temperature": 0.0,
             }
+            # Responses reasoning models reject the temperature parameter.
             if self.extra_body:
                 payload.update(self.extra_body)
             return "/responses", payload
