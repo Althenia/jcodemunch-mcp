@@ -2,6 +2,38 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.129] - 2026-07-14 - Keystone-protected structural compression for get_ranked_context
+
+`get_ranked_context` gains an opt-in `compress=True` that fits **more** relevant
+symbols into the same token budget. When a symbol body is large, a model-free,
+structural pass prunes its lowest-signal lines and keeps the high-signal ones,
+while **always** preserving "keystone" lines — control flow, returns/raises,
+signatures, and decision/constraint/negation cues (`if`, `return`, `raise`,
+`must`, `!=`, `def`/`class`, …) whose removal could silently change meaning.
+Dropped runs collapse into an honest `… N low-signal line(s) elided …` marker,
+so the caller can never mistake a pruned view for the full body.
+
+The signal is pure structure — normalized Shannon entropy of each line's token
+distribution, weighted by length — so it runs **headless, deterministic, and
+local**: no model, no network, no persisted state. The result is a labeled
+read-only VIEW, never an edit (consistent with the read-only charter). On the
+live jCodeMunch index at a 1,500-token budget, `compress=True` delivered 12
+symbols where the default fit 9 (three pruned to make room), same total tokens.
+
+- New `retrieval/entropy_prune.py`: `prune_source` / `is_keystone` / `line_signal`
+  (O(L), one token-cost measurement per line).
+- Wired into BOTH the default and `fusion=True` packing paths via a shared
+  `_compressing_get_tokens` wrapper; pruned items carry `source_pruned`,
+  `source_kept_lines`, `source_elided_lines`, `source_total_lines`,
+  `source_is_pruned_view`.
+- **Default `compress=False` is byte-identical** to prior output. `compress` is
+  compact-stripped so `core_compact` is unchanged; no new tool, no tool-count
+  change, no INDEX_VERSION bump.
+- New `tests/test_v1_108_129.py` (13: pruner units + integration incl.
+  default-off byte-identity, fits-more, keystones-survive, honest metadata,
+  fusion path). ruff clean; ranked-context/encoding/schema-budget/dispatch-parity/
+  server suites green.
+
 ## [1.108.128] - 2026-07-13 - Never auto-bill a paid cloud provider from a bare env key
 
 A bare cloud API key in the environment (e.g. `ANTHROPIC_API_KEY`) silently

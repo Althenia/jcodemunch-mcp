@@ -25,6 +25,49 @@ _FILE_GROUP_CAP = 3          # max symbols from a single file
 # Max chars for the compact-row summary so packed rows stay cheap (#354).
 _COMPACT_SUMMARY_MAX = 160
 
+# Keystone-protected compression (opt-in `compress=True`). A large symbol body is
+# pruned toward a per-item soft cap so more relevant symbols fit the same budget.
+_COMPRESS_TARGET_ITEMS = 8       # aim to leave room for ~this many items
+_COMPRESS_MIN_ITEM_TOKENS = 120  # never squeeze a single item below this
+
+
+def _compressing_get_tokens(base_get_tokens, token_budget: int, registry: dict) -> callable:
+    """Wrap a ``get_tokens`` fn so oversized bodies are keystone-pruned (opt-in).
+
+    Records each pruned symbol's ``PruneResult`` in ``registry`` (keyed by symbol
+    id) so the item-assembly loop can surface honest elision metadata. The prune
+    is a labeled read-only view — the source is never edited on disk.
+    """
+    from ..retrieval.entropy_prune import prune_source
+
+    per_item = max(_COMPRESS_MIN_ITEM_TOKENS, token_budget // _COMPRESS_TARGET_ITEMS)
+
+    def _wrapped(sym):
+        source, _ = base_get_tokens(sym)
+        if source:
+            pr = prune_source(source, per_item, _count_tokens)
+            if pr.is_pruned:
+                registry[sym["id"]] = pr
+                source = pr.text
+        tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
+        return source, tokens
+
+    return _wrapped
+
+
+def _prune_fields(registry: dict, sym_id: str) -> dict:
+    """Honest per-item metadata when a symbol's source was compressed."""
+    pr = registry.get(sym_id)
+    if not pr:
+        return {}
+    return {
+        "source_pruned": True,
+        "source_kept_lines": pr.kept_lines,
+        "source_elided_lines": pr.elided_lines,
+        "source_total_lines": pr.total_lines,
+        "source_is_pruned_view": True,
+    }
+
 
 def _compact_fields(sym: dict, score: float, token_cost: int) -> dict:
     """Display fields the rc1 compact encoder declares (#354).
@@ -109,6 +152,7 @@ def get_ranked_context(
     include_kinds: Optional[list] = None,
     scope: Optional[str] = None,
     fusion: bool = False,
+    compress: bool = False,
     storage_path: Optional[str] = None,
 ) -> dict:
     """Assemble the best-fit context for a query within a token budget.
@@ -130,6 +174,13 @@ def get_ranked_context(
         scope: Optional subdirectory glob to limit search (e.g. 'src/core/*').
         fusion: Enable multi-signal fusion (Weighted Reciprocal Rank) for
             ranking. When True, ``strategy`` maps to channel weight presets.
+        compress: When True, keystone-protected structural compression prunes
+            each oversized symbol body toward a per-item soft cap so MORE
+            relevant symbols fit the same budget. Low-signal lines are elided
+            (control-flow, returns, signatures, and decision/constraint lines
+            are always kept); pruned items carry ``source_pruned`` +
+            kept/elided/total line counts and the source is a labeled view.
+            Model-free and local. Default False = byte-identical to prior output.
         storage_path: Custom storage path.
 
     Returns:
@@ -196,6 +247,7 @@ def get_ranked_context(
             token_budget=token_budget,
             include_kinds=include_kinds,
             scope=scope,
+            compress=compress,
             start=start,
         )
 
@@ -297,10 +349,16 @@ def get_ranked_context(
         tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
         return source, tokens
 
+    _prune_registry: dict = {}
+    _pack_get_tokens = (
+        _compressing_get_tokens(_get_tokens, token_budget, _prune_registry)
+        if compress else _get_tokens
+    )
+
     packed, total_tokens = _pack_budget(
         [(combined_score, sym) for combined_score, _, _, sym in scored],
         token_budget,
-        _get_tokens,
+        _pack_get_tokens,
     )
 
     context_items: list[dict] = []
@@ -318,6 +376,7 @@ def get_ranked_context(
             # producer dict had none of them, so every compact row encoded blank
             # while items_included reported a nonzero count.
             **_compact_fields(sym, adj_score, item_tokens),
+            **_prune_fields(_prune_registry, sym["id"]),
         })
 
     # Retrieval verdict threshold. The verdict itself is computed after the
@@ -420,6 +479,7 @@ def _get_ranked_context_fusion(
     include_kinds,
     scope,
     start: float,
+    compress: bool = False,
 ) -> dict:
     """Fusion-based ranked context: WRR across channels, greedy budget packing."""
     from ..retrieval.signal_fusion import (
@@ -494,8 +554,14 @@ def _get_ranked_context_fusion(
         tokens = _count_tokens(source) if source else max(1, sym.get("byte_length", 0) // BYTES_PER_TOKEN)
         return source, tokens
 
+    _prune_registry: dict = {}
+    _pack_get_tokens = (
+        _compressing_get_tokens(_get_tokens_fusion, token_budget, _prune_registry)
+        if compress else _get_tokens_fusion
+    )
+
     packed, total_tokens = _pack_budget(
-        fused_scored, token_budget, _get_tokens_fusion,
+        fused_scored, token_budget, _pack_get_tokens,
     )
 
     context_items = []
@@ -509,6 +575,7 @@ def _get_ranked_context_fusion(
             "source": source,
             # Compact-encoder display fields (#354) — see non-fusion path.
             **_compact_fields(sym, adj_score, item_tokens),
+            **_prune_fields(_prune_registry, sym["id"]),
         })
 
     raw_bytes = sum(
