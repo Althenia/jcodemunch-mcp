@@ -521,6 +521,9 @@ class OpenAIBatchSummarizer(BaseSummarizer):
     api_base: Optional[str] = None
     api_key: str = "local-llm"
     oauth_credential: "OpenAIOAuthCredential | None" = None
+    _oauth_refresh_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def __post_init__(self):
         self.client = None
@@ -584,6 +587,24 @@ class OpenAIBatchSummarizer(BaseSummarizer):
             self.client = httpx.Client(timeout=timeout, headers=headers)
         except ImportError:
             self.client = None
+
+    def _oauth_request_headers(self) -> dict[str, str] | None:
+        if self.oauth_credential is None:
+            return None
+        with self._oauth_refresh_lock:
+            credential = self.oauth_credential
+            if credential.is_expired():
+                from ..openai_oauth import load_credential
+
+                credential = load_credential()
+                if credential is None:
+                    raise RuntimeError("OpenAI OAuth credential is unavailable")
+                self.oauth_credential = credential
+                self.api_key = credential.access_token
+            headers = {"Authorization": f"Bearer {credential.access_token}"}
+            if credential.account_id:
+                headers["ChatGPT-Account-Id"] = credential.account_id
+            return headers
 
     def summarize_batch(
         self, symbols: list[Symbol], batch_size: int = 10
@@ -655,14 +676,30 @@ class OpenAIBatchSummarizer(BaseSummarizer):
         reasoning (#323).
         """
         if self.wire_api == "responses":
-            payload = {
-                "model": self.model,
-                "input": prompt,
-                "max_output_tokens": self.max_tokens_per_batch,
-            }
+            if self.oauth_credential is not None:
+                payload = {"model": self.model}
+            else:
+                payload = {
+                    "model": self.model,
+                    "input": prompt,
+                    "max_output_tokens": self.max_tokens_per_batch,
+                }
             # Responses reasoning models reject the temperature parameter.
             if self.extra_body:
                 payload.update(self.extra_body)
+            if self.oauth_credential is not None:
+                payload.update(
+                    {
+                        "input": [
+                            {
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": prompt}],
+                            }
+                        ],
+                        "store": False,
+                        "stream": True,
+                    }
+                )
             return "/responses", payload
 
         if self.wire_api != "chat":
@@ -700,6 +737,24 @@ class OpenAIBatchSummarizer(BaseSummarizer):
 
         return data["choices"][0]["message"]["content"]
 
+    def _extract_stream_text(self, response) -> str:
+        """Extract text from a Codex Responses SSE stream."""
+        text_parts = []
+        for line in response.iter_lines():
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].lstrip()
+            if raw == "[DONE]":
+                break
+            event = json.loads(raw)
+            if event.get("type") == "response.output_text.delta":
+                text_parts.append(event.get("delta", ""))
+            elif event.get("type") == "response.completed" and not text_parts:
+                return self._extract_response_text(event["response"])
+        if not text_parts:
+            raise KeyError("Codex Responses stream did not contain output text")
+        return "".join(text_parts)
+
     def _summarize_one_batch(self, batch: list[Symbol]):
         """Summarize one batch of symbols via HTTP POST."""
         prompt = self._build_prompt(batch)
@@ -707,11 +762,19 @@ class OpenAIBatchSummarizer(BaseSummarizer):
         try:
             path, payload = self._request_spec(prompt)
 
-            response = self.client.post(f"{self.api_base}{path}", json=payload)
+            headers = self._oauth_request_headers()
+            if headers is None:
+                response = self.client.post(f"{self.api_base}{path}", json=payload)
+            else:
+                response = self.client.post(
+                    f"{self.api_base}{path}", json=payload, headers=headers
+                )
             response.raise_for_status()
 
-            data = response.json()
-            text = self._extract_response_text(data)
+            if self.oauth_credential is not None:
+                text = self._extract_stream_text(response)
+            else:
+                text = self._extract_response_text(response.json())
             summaries = self._parse_response(text, len(batch))
             self._apply_summaries(batch, summaries)
 

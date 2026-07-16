@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from jcodemunch_mcp import openai_oauth
+from jcodemunch_mcp.parser import Symbol
 
 
 def test_authorize_url_uses_pkce_state_and_loopback_callback():
@@ -116,6 +117,71 @@ def test_load_credential_refreshes_expired_token_and_persists(monkeypatch):
     assert json.loads(persisted[0])["refresh_token"] == "new-refresh"
 
 
+def test_load_credential_serializes_refresh_token_rotation(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+
+    stored = {
+        "value": json.dumps(
+            {
+                "access_token": "expired",
+                "refresh_token": "refresh",
+                "expires_at": 0,
+                "account_id": "acct",
+            }
+        )
+    }
+    fresh = openai_oauth.OpenAIOAuthCredential(
+        access_token="fresh",
+        refresh_token="new-refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    first_get = Event()
+    second_get = Event()
+    release_first = Event()
+    count_lock = Lock()
+    get_count = 0
+    refresh_count = 0
+
+    def fake_get(name):
+        nonlocal get_count
+        with count_lock:
+            get_count += 1
+            current = get_count
+        if current == 1:
+            first_get.set()
+            release_first.wait(timeout=1)
+        else:
+            second_get.set()
+        return stored["value"]
+
+    def fake_refresh(credential):
+        nonlocal refresh_count
+        refresh_count += 1
+        return fresh
+
+    monkeypatch.setattr(openai_oauth.credentials, "keyring_get", fake_get)
+    monkeypatch.setattr(
+        openai_oauth.credentials,
+        "keyring_set",
+        lambda name, value: stored.update(value=value),
+    )
+    monkeypatch.setattr(openai_oauth, "refresh_credential", fake_refresh)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(openai_oauth.load_credential)
+        assert first_get.wait(timeout=1)
+        second = executor.submit(openai_oauth.load_credential)
+        second_entered_while_first_loading = second_get.wait(timeout=0.1)
+        release_first.set()
+        credentials = [first.result(timeout=1), second.result(timeout=1)]
+
+    assert not second_entered_while_first_loading
+    assert refresh_count == 1
+    assert [credential.access_token for credential in credentials] == ["fresh", "fresh"]
+
+
 def test_load_credential_rejects_malformed_keyring_value(monkeypatch):
     monkeypatch.setattr(openai_oauth.credentials, "keyring_get", lambda name: "not-json")
 
@@ -162,6 +228,153 @@ def test_openai_codex_request_omits_temperature_for_reasoning_model(monkeypatch)
 
     assert payload["model"] == "gpt-5.4-mini"
     assert "temperature" not in payload
+
+
+def test_openai_codex_request_uses_backend_contract(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import _create_summarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    monkeypatch.setenv("JCODEMUNCH_SUMMARIZER_PROVIDER", "openai")
+    monkeypatch.setattr(openai_oauth, "load_credential", lambda: credential)
+
+    summarizer = _create_summarizer()
+    assert summarizer is not None
+
+    path, payload = summarizer._request_spec("Summarize this symbol.")
+
+    assert path == "/responses"
+    assert payload == {
+        "model": "gpt-5.4-mini",
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Summarize this symbol."}
+                ],
+            }
+        ],
+        "store": False,
+        "stream": True,
+    }
+
+
+def test_openai_codex_request_preserves_required_fields(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import _create_summarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    monkeypatch.setenv("JCODEMUNCH_SUMMARIZER_PROVIDER", "openai")
+    monkeypatch.setattr(openai_oauth, "load_credential", lambda: credential)
+
+    summarizer = _create_summarizer()
+    assert summarizer is not None
+    summarizer.extra_body = {
+        "input": "invalid",
+        "store": True,
+        "stream": False,
+        "reasoning": {"effort": "low"},
+    }
+
+    _, payload = summarizer._request_spec("Summarize this symbol.")
+
+    assert payload["input"][0]["content"][0]["text"] == "Summarize this symbol."
+    assert payload["store"] is False
+    assert payload["stream"] is True
+    assert payload["reasoning"] == {"effort": "low"}
+
+
+def test_openai_codex_summarizer_reads_sse_output():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    response = MagicMock()
+    response.iter_lines.return_value = [
+        "event: response.output_text.delta",
+        'data: {"type":"response.output_text.delta","delta":"1. Summarizes "}',
+        "event: response.output_text.delta",
+        'data:{"type":"response.output_text.delta","delta":"a symbol."}',
+        "event: response.completed",
+        'data: {"type":"response.completed","response":{}}',
+        "data: [DONE]",
+    ]
+    client = MagicMock()
+    client.post.return_value = response
+
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+    summarizer.client = client
+    symbol = Symbol(
+        id="test::thing",
+        file="test.py",
+        name="thing",
+        qualified_name="thing",
+        kind="function",
+        language="python",
+        signature="def thing():",
+    )
+
+    summarizer.summarize_batch([symbol])
+
+    assert symbol.summary == "Summarizes a symbol."
+
+
+def test_openai_codex_refreshes_expired_credential_before_request(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    expired = openai_oauth.OpenAIOAuthCredential(
+        access_token="expired-access",
+        refresh_token="old-refresh",
+        expires_at=0,
+        account_id="acct",
+    )
+    rotated = openai_oauth.OpenAIOAuthCredential(
+        access_token="rotated-access",
+        refresh_token="rotated-refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    monkeypatch.setattr(openai_oauth, "load_credential", lambda: rotated)
+    response = MagicMock()
+    response.iter_lines.return_value = [
+        'data: {"type":"response.output_text.delta","delta":"1. Refreshed."}',
+        "data: [DONE]",
+    ]
+    client = MagicMock()
+    client.post.return_value = response
+
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=expired)
+    summarizer.client = client
+    symbol = Symbol(
+        id="test::thing",
+        file="test.py",
+        name="thing",
+        qualified_name="thing",
+        kind="function",
+        language="python",
+        signature="def thing():",
+    )
+
+    summarizer.summarize_batch([symbol])
+
+    headers = client.post.call_args.kwargs["headers"]
+    assert headers["Authorization"] == "Bearer rotated-access"
+    assert headers["ChatGPT-Account-Id"] == "acct"
+    assert summarizer.oauth_credential is rotated
 
 
 def test_openai_provider_preserves_api_key_fallback_when_keyring_is_unavailable(monkeypatch):

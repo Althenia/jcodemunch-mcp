@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 from queue import Empty, Queue
 import secrets
-from threading import Thread
+from threading import Lock, Thread
 import time
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -29,6 +29,7 @@ CALLBACK_PATH = "/auth/callback"
 OAUTH_SCOPE = "openid profile email offline_access"
 EXPIRY_SAFETY_SECONDS = 60
 DEVICE_AUTH_HEADERS = {"User-Agent": "jcodemunch-mcp"}
+_CREDENTIAL_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -162,32 +163,33 @@ def store_credential(credential: OpenAIOAuthCredential) -> None:
 
 def load_credential() -> OpenAIOAuthCredential | None:
     """Load and, when necessary, refresh the stored OAuth credential."""
-    raw = credentials.keyring_get(CREDENTIAL_NAME)
-    if raw is None:
-        return None
-    try:
-        value = json.loads(raw)
-        if not isinstance(value, dict):
-            raise ValueError("credential must be a JSON object")
-        access_token = value["access_token"]
-        refresh_token = value["refresh_token"]
-        account_id = value.get("account_id")
-        if not isinstance(access_token, str) or not isinstance(refresh_token, str):
-            raise ValueError("credential tokens must be strings")
-        if account_id is not None and not isinstance(account_id, str):
-            raise ValueError("credential account ID must be a string")
-        credential = OpenAIOAuthCredential(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            expires_at=float(value["expires_at"]),
-            account_id=account_id,
-        )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-        raise ValueError("invalid OpenAI OAuth credential in system keyring") from error
-    if credential.is_expired():
-        credential = refresh_credential(credential)
-        store_credential(credential)
-    return credential
+    with _CREDENTIAL_LOCK:
+        raw = credentials.keyring_get(CREDENTIAL_NAME)
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+            if not isinstance(value, dict):
+                raise ValueError("credential must be a JSON object")
+            access_token = value["access_token"]
+            refresh_token = value["refresh_token"]
+            account_id = value.get("account_id")
+            if not isinstance(access_token, str) or not isinstance(refresh_token, str):
+                raise ValueError("credential tokens must be strings")
+            if account_id is not None and not isinstance(account_id, str):
+                raise ValueError("credential account ID must be a string")
+            credential = OpenAIOAuthCredential(
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=float(value["expires_at"]),
+                account_id=account_id,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("invalid OpenAI OAuth credential in system keyring") from error
+        if credential.is_expired():
+            credential = refresh_credential(credential)
+            store_credential(credential)
+        return credential
 
 
 def _callback_server(
