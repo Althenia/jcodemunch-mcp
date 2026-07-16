@@ -98,12 +98,15 @@ _DEFAULT_MULTIPLIER = 8.0
 # typically 10% of normal input pricing for Anthropic models, but we use
 # normal input pricing here because savings are computed against a
 # counterfactual (naive Read+Grep would have been *fresh* input, not
-# cached). Opus is the default — most jcodemunch users are running an
-# Opus-grade model where savings actually move a budget needle.
+# cached). Opus is the default: most jcodemunch users run an Opus-grade
+# model where savings actually move a budget needle.
+# Rates as of 2026-06-24 (anthropic.com/pricing). Update when the public
+# price list changes; the test suite pins these to that dated source.
 _MODEL_PRICES_USD_PER_MTOK: dict[str, float] = {
-    "sonnet": 3.0,    # Claude Sonnet 4.x
-    "opus":   15.0,   # Claude Opus 4.x
-    "haiku":  0.80,   # Claude Haiku 4.x
+    "fable":  10.0,   # Claude Fable 5 ($10/MTok input)
+    "opus":   5.0,    # Claude Opus 4.8 / 4.7 / 4.6 ($5/MTok input; retired 4.0/4.1 were $15)
+    "sonnet": 3.0,    # Claude Sonnet 5 / 4.6 ($3/MTok input)
+    "haiku":  1.0,    # Claude Haiku 4.5 ($1/MTok input)
 }
 
 _DEFAULT_MODEL = "opus"
@@ -308,7 +311,7 @@ def render_text(agg: dict, *, days: int, model: str, primary_only: bool = False)
     out.write(f"  Saved at {model.title()} pricing (${rate:.2f}/MTok input):  ${primary_dollars:,.2f}\n")
 
     if not primary_only:
-        for other in ("sonnet", "opus", "haiku"):
+        for other in ("fable", "opus", "sonnet", "haiku"):
             if other == model.lower():
                 continue
             other_rate = _MODEL_PRICES_USD_PER_MTOK[other]

@@ -2,6 +2,33 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.130] - 2026-07-16 - receipt price table corrected to current Opus pricing (+ Fable 5)
+
+The `receipt` CLI's model price table carried a stale Opus input rate of
+$15/MTok (the retired Opus 4.0/4.1 price). Current Opus (4.8/4.7/4.6) is
+$5/MTok, so `receipt --model opus` overstated dollar savings roughly 3x.
+
+### Fixed
+- `cli/receipt.py`: `_MODEL_PRICES_USD_PER_MTOK` corrected to the live rates
+  (Opus $5, Sonnet $3, Haiku $1). Comment now cites the dated source
+  (anthropic.com/pricing, 2026-06-24).
+- `tests/test_receipt.py`: the two assertions that pinned the stale rates
+  ($15 Opus, $0.80 Haiku) updated to the correct values.
+
+### Added
+- Claude Fable 5 ($10/MTok) as a selectable `--model` value and an
+  alternate-model comparison line (both derive from the price table, so they
+  pick it up automatically).
+- A dated-source rate pin over the whole table in `tests/test_receipt.py`, so a
+  future price drift fails loudly instead of silently misreporting.
+
+Present-value note: `receipt` is a per-call estimator ("what this session would
+cost at current prices"). It does not feed the public token-savings counter,
+which stores tokens (not dollars) and values them at display time. jcm's own
+`storage/token_tracker.PRICING` was already correct at $5; `receipt` was the
+sole stale spot. No INDEX_VERSION bump, no tool-count change, no wire-shape
+change.
+
 ## [1.108.129] - 2026-07-14 - Keystone-protected structural compression for get_ranked_context
 
 `get_ranked_context` gains an opt-in `compress=True` that fits **more** relevant

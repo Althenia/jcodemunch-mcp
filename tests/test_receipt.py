@@ -175,10 +175,14 @@ class TestDollarSavings:
         assert dollar_savings(1_000_000, "sonnet") == pytest.approx(3.0)
 
     def test_opus_rate(self):
-        assert dollar_savings(1_000_000, "opus") == pytest.approx(15.0)
+        # Opus 4.8 / 4.7 / 4.6 = $5/MTok input (retired 4.0/4.1 were $15).
+        assert dollar_savings(1_000_000, "opus") == pytest.approx(5.0)
 
     def test_haiku_rate(self):
-        assert dollar_savings(1_000_000, "haiku") == pytest.approx(0.80)
+        assert dollar_savings(1_000_000, "haiku") == pytest.approx(1.0)
+
+    def test_fable_rate(self):
+        assert dollar_savings(1_000_000, "fable") == pytest.approx(10.0)
 
     def test_unknown_model_zero(self):
         assert dollar_savings(1_000_000, "made-up") == 0.0
@@ -242,10 +246,23 @@ class TestExports:
 
 
 class TestModelPriceTable:
+    # Pinned to anthropic.com/pricing as of 2026-06-24. Update this table AND
+    # the source table in cli/receipt.py together when the price list changes.
+    _EXPECTED_RATES = {
+        "fable": 10.0,
+        "opus": 5.0,
+        "sonnet": 3.0,
+        "haiku": 1.0,
+    }
+
     def test_known_models_present(self):
-        for m in ("sonnet", "opus", "haiku"):
+        for m in ("fable", "sonnet", "opus", "haiku"):
             assert m in _MODEL_PRICES_USD_PER_MTOK
             assert _MODEL_PRICES_USD_PER_MTOK[m] > 0
+
+    def test_rates_match_dated_source(self):
+        for model, rate in self._EXPECTED_RATES.items():
+            assert _MODEL_PRICES_USD_PER_MTOK[model] == pytest.approx(rate)
 
     def test_opus_more_expensive_than_sonnet(self):
         assert _MODEL_PRICES_USD_PER_MTOK["opus"] > _MODEL_PRICES_USD_PER_MTOK["sonnet"]
