@@ -2,32 +2,48 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
-## [1.108.130] - 2026-07-16 - receipt price table corrected to current Opus pricing (+ Fable 5)
+## [1.108.131] - 2026-07-16 - receipt/org-report --model choices derive from the price table (Fable selectable)
 
-The `receipt` CLI's model price table carried a stale Opus input rate of
-$15/MTok (the retired Opus 4.0/4.1 price). Current Opus (4.8/4.7/4.6) is
-$5/MTok, so `receipt --model opus` overstated dollar savings roughly 3x.
+The `receipt` and `org-report` CLI subparsers in `server.py` built their
+`--model` choices from a hardcoded `{sonnet, opus, haiku}` list, independent of
+the price table in `cli/receipt.py`. After v1.108.130 added Fable to the table,
+`receipt --model fable` was still rejected by the CLI dispatcher. Both
+subparsers now derive `choices` from `_MODEL_PRICES_USD_PER_MTOK`, so any priced
+model (including Fable) is selectable and the two can't drift from the rates.
 
 ### Fixed
-- `cli/receipt.py`: `_MODEL_PRICES_USD_PER_MTOK` corrected to the live rates
-  (Opus $5, Sonnet $3, Haiku $1). Comment now cites the dated source
-  (anthropic.com/pricing, 2026-06-24).
-- `tests/test_receipt.py`: the two assertions that pinned the stale rates
-  ($15 Opus, $0.80 Haiku) updated to the correct values.
+- `server.py`: the `receipt` and `org-report` `--model` choices now come from
+  `sorted(cli.receipt._MODEL_PRICES_USD_PER_MTOK)`.
+
+### Added
+- `tests/test_receipt.py`: a parametrized end-to-end test runs the server CLI
+  for every priced model and asserts none is rejected, guarding against a
+  re-hardcoded subset.
+
+No INDEX_VERSION bump, no tool-count change, no wire-shape change.
+
+## [1.108.130] - 2026-07-16 - receipt price table updated to current Anthropic pricing (+ Fable 5)
+
+Updates the `receipt` CLI model input-price table to Anthropic's current
+published rates (Opus $5/MTok, Sonnet $3/MTok, Haiku $1/MTok) and adds Claude
+Fable 5 ($10/MTok). Anthropic has reduced input pricing across the Opus line
+since these models launched, so the price constants now track current pricing.
+
+### Changed
+- `cli/receipt.py`: `_MODEL_PRICES_USD_PER_MTOK` set to the current published
+  rates; comment cites the dated pricing source (anthropic.com/pricing,
+  2026-06-24).
+- `tests/test_receipt.py`: rate assertions updated to the current rates and
+  hardened into a dated-source pin over the whole table.
 
 ### Added
 - Claude Fable 5 ($10/MTok) as a selectable `--model` value and an
-  alternate-model comparison line (both derive from the price table, so they
-  pick it up automatically).
-- A dated-source rate pin over the whole table in `tests/test_receipt.py`, so a
-  future price drift fails loudly instead of silently misreporting.
+  alternate-model comparison line (both derive from the price table).
 
-Present-value note: `receipt` is a per-call estimator ("what this session would
-cost at current prices"). It does not feed the public token-savings counter,
-which stores tokens (not dollars) and values them at display time. jcm's own
-`storage/token_tracker.PRICING` was already correct at $5; `receipt` was the
-sole stale spot. No INDEX_VERSION bump, no tool-count change, no wire-shape
-change.
+`receipt` values your measured token savings at the selected model's current
+rate; the underlying token savings are unchanged. It does not feed the public
+token-savings counter, which stores tokens (not dollars) and values them at
+display time. No INDEX_VERSION bump, no tool-count change, no wire-shape change.
 
 ## [1.108.129] - 2026-07-14 - Keystone-protected structural compression for get_ranked_context
 

@@ -269,3 +269,31 @@ class TestModelPriceTable:
 
     def test_haiku_cheaper_than_sonnet(self):
         assert _MODEL_PRICES_USD_PER_MTOK["haiku"] < _MODEL_PRICES_USD_PER_MTOK["sonnet"]
+
+
+class TestServerReceiptModelChoices:
+    """The `receipt`/`org-report` subparsers in server.py must derive their
+    --model choices from the price table, not hardcode a subset. Guards the
+    v1.108.131 regression where `fable` was in the table but rejected by the
+    CLI dispatcher's stale hardcoded {sonnet,opus,haiku}."""
+
+    @pytest.mark.parametrize("model", sorted(_MODEL_PRICES_USD_PER_MTOK))
+    def test_server_cli_accepts_every_priced_model(self, model: str):
+        import subprocess
+        import sys
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.argv=['jcm','receipt','--model',"
+                f"'{model}','--days','1']; "
+                "from jcodemunch_mcp.server import main; main()",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        combined = r.stdout + r.stderr
+        # argparse exits 2 with "invalid choice" for an unlisted --model.
+        assert "invalid choice" not in combined, f"{model}: {combined}"
+        assert r.returncode != 2, f"{model} exit 2: {combined}"
