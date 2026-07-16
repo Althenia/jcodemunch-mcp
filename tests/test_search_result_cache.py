@@ -139,6 +139,39 @@ class TestSearchCacheIntegration:
         # Second result should have cache_hit flag
         assert result2["_meta"].get("cache_hit") is True
 
+    def test_cache_hit_records_savings_into_meter(self, tmp_path: Path, monkeypatch):
+        """A cache hit re-records the cached per-call savings into the lifetime
+        meter. Without this, every repeat query (identical avoided read) is
+        invisible to the persistent meter + community counter — a systematic
+        undercount on repetitive workloads."""
+        import jcodemunch_mcp.tools.search_symbols as ss
+        repo, storage_path = create_mini_index(tmp_path)
+
+        calls: list = []
+
+        def _spy(tokens_saved, *a, **k):
+            calls.append(tokens_saved)
+            return sum(calls)
+
+        monkeypatch.setattr(ss, "record_savings", _spy)
+
+        r1 = ss.search_symbols(repo=repo, query="my_func", storage_path=storage_path)
+        saved = r1["_meta"].get("tokens_saved", 0)
+        n_after_miss = len(calls)
+
+        r2 = ss.search_symbols(repo=repo, query="my_func", storage_path=storage_path)
+        assert r2["_meta"].get("cache_hit") is True
+
+        if saved:
+            # The hit recorded exactly the cached per-call figure (not zero).
+            assert len(calls) == n_after_miss + 1
+            assert calls[-1] == saved
+            assert r2["_meta"]["total_tokens_saved"] == sum(calls)
+        else:
+            # Degenerate tiny index with no savings: the hit must not
+            # fabricate a recording either.
+            assert len(calls) == n_after_miss
+
     def test_cache_skipped_for_debug(self, tmp_path: Path):
         """search_symbols(debug=True) should NOT populate cache."""
         (

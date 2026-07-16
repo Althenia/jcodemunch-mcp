@@ -2,6 +2,32 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.133] - 2026-07-16 - cache hits count toward the savings meter
+
+`search_symbols` records the tokens it saves into the persistent lifetime meter
+(`_savings.json`) and the community counter on its miss path, but the cache-hit
+path returned early without recording. A repeated query avoids the identical file
+read the first one did, so its savings are just as real; without recording them,
+every cache hit silently undercounted the meter on repetitive workloads. The meter
+was already conservative in every other respect (byte-approximate token estimate,
+each matched file credited once, empty results credited as zero) so this correction
+moves the figure toward its true value and never overstates it.
+
+### Fixed
+- `search_symbols` cache-hit path now re-records the cached per-call `tokens_saved`
+  into the lifetime meter via `record_savings`, refreshing `_meta.total_tokens_saved`
+  on the returned result. The cached `_meta` is a fresh copy per lookup, so the stored
+  figure stays pristine and each hit re-records the same original value. No-op when the
+  cached call saved zero tokens (the hit never fabricates a recording).
+
+### Notes
+- `find_references` and `get_blast_radius` cache paths are unaffected: those tools
+  do not record savings on either path, so their hit/miss accounting stays consistent.
+  Whether those graph tools should record their (real) avoided reads at all is a
+  separate design question, not addressed here.
+- No wire-shape change, no INDEX_VERSION bump. New test in
+  `tests/test_search_result_cache.py`.
+
 ## [1.108.132] - 2026-07-16 - receipt surfaces the lifetime savings meter
 
 `receipt` scans local Claude Code transcripts, which are cleared on reinstall,

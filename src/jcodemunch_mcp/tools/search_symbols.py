@@ -642,6 +642,17 @@ def search_symbols(
             # entry without _meta must not raise KeyError here, because the
             # dispatcher renders any KeyError as a bogus "missing argument".
             _hit_meta = _cached.setdefault("_meta", {})
+            # A repeat query avoids the identical file read the first one did,
+            # so its savings are just as real. Record the cached per-call
+            # figure into the lifetime meter here — without this, every cache
+            # hit silently undercounts the persistent meter + community counter
+            # (the cached _meta is a fresh copy per get(), so the stored figure
+            # stays pristine and each hit re-records the same original value).
+            _hit_tokens = _hit_meta.get("tokens_saved", 0)
+            if _hit_tokens:
+                _hit_meta["total_tokens_saved"] = record_savings(
+                    _hit_tokens, tool_name="search_symbols"
+                )
             _hit_meta["timing_ms"] = round((time.perf_counter() - start) * 1000, 1)
             _hit_meta["cache_hit"] = True
             return _cached
