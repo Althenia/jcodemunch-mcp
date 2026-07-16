@@ -2,6 +2,27 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.132] - 2026-07-16 - receipt surfaces the lifetime savings meter
+
+`receipt` scans local Claude Code transcripts, which are cleared on reinstall,
+so its windowed figure can badly understate a heavy user's real savings. It now
+also reads the persistent per-call meter (`_savings.json` under the index root,
+which survives reinstalls) and reports lifetime tokens saved plus their value at
+the selected model's input rate, alongside the windowed figure.
+
+### Added
+- A "Lifetime savings (jCodeMunch meter)" section in the `receipt` text report
+  and `--export json` output: cumulative tokens saved and their dollar value at
+  the selected model rate. Shown even when the transcript window is empty.
+- `lifetime_meter()` reader (honors `CODE_INDEX_PATH`); returns None when the
+  meter file is absent, unreadable, or empty.
+
+### Changed
+- The empty-window message now explains the window is transcript-scoped and
+  points at the lifetime meter as the durable record.
+
+No INDEX_VERSION bump, no wire-shape change to any MCP tool.
+
 ## [1.108.131] - 2026-07-16 - receipt/org-report --model choices derive from the price table (Fable selectable)
 
 The `receipt` and `org-report` CLI subparsers in `server.py` built their

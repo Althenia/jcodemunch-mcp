@@ -17,6 +17,7 @@ from jcodemunch_mcp.cli.receipt import (
     aggregate,
     dollar_savings,
     iter_calls,
+    lifetime_meter,
     render_csv,
     render_explain,
     render_json,
@@ -269,6 +270,62 @@ class TestModelPriceTable:
 
     def test_haiku_cheaper_than_sonnet(self):
         assert _MODEL_PRICES_USD_PER_MTOK["haiku"] < _MODEL_PRICES_USD_PER_MTOK["sonnet"]
+
+
+class TestLifetimeMeter:
+    def test_reads_savings_file(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text(
+            json.dumps({"total_tokens_saved": 34_317_586_613, "anon_id": "abc"}),
+            encoding="utf-8",
+        )
+        m = lifetime_meter(root=tmp_path)
+        assert m["total_tokens_saved"] == 34_317_586_613
+        assert m["anon_id"] == "abc"
+
+    def test_missing_file_returns_none(self, tmp_path: Path):
+        assert lifetime_meter(root=tmp_path) is None
+
+    def test_zero_returns_none(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text('{"total_tokens_saved": 0}', encoding="utf-8")
+        assert lifetime_meter(root=tmp_path) is None
+
+    def test_corrupt_file_returns_none(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text("not json", encoding="utf-8")
+        assert lifetime_meter(root=tmp_path) is None
+
+    def _agg(self):
+        return aggregate([
+            {"tool": "search_symbols", "result_tokens": 1000, "timestamp": "", "session_file": "x"},
+        ])
+
+    def test_render_text_includes_lifetime_at_input_rate(self):
+        meter = {"total_tokens_saved": 34_317_586_613, "anon_id": "x"}
+        out = render_text(self._agg(), days=0, model="opus", meter=meter)
+        assert "Lifetime savings" in out
+        assert "34,317,586,613" in out
+        # 34.3B tokens x $5/MTok (Opus INPUT) = $171,587.93 — not the $25 output rate.
+        assert "$171,587.93" in out
+
+    def test_render_text_no_meter_omits_lifetime(self):
+        out = render_text(self._agg(), days=0, model="opus", meter=None)
+        assert "Lifetime savings" not in out
+
+    def test_empty_transcripts_still_surfaces_meter(self):
+        meter = {"total_tokens_saved": 34_317_586_613, "anon_id": "x"}
+        out = render_text(aggregate([]), days=30, model="opus", meter=meter)
+        assert "No jcodemunch tool calls found" in out
+        assert "Lifetime savings" in out
+        assert "34,317,586,613" in out
+
+    def test_render_json_includes_lifetime(self):
+        meter = {"total_tokens_saved": 1_000_000, "anon_id": "x"}
+        payload = json.loads(render_json(self._agg(), model="opus", meter=meter))
+        assert payload["lifetime"]["tokens_saved"] == 1_000_000
+        assert payload["lifetime"]["usd"] == pytest.approx(5.0)
+
+    def test_render_json_no_meter_omits_lifetime(self):
+        payload = json.loads(render_json(self._agg(), model="opus", meter=None))
+        assert "lifetime" not in payload
 
 
 class TestServerReceiptModelChoices:
