@@ -17,6 +17,7 @@ from jcodemunch_mcp.cli.receipt import (
     aggregate,
     dollar_savings,
     iter_calls,
+    lifetime_meter,
     render_csv,
     render_explain,
     render_json,
@@ -175,10 +176,14 @@ class TestDollarSavings:
         assert dollar_savings(1_000_000, "sonnet") == pytest.approx(3.0)
 
     def test_opus_rate(self):
-        assert dollar_savings(1_000_000, "opus") == pytest.approx(15.0)
+        # Opus 4.8 / 4.7 / 4.6 = $5/MTok input (retired 4.0/4.1 were $15).
+        assert dollar_savings(1_000_000, "opus") == pytest.approx(5.0)
 
     def test_haiku_rate(self):
-        assert dollar_savings(1_000_000, "haiku") == pytest.approx(0.80)
+        assert dollar_savings(1_000_000, "haiku") == pytest.approx(1.0)
+
+    def test_fable_rate(self):
+        assert dollar_savings(1_000_000, "fable") == pytest.approx(10.0)
 
     def test_unknown_model_zero(self):
         assert dollar_savings(1_000_000, "made-up") == 0.0
@@ -242,13 +247,110 @@ class TestExports:
 
 
 class TestModelPriceTable:
+    # Pinned to anthropic.com/pricing as of 2026-06-24. Update this table AND
+    # the source table in cli/receipt.py together when the price list changes.
+    _EXPECTED_RATES = {
+        "fable": 10.0,
+        "opus": 5.0,
+        "sonnet": 3.0,
+        "haiku": 1.0,
+    }
+
     def test_known_models_present(self):
-        for m in ("sonnet", "opus", "haiku"):
+        for m in ("fable", "sonnet", "opus", "haiku"):
             assert m in _MODEL_PRICES_USD_PER_MTOK
             assert _MODEL_PRICES_USD_PER_MTOK[m] > 0
+
+    def test_rates_match_dated_source(self):
+        for model, rate in self._EXPECTED_RATES.items():
+            assert _MODEL_PRICES_USD_PER_MTOK[model] == pytest.approx(rate)
 
     def test_opus_more_expensive_than_sonnet(self):
         assert _MODEL_PRICES_USD_PER_MTOK["opus"] > _MODEL_PRICES_USD_PER_MTOK["sonnet"]
 
     def test_haiku_cheaper_than_sonnet(self):
         assert _MODEL_PRICES_USD_PER_MTOK["haiku"] < _MODEL_PRICES_USD_PER_MTOK["sonnet"]
+
+
+class TestLifetimeMeter:
+    def test_reads_savings_file(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text(
+            json.dumps({"total_tokens_saved": 34_317_586_613, "anon_id": "abc"}),
+            encoding="utf-8",
+        )
+        m = lifetime_meter(root=tmp_path)
+        assert m["total_tokens_saved"] == 34_317_586_613
+        assert m["anon_id"] == "abc"
+
+    def test_missing_file_returns_none(self, tmp_path: Path):
+        assert lifetime_meter(root=tmp_path) is None
+
+    def test_zero_returns_none(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text('{"total_tokens_saved": 0}', encoding="utf-8")
+        assert lifetime_meter(root=tmp_path) is None
+
+    def test_corrupt_file_returns_none(self, tmp_path: Path):
+        (tmp_path / "_savings.json").write_text("not json", encoding="utf-8")
+        assert lifetime_meter(root=tmp_path) is None
+
+    def _agg(self):
+        return aggregate([
+            {"tool": "search_symbols", "result_tokens": 1000, "timestamp": "", "session_file": "x"},
+        ])
+
+    def test_render_text_includes_lifetime_at_input_rate(self):
+        meter = {"total_tokens_saved": 34_317_586_613, "anon_id": "x"}
+        out = render_text(self._agg(), days=0, model="opus", meter=meter)
+        assert "Lifetime savings" in out
+        assert "34,317,586,613" in out
+        # 34.3B tokens x $5/MTok (Opus INPUT) = $171,587.93 — not the $25 output rate.
+        assert "$171,587.93" in out
+
+    def test_render_text_no_meter_omits_lifetime(self):
+        out = render_text(self._agg(), days=0, model="opus", meter=None)
+        assert "Lifetime savings" not in out
+
+    def test_empty_transcripts_still_surfaces_meter(self):
+        meter = {"total_tokens_saved": 34_317_586_613, "anon_id": "x"}
+        out = render_text(aggregate([]), days=30, model="opus", meter=meter)
+        assert "No jcodemunch tool calls found" in out
+        assert "Lifetime savings" in out
+        assert "34,317,586,613" in out
+
+    def test_render_json_includes_lifetime(self):
+        meter = {"total_tokens_saved": 1_000_000, "anon_id": "x"}
+        payload = json.loads(render_json(self._agg(), model="opus", meter=meter))
+        assert payload["lifetime"]["tokens_saved"] == 1_000_000
+        assert payload["lifetime"]["usd"] == pytest.approx(5.0)
+
+    def test_render_json_no_meter_omits_lifetime(self):
+        payload = json.loads(render_json(self._agg(), model="opus", meter=None))
+        assert "lifetime" not in payload
+
+
+class TestServerReceiptModelChoices:
+    """The `receipt`/`org-report` subparsers in server.py must derive their
+    --model choices from the price table, not hardcode a subset. Guards the
+    v1.108.131 regression where `fable` was in the table but rejected by the
+    CLI dispatcher's stale hardcoded {sonnet,opus,haiku}."""
+
+    @pytest.mark.parametrize("model", sorted(_MODEL_PRICES_USD_PER_MTOK))
+    def test_server_cli_accepts_every_priced_model(self, model: str):
+        import subprocess
+        import sys
+
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys; sys.argv=['jcm','receipt','--model',"
+                f"'{model}','--days','1']; "
+                "from jcodemunch_mcp.server import main; main()",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        combined = r.stdout + r.stderr
+        # argparse exits 2 with "invalid choice" for an unlisted --model.
+        assert "invalid choice" not in combined, f"{model}: {combined}"
+        assert r.returncode != 2, f"{model} exit 2: {combined}"

@@ -7429,6 +7429,11 @@ def main(argv: Optional[list[str]] = None):
         help="Emit the structured {success, repo, message|error} JSON result",
     )
 
+    # --model choices derive from the single receipt price table so the two
+    # CLI subparsers can never drift from the rates (see cli/receipt.py).
+    from .cli.receipt import _MODEL_PRICES_USD_PER_MTOK as _RECEIPT_MODEL_PRICES
+    _receipt_model_choices = sorted(_RECEIPT_MODEL_PRICES)
+
     # --- org-report / org-rollup (team SKU) ---
     org_report_parser = subparsers.add_parser(
         "org-report",
@@ -7437,7 +7442,7 @@ def main(argv: Optional[list[str]] = None):
     org_report_parser.add_argument("--org", help="Org identifier (overrides JCODEMUNCH_ORG_ID)")
     org_report_parser.add_argument("--seat", help="Seat identifier (default: JCODEMUNCH_CLIENT_ID or hostname)")
     org_report_parser.add_argument("--endpoint", help="Org host URL to POST to (overrides JCODEMUNCH_ORG_ENDPOINT); omit to record locally")
-    org_report_parser.add_argument("--model", default="opus", choices=["sonnet", "opus", "haiku"], help="Rate for the $ figure")
+    org_report_parser.add_argument("--model", default="opus", choices=_receipt_model_choices, help="Rate for the $ figure")
     org_report_parser.add_argument("--json", action="store_true", help="Emit JSON")
 
     org_rollup_parser = subparsers.add_parser(
@@ -7986,7 +7991,7 @@ def main(argv: Optional[list[str]] = None):
     )
     receipt_parser.add_argument("--days", type=int, default=30,
         help="Window size in days (default 30; use 0 for all-time).")
-    receipt_parser.add_argument("--model", choices=["sonnet", "opus", "haiku"], default="opus",
+    receipt_parser.add_argument("--model", choices=_receipt_model_choices, default="opus",
         help="Model rate to apply for the dollar conversion (default opus).")
     receipt_parser.add_argument("--export", metavar="FILE.csv|FILE.json", default=None,
         help="Write raw per-tool data to a file instead of the human report.")

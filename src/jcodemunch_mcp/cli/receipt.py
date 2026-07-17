@@ -19,6 +19,7 @@ import csv
 import datetime as _dt
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, Optional
@@ -98,12 +99,15 @@ _DEFAULT_MULTIPLIER = 8.0
 # typically 10% of normal input pricing for Anthropic models, but we use
 # normal input pricing here because savings are computed against a
 # counterfactual (naive Read+Grep would have been *fresh* input, not
-# cached). Opus is the default — most jcodemunch users are running an
-# Opus-grade model where savings actually move a budget needle.
+# cached). Opus is the default: most jcodemunch users run an Opus-grade
+# model where savings actually move a budget needle.
+# Rates as of 2026-06-24 (anthropic.com/pricing). Update when the public
+# price list changes; the test suite pins these to that dated source.
 _MODEL_PRICES_USD_PER_MTOK: dict[str, float] = {
-    "sonnet": 3.0,    # Claude Sonnet 4.x
-    "opus":   15.0,   # Claude Opus 4.x
-    "haiku":  0.80,   # Claude Haiku 4.x
+    "fable":  10.0,   # Claude Fable 5 ($10/MTok input)
+    "opus":   5.0,    # Claude Opus 4.8 / 4.7 / 4.6 ($5/MTok input; retired 4.0/4.1 were $15)
+    "sonnet": 3.0,    # Claude Sonnet 5 / 4.6 ($3/MTok input)
+    "haiku":  1.0,    # Claude Haiku 4.5 ($1/MTok input)
 }
 
 _DEFAULT_MODEL = "opus"
@@ -116,6 +120,33 @@ _BYTES_PER_TOKEN = 4
 
 def _projects_root() -> Path:
     return Path.home() / ".claude" / "projects"
+
+
+def _index_root() -> Path:
+    """Index storage root (honors CODE_INDEX_PATH, default ~/.code-index)."""
+    env = os.environ.get("CODE_INDEX_PATH")
+    return Path(env) if env else Path.home() / ".code-index"
+
+
+def lifetime_meter(root: Optional[Path] = None) -> Optional[dict]:
+    """Read the persistent per-call savings meter (``_savings.json``).
+
+    This is the cumulative token savings the MCP server records on *every*
+    tool call, stored under the index root. It survives Claude Code
+    reinstalls (it does not live with the transcripts), so it reflects true
+    lifetime usage even when the local transcript history the window ledger
+    scans has been cleared. Byte-approximate estimate, like the community
+    meter it feeds. Returns None when absent/unreadable/empty.
+    """
+    path = (root or _index_root()) / "_savings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    total = data.get("total_tokens_saved")
+    if not isinstance(total, (int, float)) or total <= 0:
+        return None
+    return {"total_tokens_saved": int(total), "anon_id": data.get("anon_id")}
 
 
 def _result_byte_length(content) -> int:
@@ -283,7 +314,29 @@ def dollar_savings(savings_tokens: int, model: str) -> float:
     return (savings_tokens / 1_000_000.0) * rate
 
 
-def render_text(agg: dict, *, days: int, model: str, primary_only: bool = False) -> str:
+def _write_lifetime(out: "io.StringIO", meter: dict, model: str) -> None:
+    """Render the persistent lifetime-meter section."""
+    total = meter["total_tokens_saved"]
+    rate = _MODEL_PRICES_USD_PER_MTOK.get(
+        model.lower(), _MODEL_PRICES_USD_PER_MTOK[_DEFAULT_MODEL]
+    )
+    usd = dollar_savings(total, model)
+    out.write("  Lifetime savings (jCodeMunch meter, all-time):\n")
+    out.write(f"    Tokens saved:                {total:>15,}\n")
+    out.write(f"    Value at {model.title()} pricing (${rate:.2f}/MTok input):  ${usd:,.2f}\n")
+    out.write("    Persistent per-call meter under the index root; survives\n")
+    out.write("    Claude Code reinstalls. The windowed figure above only counts\n")
+    out.write("    tool calls still present in local transcripts.\n\n")
+
+
+def render_text(
+    agg: dict,
+    *,
+    days: int,
+    model: str,
+    primary_only: bool = False,
+    meter: Optional[dict] = None,
+) -> str:
     """Human-readable ledger output."""
     out = io.StringIO()
     totals = agg["totals"]
@@ -292,9 +345,13 @@ def render_text(agg: dict, *, days: int, model: str, primary_only: bool = False)
     out.write("=" * 56 + "\n\n")
 
     if totals["calls"] == 0:
-        out.write("No jcodemunch tool calls found in ~/.claude/projects/.\n")
-        out.write("If you've been using jcodemunch, check that Claude Code is\n")
-        out.write("writing transcripts to that directory (default behaviour).\n")
+        out.write("No jcodemunch tool calls found in the scanned transcript\n")
+        out.write("window (~/.claude/projects/). Local transcripts are cleared on\n")
+        out.write("reinstall; the lifetime meter below is the durable record.\n\n")
+        if meter:
+            _write_lifetime(out, meter, model)
+        else:
+            out.write("No lifetime meter data yet (index root _savings.json).\n")
         return out.getvalue()
 
     out.write(f"  Tool calls:                    {totals['calls']:>12,}\n")
@@ -308,13 +365,16 @@ def render_text(agg: dict, *, days: int, model: str, primary_only: bool = False)
     out.write(f"  Saved at {model.title()} pricing (${rate:.2f}/MTok input):  ${primary_dollars:,.2f}\n")
 
     if not primary_only:
-        for other in ("sonnet", "opus", "haiku"):
+        for other in ("fable", "opus", "sonnet", "haiku"):
             if other == model.lower():
                 continue
             other_rate = _MODEL_PRICES_USD_PER_MTOK[other]
             other_dollars = dollar_savings(totals["savings_tokens"], other)
             out.write(f"     ... at {other.title()} pricing (${other_rate:.2f}/MTok):                 ${other_dollars:,.2f}\n")
     out.write("\n")
+
+    if meter:
+        _write_lifetime(out, meter, model)
 
     if per_tool:
         out.write("  Top tools by savings:\n")
@@ -369,13 +429,18 @@ def render_csv(agg: dict) -> str:
     return out.getvalue()
 
 
-def render_json(agg: dict, *, model: str) -> str:
+def render_json(agg: dict, *, model: str, meter: Optional[dict] = None) -> str:
     payload = {
         "totals": agg["totals"],
         "per_tool": agg["per_tool"],
         "model": model,
         "savings_usd": dollar_savings(agg["totals"]["savings_tokens"], model),
     }
+    if meter:
+        payload["lifetime"] = {
+            "tokens_saved": meter["total_tokens_saved"],
+            "usd": dollar_savings(meter["total_tokens_saved"], model),
+        }
     return json.dumps(payload, indent=2)
 
 
@@ -423,12 +488,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=args.days)
 
     agg = aggregate(iter_calls(root, since=since))
+    meter = lifetime_meter()
 
     if args.export:
         target = Path(args.export)
         ext = target.suffix.lower()
         if ext == ".json":
-            target.write_text(render_json(agg, model=args.model), encoding="utf-8")
+            target.write_text(render_json(agg, model=args.model, meter=meter), encoding="utf-8")
         elif ext == ".csv":
             target.write_text(render_csv(agg), encoding="utf-8")
         else:
@@ -440,7 +506,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"wrote {target}")
         return 0
 
-    sys.stdout.write(render_text(agg, days=args.days, model=args.model))
+    sys.stdout.write(render_text(agg, days=args.days, model=args.model, meter=meter))
     return 0
 
 

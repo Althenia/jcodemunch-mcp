@@ -2,6 +2,96 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.133] - 2026-07-16 - cache hits count toward the savings meter
+
+`search_symbols` records the tokens it saves into the persistent lifetime meter
+(`_savings.json`) and the community counter on its miss path, but the cache-hit
+path returned early without recording. A repeated query avoids the identical file
+read the first one did, so its savings are just as real; without recording them,
+every cache hit silently undercounted the meter on repetitive workloads. The meter
+was already conservative in every other respect (byte-approximate token estimate,
+each matched file credited once, empty results credited as zero) so this correction
+moves the figure toward its true value and never overstates it.
+
+### Fixed
+- `search_symbols` cache-hit path now re-records the cached per-call `tokens_saved`
+  into the lifetime meter via `record_savings`, refreshing `_meta.total_tokens_saved`
+  on the returned result. The cached `_meta` is a fresh copy per lookup, so the stored
+  figure stays pristine and each hit re-records the same original value. No-op when the
+  cached call saved zero tokens (the hit never fabricates a recording).
+
+### Notes
+- `find_references` and `get_blast_radius` cache paths are unaffected: those tools
+  do not record savings on either path, so their hit/miss accounting stays consistent.
+  Whether those graph tools should record their (real) avoided reads at all is a
+  separate design question, not addressed here.
+- No wire-shape change, no INDEX_VERSION bump. New test in
+  `tests/test_search_result_cache.py`.
+
+## [1.108.132] - 2026-07-16 - receipt surfaces the lifetime savings meter
+
+`receipt` scans local Claude Code transcripts, which are cleared on reinstall,
+so its windowed figure can badly understate a heavy user's real savings. It now
+also reads the persistent per-call meter (`_savings.json` under the index root,
+which survives reinstalls) and reports lifetime tokens saved plus their value at
+the selected model's input rate, alongside the windowed figure.
+
+### Added
+- A "Lifetime savings (jCodeMunch meter)" section in the `receipt` text report
+  and `--export json` output: cumulative tokens saved and their dollar value at
+  the selected model rate. Shown even when the transcript window is empty.
+- `lifetime_meter()` reader (honors `CODE_INDEX_PATH`); returns None when the
+  meter file is absent, unreadable, or empty.
+
+### Changed
+- The empty-window message now explains the window is transcript-scoped and
+  points at the lifetime meter as the durable record.
+
+No INDEX_VERSION bump, no wire-shape change to any MCP tool.
+
+## [1.108.131] - 2026-07-16 - receipt/org-report --model choices derive from the price table (Fable selectable)
+
+The `receipt` and `org-report` CLI subparsers in `server.py` built their
+`--model` choices from a hardcoded `{sonnet, opus, haiku}` list, independent of
+the price table in `cli/receipt.py`. After v1.108.130 added Fable to the table,
+`receipt --model fable` was still rejected by the CLI dispatcher. Both
+subparsers now derive `choices` from `_MODEL_PRICES_USD_PER_MTOK`, so any priced
+model (including Fable) is selectable and the two can't drift from the rates.
+
+### Fixed
+- `server.py`: the `receipt` and `org-report` `--model` choices now come from
+  `sorted(cli.receipt._MODEL_PRICES_USD_PER_MTOK)`.
+
+### Added
+- `tests/test_receipt.py`: a parametrized end-to-end test runs the server CLI
+  for every priced model and asserts none is rejected, guarding against a
+  re-hardcoded subset.
+
+No INDEX_VERSION bump, no tool-count change, no wire-shape change.
+
+## [1.108.130] - 2026-07-16 - receipt price table updated to current Anthropic pricing (+ Fable 5)
+
+Updates the `receipt` CLI model input-price table to Anthropic's current
+published rates (Opus $5/MTok, Sonnet $3/MTok, Haiku $1/MTok) and adds Claude
+Fable 5 ($10/MTok). Anthropic has reduced input pricing across the Opus line
+since these models launched, so the price constants now track current pricing.
+
+### Changed
+- `cli/receipt.py`: `_MODEL_PRICES_USD_PER_MTOK` set to the current published
+  rates; comment cites the dated pricing source (anthropic.com/pricing,
+  2026-06-24).
+- `tests/test_receipt.py`: rate assertions updated to the current rates and
+  hardened into a dated-source pin over the whole table.
+
+### Added
+- Claude Fable 5 ($10/MTok) as a selectable `--model` value and an
+  alternate-model comparison line (both derive from the price table).
+
+`receipt` values your measured token savings at the selected model's current
+rate; the underlying token savings are unchanged. It does not feed the public
+token-savings counter, which stores tokens (not dollars) and values them at
+display time. No INDEX_VERSION bump, no tool-count change, no wire-shape change.
+
 ## [1.108.129] - 2026-07-14 - Keystone-protected structural compression for get_ranked_context
 
 `get_ranked_context` gains an opt-in `compress=True` that fits **more** relevant
