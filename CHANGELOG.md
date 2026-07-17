@@ -2,6 +2,71 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.136] - 2026-07-17 - the savings meter records a per-day rollup
+
+The lifetime meter (`_savings.json`, written on every tool call) is the
+authoritative record of what each call actually avoided, but it stored only one
+number — so any windowed view ("today", "this month") had to fall back to
+scanning local transcripts, which miss cleared history and model savings with
+deliberately conservative multipliers. On a heavy install the gap is not subtle:
+the transcript scan could prove ~2.2M tokens all-time while the meter had
+recorded 34.3B — four orders of magnitude. A dashboard drawing windows from
+transcripts next to a lifetime tile from the meter showed \$7.73 "this month"
+beside \$171K all-time, which reads as a broken product rather than two sources.
+
+The flush now also credits each batch to a per-local-day bucket in a `daily` map
+alongside `total_tokens_saved`. Same file, same read-modify-write chokepoint, so
+multiple server processes keep accumulating correctly; capped at 750 days so the
+file stays a few KB. Flush batches are small, so crediting a batch to its flush
+day mis-dates at most one batch across midnight. History accrues from the first
+flush under this version forward — the single lifetime total can't be
+back-distributed into days it never recorded.
+
+New `tests/test_v1_108_136.py` (6). NO INDEX_VERSION / tool-count / wire change;
+the file was already disclosed in the README's background-behavior section.
+
+## [1.108.135] - 2026-07-17 - `receipt --rates` publishes the model price table
+
+The savings model values tokens at a model's input rate, and the rate table lived
+only inside `receipt`. Any consumer pricing its own token counts had to keep a
+copy — and a copy drifts silently: the jMunch Console's duplicate sat at the
+retired \$15 Opus rate long after this table moved to \$5, so its two dollar
+figures disagreed by 3x with nothing to catch it.
+
+`receipt --rates` prints the table as JSON (`rates_usd_per_mtok` + `default_model`)
+and exits. It scans no transcripts, so a consumer can read it cheaply and offer
+every model this table prices — including any model added later — without a code
+change on its side. `--model`'s choices already derive from the same table
+(1.108.131), so the CLI and its published rates cannot disagree.
+
++3 tests in `tests/test_v1_108_134.py`. NO INDEX_VERSION / tool-count / wire change.
+
+## [1.108.134] - 2026-07-17 - `receipt` gains calendar windows and a per-day series
+
+`receipt --days N` is a rolling window measured back from now, so it can express
+"the last 24 hours" but not "today", and "yesterday" not at all. Two additions:
+
+- **`--since` / `--until`** bound the window explicitly. A bare date (`2026-07-16`)
+  means local midnight — "yesterday" means yesterday where the person is sitting,
+  not in UTC — and a full ISO datetime works too. `--until` is **exclusive**, so
+  two adjacent calendar windows can never both claim a call that lands on the
+  boundary. `--days` still applies when neither is given, so existing callers are
+  unaffected.
+- **`--by-day`** adds a `by_day` series to the JSON export: one row per calendar
+  day with any calls, carrying calls/actual/baseline/savings plus the dollar value
+  at the selected model's rate. `iter_calls` already yielded a per-call timestamp
+  and `aggregate` discarded it; the new `aggregate_by_day` keeps it. The series
+  sums to the window total by construction, so a chart drawn from it always
+  reconciles with the headline figure beside it — and a caller wanting several
+  ranges can slice one scan instead of paying one scan per range.
+
+The JSON export also gains a `window` block recording the bounds it actually used.
+Both new flags are additive: without them the output is unchanged. The `server.py`
+CLI dispatcher (which re-declares the receipt flags) forwards them too — the same
+duplicate-parser surface that stranded `--model fable` in 1.108.131.
+
+New `tests/test_v1_108_134.py` (16). NO INDEX_VERSION / tool-count / wire change.
+
 ## [1.108.133] - 2026-07-16 - cache hits count toward the savings meter
 
 `search_symbols` records the tokens it saves into the persistent lifetime meter

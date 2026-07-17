@@ -45,6 +45,11 @@ from .. import config as _config
 logger = logging.getLogger(__name__)
 
 _SAVINGS_FILE = "_savings.json"
+
+# Days of per-day savings history kept in _savings.json's "daily" map. Two years
+# covers every window a dashboard offers ("this year", year-over-year) while
+# keeping the file a few KB.
+_DAILY_MAX_DAYS = 750
 _SESSION_STATS_FILE = "session_stats.json"
 _PULSE_FILE = "_pulse.json"
 _PERF_DB_FILE = "telemetry.db"
@@ -480,6 +485,24 @@ class _State:
         else:
             data["anon_id"] = self._anon_id
         data["total_tokens_saved"] = data.get("total_tokens_saved", 0) + self._unflushed
+        # Daily rollup alongside the lifetime total, so windowed views ("today",
+        # "this month") can come from THIS meter — the authoritative record —
+        # instead of transcript scans, which miss cleared history and model
+        # savings conservatively (observed 4 orders of magnitude under the
+        # meter on a heavy install). Flush batches are small (_FLUSH_INTERVAL
+        # calls), so crediting the whole batch to the flush day mis-dates at
+        # most one batch across midnight. Local date: "today" means today
+        # where the user sits. Capped so the file stays small.
+        if self._unflushed:
+            daily = data.get("daily")
+            if not isinstance(daily, dict):
+                daily = {}
+            day = datetime.now().date().isoformat()
+            daily[day] = daily.get(day, 0) + self._unflushed
+            if len(daily) > _DAILY_MAX_DAYS:
+                for stale in sorted(daily)[: len(daily) - _DAILY_MAX_DAYS]:
+                    del daily[stale]
+            data["daily"] = daily
         if self._encoding_unflushed:
             data["total_encoding_tokens_saved"] = (
                 data.get("total_encoding_tokens_saved", 0) + self._encoding_unflushed

@@ -7990,13 +7990,22 @@ def main(argv: Optional[list[str]] = None):
         help="Token-economy ledger: parse Claude transcripts, show modeled tokens-saved + dollar value",
     )
     receipt_parser.add_argument("--days", type=int, default=30,
-        help="Window size in days (default 30; use 0 for all-time).")
+        help="Rolling window size in days back from now (default 30; 0 = all-time). "
+             "Ignored when --since/--until is given.")
+    receipt_parser.add_argument("--since", default=None, metavar="DATE",
+        help="Window start, inclusive (YYYY-MM-DD = local midnight, or an ISO datetime).")
+    receipt_parser.add_argument("--until", default=None, metavar="DATE",
+        help="Window end, exclusive. Pair with --since for calendar windows.")
+    receipt_parser.add_argument("--by-day", action="store_true",
+        help="Include a per-calendar-day series in the JSON export.")
     receipt_parser.add_argument("--model", choices=_receipt_model_choices, default="opus",
         help="Model rate to apply for the dollar conversion (default opus).")
     receipt_parser.add_argument("--export", metavar="FILE.csv|FILE.json", default=None,
         help="Write raw per-tool data to a file instead of the human report.")
     receipt_parser.add_argument("--explain", action="store_true",
         help="Print the per-tool savings multiplier table + methodology, then exit.")
+    receipt_parser.add_argument("--rates", action="store_true",
+        help="Print the model input-price table as JSON, then exit (scans nothing).")
     receipt_parser.add_argument("--projects-root", default=None,
         help="Override Claude Code projects directory (default ~/.claude/projects).")
 
@@ -8688,10 +8697,18 @@ def main(argv: Optional[list[str]] = None):
     if args.command == "receipt":
         from .cli.receipt import main as receipt_main
         argv = ["--days", str(args.days), "--model", args.model]
+        if args.since:
+            argv += ["--since", args.since]
+        if args.until:
+            argv += ["--until", args.until]
+        if args.by_day:
+            argv += ["--by-day"]
         if args.export:
             argv += ["--export", args.export]
         if args.explain:
             argv += ["--explain"]
+        if args.rates:
+            argv += ["--rates"]
         if args.projects_root:
             argv += ["--projects-root", args.projects_root]
         sys.exit(receipt_main(argv))
