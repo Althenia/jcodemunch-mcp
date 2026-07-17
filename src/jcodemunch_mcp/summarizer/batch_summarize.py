@@ -2,8 +2,11 @@
 
 import json
 import logging
+import math
 import os
+import random
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
@@ -71,6 +74,8 @@ def _auto_entry_is_paid_cloud(env_var: str, name: str) -> bool:
 # emit a degradation warning (#323 — thinking models burning the output
 # budget on reasoning tokens return 200 OK with no usable summary text).
 _DEGRADED_FALLBACK_WARN_RATIO = 0.5
+_OPENAI_RATE_LIMIT_RETRIES = 3
+_OPENAI_MAX_RETRY_DELAY_SECONDS = 60.0
 
 
 def _is_localhost_url(url: str) -> bool:
@@ -606,6 +611,45 @@ class OpenAIBatchSummarizer(BaseSummarizer):
                 headers["ChatGPT-Account-Id"] = credential.account_id
             return headers
 
+    def _rate_limit_delay(self, response, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After")
+        delay = None
+        if retry_after is not None:
+            try:
+                parsed = float(retry_after)
+                if math.isfinite(parsed) and parsed >= 0:
+                    delay = parsed
+            except (TypeError, ValueError):
+                pass
+        if delay is None:
+            delay = 2**attempt * random.uniform(0.9, 1.1)
+        return min(max(delay, 0.0), _OPENAI_MAX_RETRY_DELAY_SECONDS)
+
+    def _post_oauth_with_retry(self, url: str, payload: dict):
+        for attempt in range(_OPENAI_RATE_LIMIT_RETRIES + 1):
+            response = self.client.post(
+                url, json=payload, headers=self._oauth_request_headers()
+            )
+            if response.status_code != 429 or attempt == _OPENAI_RATE_LIMIT_RETRIES:
+                return response
+            delay = self._rate_limit_delay(response, attempt)
+            logger.warning(
+                "OpenAI rate limit hit; retrying in %.1fs (attempt %d/%d)",
+                delay,
+                attempt + 1,
+                _OPENAI_RATE_LIMIT_RETRIES,
+            )
+            time.sleep(delay)
+        raise RuntimeError("unreachable")
+
+    def _worker_count(self) -> int:
+        explicit = os.environ.get("OPENAI_CONCURRENCY")
+        if explicit is not None:
+            return int(explicit)
+        if self.oauth_credential is not None:
+            return 1
+        return int(_config.get("summarizer_concurrency", 4))
+
     def summarize_batch(
         self, symbols: list[Symbol], batch_size: int = 10
     ) -> list[Symbol]:
@@ -625,7 +669,7 @@ class OpenAIBatchSummarizer(BaseSummarizer):
         total = len(to_summarize)
         logger.info("AI summarization starting: %d symbols to process (provider=openai model=%s)", total, self.model)
 
-        max_workers = int(os.environ.get("OPENAI_CONCURRENCY", str(_config.get("summarizer_concurrency", 4))))
+        max_workers = self._worker_count()
         batches = [
             to_summarize[i : i + batch_size]
             for i in range(0, len(to_summarize), batch_size)
@@ -762,12 +806,11 @@ class OpenAIBatchSummarizer(BaseSummarizer):
         try:
             path, payload = self._request_spec(prompt)
 
-            headers = self._oauth_request_headers()
-            if headers is None:
+            if self.oauth_credential is None:
                 response = self.client.post(f"{self.api_base}{path}", json=payload)
             else:
-                response = self.client.post(
-                    f"{self.api_base}{path}", json=payload, headers=headers
+                response = self._post_oauth_with_retry(
+                    f"{self.api_base}{path}", payload
                 )
             response.raise_for_status()
 

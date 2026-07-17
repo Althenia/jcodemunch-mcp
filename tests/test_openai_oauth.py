@@ -377,6 +377,274 @@ def test_openai_codex_refreshes_expired_credential_before_request(monkeypatch):
     assert summarizer.oauth_credential is rotated
 
 
+def test_openai_codex_retries_429_then_succeeds():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    request = openai_oauth.httpx.Request("POST", f"{openai_oauth.CODEX_API_BASE}/responses")
+    rate_limited = openai_oauth.httpx.Response(
+        429, headers={"Retry-After": "0"}, request=request
+    )
+    success = MagicMock(status_code=200)
+    success.iter_lines.return_value = [
+        'data: {"type":"response.output_text.delta","delta":"1. Retried."}',
+        "data: [DONE]",
+    ]
+    client = MagicMock()
+    client.post.side_effect = [rate_limited, success]
+
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+    summarizer.client = client
+    symbol = Symbol(
+        id="test::thing",
+        file="test.py",
+        name="thing",
+        qualified_name="thing",
+        kind="function",
+        language="python",
+        signature="def thing():",
+    )
+
+    with patch("time.sleep") as sleep:
+        summarizer.summarize_batch([symbol])
+
+    assert symbol.summary == "Retried."
+    assert client.post.call_count == 2
+    sleep.assert_called_once_with(0.0)
+    assert summarizer._consecutive_failures == 0
+
+
+def test_openai_codex_rechecks_token_before_retry(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    initial = openai_oauth.OpenAIOAuthCredential(
+        access_token="initial-access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    expired = openai_oauth.OpenAIOAuthCredential(
+        access_token="expired-access",
+        refresh_token="refresh",
+        expires_at=0,
+        account_id="acct",
+    )
+    rotated = openai_oauth.OpenAIOAuthCredential(
+        access_token="rotated-access",
+        refresh_token="rotated-refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    monkeypatch.setattr(openai_oauth, "load_credential", lambda: rotated)
+    request = openai_oauth.httpx.Request("POST", f"{openai_oauth.CODEX_API_BASE}/responses")
+    rate_limited = openai_oauth.httpx.Response(
+        429, headers={"Retry-After": "0"}, request=request
+    )
+    success = MagicMock(status_code=200)
+    success.iter_lines.return_value = [
+        'data: {"type":"response.output_text.delta","delta":"1. Rotated."}',
+        "data: [DONE]",
+    ]
+
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=initial)
+    authorization_headers = []
+
+    def post(url, json, headers):
+        authorization_headers.append(headers["Authorization"])
+        if len(authorization_headers) == 1:
+            summarizer.oauth_credential = expired
+            return rate_limited
+        return success
+
+    summarizer.client = MagicMock()
+    summarizer.client.post.side_effect = post
+    symbol = Symbol(
+        id="test::thing",
+        file="test.py",
+        name="thing",
+        qualified_name="thing",
+        kind="function",
+        language="python",
+        signature="def thing():",
+    )
+
+    with patch("time.sleep"):
+        summarizer.summarize_batch([symbol])
+
+    assert authorization_headers == ["Bearer initial-access", "Bearer rotated-access"]
+    assert symbol.summary == "Rotated."
+
+
+def test_openai_codex_stops_after_429_retries():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    request = openai_oauth.httpx.Request("POST", f"{openai_oauth.CODEX_API_BASE}/responses")
+    rate_limited = openai_oauth.httpx.Response(
+        429, headers={"Retry-After": "0"}, request=request
+    )
+    client = MagicMock()
+    client.post.side_effect = [rate_limited] * 4
+
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+    summarizer.client = client
+    symbol = Symbol(
+        id="test::thing",
+        file="test.py",
+        name="thing",
+        qualified_name="thing",
+        kind="function",
+        language="python",
+        signature="def thing():",
+    )
+
+    with patch("time.sleep") as sleep:
+        summarizer.summarize_batch([symbol])
+
+    assert symbol.summary == "def thing():"
+    assert client.post.call_count == 4
+    assert sleep.call_count == 3
+    assert summarizer._consecutive_failures == 1
+
+
+def test_openai_codex_rate_limit_delay():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    summarizer = OpenAIBatchSummarizer()
+    capped = MagicMock(headers={"Retry-After": "120"})
+    exponential = MagicMock(headers={})
+
+    assert summarizer._rate_limit_delay(capped, 0) == 60.0
+    with patch(
+        "jcodemunch_mcp.summarizer.batch_summarize.random.uniform",
+        return_value=1.0,
+    ):
+        assert [summarizer._rate_limit_delay(exponential, attempt) for attempt in range(3)] == [
+            1.0,
+            2.0,
+            4.0,
+        ]
+
+
+@pytest.mark.parametrize("retry_after", ["invalid", "-1", "nan", "inf"])
+def test_openai_codex_invalid_retry_after_uses_backoff(retry_after):
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    summarizer = OpenAIBatchSummarizer()
+    response = MagicMock(headers={"Retry-After": retry_after})
+
+    with patch(
+        "jcodemunch_mcp.summarizer.batch_summarize.random.uniform",
+        return_value=1.0,
+    ):
+        assert summarizer._rate_limit_delay(response, 1) == 2.0
+
+
+def test_openai_codex_defaults_to_one_worker(monkeypatch):
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    monkeypatch.delenv("OPENAI_CONCURRENCY", raising=False)
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+
+    assert summarizer._worker_count() == 1
+
+
+def test_openai_concurrency_override_is_preserved():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    with patch.dict("os.environ", {"OPENAI_CONCURRENCY": "2"}, clear=True), patch.object(
+        OpenAIBatchSummarizer, "_init_client"
+    ):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+        assert summarizer._worker_count() == 2
+
+
+def test_openai_api_key_keeps_configured_workers():
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    with patch.dict("os.environ", {}, clear=True), patch(
+        "jcodemunch_mcp.summarizer.batch_summarize._config.get", return_value=4
+    ):
+        summarizer = OpenAIBatchSummarizer()
+        assert summarizer._worker_count() == 4
+
+
+def test_openai_codex_burst_is_serialized_by_default(monkeypatch):
+    import time
+    from threading import Lock
+
+    from jcodemunch_mcp.summarizer.batch_summarize import OpenAIBatchSummarizer
+
+    monkeypatch.delenv("OPENAI_CONCURRENCY", raising=False)
+    credential = openai_oauth.OpenAIOAuthCredential(
+        access_token="access",
+        refresh_token="refresh",
+        expires_at=9999999999,
+        account_id="acct",
+    )
+    with patch.object(OpenAIBatchSummarizer, "_init_client"):
+        summarizer = OpenAIBatchSummarizer(oauth_credential=credential)
+    summarizer.client = object()
+    lock = Lock()
+    active = 0
+    peak = 0
+
+    def run_batch(batch):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        for symbol in batch:
+            symbol.summary = "Done."
+
+    summarizer._run_batch = run_batch
+    symbols = [
+        Symbol(
+            id=f"test::thing_{index}",
+            file="test.py",
+            name=f"thing_{index}",
+            qualified_name=f"thing_{index}",
+            kind="function",
+            language="python",
+            signature=f"def thing_{index}():",
+        )
+        for index in range(8)
+    ]
+
+    summarizer.summarize_batch(symbols, batch_size=1)
+
+    assert peak == 1
+
+
 def test_openai_provider_preserves_api_key_fallback_when_keyring_is_unavailable(monkeypatch):
     from jcodemunch_mcp.summarizer.batch_summarize import _create_summarizer
 
