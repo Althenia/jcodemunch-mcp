@@ -2,6 +2,24 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.143] - 2026-07-18 - UNDER_THE_HOOD.md: the technical manual
+
+### Added
+- **`UNDER_THE_HOOD.md` — a workshop-manual counterpart to USER_GUIDE.md.**
+  Six chapters on the machinery an advanced developer can exploit but the
+  owner's manual doesn't cover: the retrieval-verdict / confidence /
+  freshness honesty signals; ranking internals (channel fusion, exact-name
+  pinning, PageRank, learned per-repo weights, the regret loop); the
+  declared-vs-measured provenance contract and the gold corpus behind it;
+  the token meter's every-error-points-down design; tool tiers and the
+  CI-enforced schema token budget; and the imported-never-executed
+  evidence rule (`import-scip` / `import-trace`). Includes a chapter map
+  ("spine") positioning the existing deep references (ARCHITECTURE, SPEC,
+  CONFIGURATION, CONTEXT_PROVIDERS, TOKEN_SAVINGS, schemas/) and names the
+  forthcoming chapters. Linked from README's doc table.
+
+Documentation-only release: no behavior changes.
+
 ## [1.108.142] - 2026-07-18 - tool descriptions catch up with the contracts
 
 ### Fixed

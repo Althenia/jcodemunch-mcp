@@ -85,6 +85,7 @@ Index once. Query cheaply. Keep moving.
 |-----|----------------|
 | [QUICKSTART.md](QUICKSTART.md) | Zero-to-indexed in three steps |
 | [USER_GUIDE.md](USER_GUIDE.md) | Full tool reference, workflows, and best practices |
+| [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) | **The technical manual** — verdicts, ranking internals, provenance contracts, the meter's design, evidence imports. For developers who want the machinery, not just the workflows |
 | [AGENT_HOOKS.md](AGENT_HOOKS.md) | Agent hooks and prompt policies |
 | [CONFIGURATION.md](CONFIGURATION.md) | JSONC config file reference, migration from env vars |
 | [GROQ.md](GROQ.md) | Groq Remote MCP integration, deployment, gcm CLI |
@@ -128,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.143](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.143)** (2026-07-18) — UNDER_THE_HOOD.md: the technical manual
 - **[v1.108.142](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.142)** (2026-07-18) — tool descriptions catch up with the contracts
 - **[v1.108.141](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.141)** (2026-07-18) — gold corpus v2: TypeScript and Go join the measurement
-- **[v1.108.140](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.140)** (2026-07-18) — the first gold corpus: channel accuracy, measured
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
