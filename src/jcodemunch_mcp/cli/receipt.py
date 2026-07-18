@@ -443,6 +443,9 @@ def render_text(
     out.write("  Methodology: per-tool savings multipliers calibrated against\n")
     out.write("  published RAG benchmarks (Express/FastAPI/Gin). Run with --explain\n")
     out.write("  to see the full multiplier table; --export csv|json for raw data.\n")
+    out.write("  Provenance: basis = measured — committed, drift-guarded artifacts\n")
+    out.write("  at benchmarks/provenance/measured.json (tiktoken methodology +\n")
+    out.write("  CI-gated replay retrieval golden). --export json carries the block.\n")
 
     return out.getvalue()
 
@@ -507,11 +510,14 @@ def render_json(
     by_day: Optional[list[dict]] = None,
     window: Optional[dict] = None,
 ) -> str:
+    from ..retrieval.provenance import measured_provenance
+
     payload = {
         "totals": agg["totals"],
         "per_tool": agg["per_tool"],
         "model": model,
         "savings_usd": dollar_savings(agg["totals"]["savings_tokens"], model),
+        "provenance": measured_provenance(),
     }
     if window:
         payload["window"] = window

@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.139](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.139)** (2026-07-18) — measured provenance rides the reporting surfaces
 - **[v1.108.138](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.138)** (2026-07-18) — confidence provenance: every number states its basis
 - **[v1.108.137](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.137)** (2026-07-18) — source-shaped exact seeding in ranked context
-- **[v1.108.136](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.136)** (2026-07-17) — the savings meter records a per-day rollup
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)

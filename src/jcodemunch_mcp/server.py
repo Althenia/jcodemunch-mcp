@@ -5645,9 +5645,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 result = await _apply_model_announcement(model)
         elif name == "jcodemunch_guide":
             from . import __version__ as _ver
+            from .retrieval.provenance import measured_provenance as _measured_provenance
             result = {
                 "version": _ver,
                 "content": _generate_claude_md_snippet(missing_only=False),
+                # Self-attesting contract: the measured artifacts behind the
+                # suite's savings/quality claims, plus the declared-vs-measured
+                # rule. Rides the guide (on-demand) — never the hot path.
+                "provenance": _measured_provenance(),
             }
         else:
             result = {"error": f"Unknown tool: {name}"}

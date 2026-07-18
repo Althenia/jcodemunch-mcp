@@ -95,6 +95,21 @@ _CONTRACT_NOTE = (
 )
 
 
+def measured_provenance() -> dict:
+    """The measured-artifact block for reporting surfaces (receipt,
+    get_session_stats, jcodemunch_guide).
+
+    Returns fresh copies of the ``MEASURED`` entries plus the contract note,
+    so callers can attach it to a response without aliasing module state.
+    Deliberately kept OFF the hot retrieval path — provenance rides the
+    surfaces where a human reads the numbers, not every query.
+    """
+    return {
+        **{key: dict(entry) for key, entry in MEASURED.items()},
+        "contract": _CONTRACT_NOTE,
+    }
+
+
 def channel_provenance(prefix: str) -> dict:
     """Compact per-channel basis block for a tool's ``_meta``.
 

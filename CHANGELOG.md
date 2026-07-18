@@ -2,6 +2,29 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.139] - 2026-07-18 - measured provenance rides the reporting surfaces
+
+### Added
+- **The measured-artifact block now attaches where the numbers get read.**
+  New `measured_provenance()` (`retrieval/provenance.py`) returns the
+  committed measurement artifacts behind the suite's savings and quality
+  claims (the tiktoken token-reduction methodology + the CI-gated replay
+  retrieval golden, both drift-guarded against
+  `benchmarks/provenance/measured.json`), and it now rides:
+  - `receipt --export json` — a `provenance` block beside the totals, so an
+    exported ledger carries its own receipts;
+  - `receipt` text output — the methodology footer cites the committed
+    artifact path;
+  - `get_session_stats` — a `savings_provenance` block beside the savings
+    figures;
+  - `jcodemunch_guide` — a `provenance` key beside the policy snippet, so an
+    agent reading the guide sees the declared-vs-measured contract up front.
+
+  Deliberately kept OFF the hot retrieval path: provenance rides the
+  reporting surfaces a human or auditor reads, not every query. Suite
+  parity note: the same reporting-surface shape belongs on jdocmunch /
+  jdatamunch session stats in their next releases.
+
 ## [1.108.138] - 2026-07-18 - confidence provenance: every number states its basis
 
 ### Added
