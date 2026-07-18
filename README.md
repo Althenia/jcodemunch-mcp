@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.138](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.138)** (2026-07-18) — confidence provenance: every number states its basis
 - **[v1.108.137](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.137)** (2026-07-18) — source-shaped exact seeding in ranked context
 - **[v1.108.136](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.136)** (2026-07-17) — the savings meter records a per-day rollup
-- **[v1.108.135](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.135)** (2026-07-17) — `receipt --rates` publishes the model price table
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -324,6 +324,10 @@ Every retrieval result now ships with three machine-readable health signals so a
 The `tune_weights` tool reads the persistent ranking ledger and learns per-repo retrieval weights (saved to `~/.code-index/tuning.jsonc`). `check_embedding_drift` pins a 16-string canary to detect silent provider model changes. `benchmarks/replay/` provides a CI-friendly retrieval-quality regression gate (nDCG/MRR/Recall) that every release runs against.
 
 The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine the same ranking ledger for **retrieval regret** — where retrieval failed and the agent had to re-ask — and return a prioritized, explainable set of *suggested* fixes (a CLAUDE.md routing or glossary line as a unified-diff preview, an index-freshness hint, a stale-config finding, a dry-run weight proposal). It is read-only by design: it suggests a patch and shows you the diff; applying it is your keystroke, never the server's. Requires `perf_telemetry_enabled` (it has a ledger to read only then) and returns an honest hint when off.
+
+### Confidence provenance — every number states its basis
+
+Every confidence constant the suite emits traces to a stated basis: **`measured`** (backed by a committed, reproducible benchmark artifact — `benchmarks/provenance/measured.json`, drift-guarded in CI so the constants and the artifact can never silently diverge) or **`declared`** (an engineering prior, honestly labeled as exactly that). `find_implementations` responses carry the per-channel basis in `_meta.confidence_provenance`, and the response contracts themselves are published as JSON Schemas in [`schemas/`](schemas/) (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so CI pipelines and agents can validate responses mechanically. A prior is never presented as a measurement: a `declared` value graduates to `measured` only when a gold-labeled corpus backs it, and a build that claims otherwise fails.
 
 ### Local-first speed
 

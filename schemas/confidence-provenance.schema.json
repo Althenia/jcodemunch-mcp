@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jcodemunch.com/schemas/confidence-provenance.schema.json",
+  "title": "jCodeMunch confidence provenance",
+  "description": "The _meta.confidence_provenance block: every confidence constant a tool emits states its basis. 'declared' = an engineering prior, honestly labeled; 'measured' = backed by a committed benchmark artifact (benchmarks/provenance/measured.json), drift-guarded in CI. A declared value graduates to measured only when a gold-labeled corpus exists for it — a prior is never presented as a measurement.",
+  "type": "object",
+  "required": ["channels", "contract"],
+  "properties": {
+    "channels": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value", "basis"],
+        "properties": {
+          "value": {"type": "number", "minimum": 0, "maximum": 1},
+          "basis": {"enum": ["declared", "measured"]},
+          "source": {
+            "type": "string",
+            "description": "Repo-relative path of the committed measurement artifact; required in spirit when basis=measured."
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "contract": {"type": "string"}
+  },
+  "additionalProperties": false
+}

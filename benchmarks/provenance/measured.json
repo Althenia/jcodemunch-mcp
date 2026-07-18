@@ -1,0 +1,25 @@
+{
+  "comment": "Committed measurement artifacts backing every basis='measured' entry in src/jcodemunch_mcp/retrieval/provenance.py. tests/test_provenance.py fails if the registry and this file diverge, and if this file diverges from the underlying artifacts it cites. Never hand-edit a number here without re-running the cited benchmark.",
+  "token_reduction": {
+    "average_pct": 99.6,
+    "task_runs": 15,
+    "baseline_tokens": 5122105,
+    "jcodemunch_tokens": 19406,
+    "tokenizer": "cl100k_base",
+    "run_date": "2026-03-28",
+    "methodology": "benchmarks/METHODOLOGY.md",
+    "results": "benchmarks/results.md"
+  },
+  "replay_retrieval_quality": {
+    "fixture": "self_v1_75_0",
+    "k": 10,
+    "queries": 10,
+    "ndcg": 1.0,
+    "mrr": 1.0,
+    "recall": 1.0,
+    "captured_at": "2026-07-06T01:03:32+00:00",
+    "generator_version": "1.108.99",
+    "source": "benchmarks/replay/results/self_v1_75_0-golden.json",
+    "ci_gated": true
+  }
+}

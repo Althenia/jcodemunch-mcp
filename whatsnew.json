@@ -1,6 +1,12 @@
 {
-  "current": "1.108.137",
+  "current": "1.108.138",
   "entries": [
+    {
+      "version": "1.108.138",
+      "date": "2026-07-18",
+      "title": "confidence provenance: every number states its basis",
+      "summary": "- **Confidence provenance registry** (`retrieval/provenance.py`). Every confidence constant the suite emits now traces to a stated basis: `measured` \u2014 backed by a committed, reproducible benchmark artifact (`benchmarks/provenance/measured.json`: the tiktoken token-reduction"
+    },
     {
       "version": "1.108.137",
       "date": "2026-07-18",
@@ -12,12 +18,6 @@
       "date": "2026-07-17",
       "title": "the savings meter records a per-day rollup",
       "summary": "The lifetime meter (`_savings.json`, written on every tool call) is the authoritative record of what each call actually avoided, but it stored only one number \u2014 so any windowed view (\"today\", \"this month\") had to fall back to scanning local transcripts, which miss cleared history and model savings with"
-    },
-    {
-      "version": "1.108.135",
-      "date": "2026-07-17",
-      "title": "`receipt --rates` publishes the model price table",
-      "summary": "The savings model values tokens at a model's input rate, and the rate table lived only inside `receipt`. Any consumer pricing its own token counts had to keep a copy \u2014 and a copy drifts silently: the jMunch Console's duplicate sat at the retired \\$15 Opus rate long after this table moved to \\$5, so its two dollar"
     }
   ]
 }

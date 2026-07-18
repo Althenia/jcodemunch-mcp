@@ -2,6 +2,35 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.138] - 2026-07-18 - confidence provenance: every number states its basis
+
+### Added
+- **Confidence provenance registry** (`retrieval/provenance.py`). Every
+  confidence constant the suite emits now traces to a stated basis:
+  `measured` — backed by a committed, reproducible benchmark artifact
+  (`benchmarks/provenance/measured.json`: the tiktoken token-reduction
+  methodology and the CI-gated replay retrieval-quality golden) — or
+  `declared` — an engineering prior, honestly labeled as exactly that. The
+  contract's load-bearing rule: **a prior is never presented as a
+  measurement.** A `declared` value graduates to `measured` only when a
+  gold-labeled corpus backs it, and `tests/test_provenance.py` fails the
+  build otherwise. Drift guards run in three directions: registry values
+  must equal the live constants in the emitting modules, registry `measured`
+  entries must equal the committed artifact, and the artifact must equal the
+  underlying benchmark results it cites (replay golden, methodology doc) —
+  no number can silently diverge from its receipt.
+- **`find_implementations` responses carry `_meta.confidence_provenance`** —
+  the per-channel basis for its resolution-confidence tiers (LSP/SCIP/AST/
+  duck-typed/decorator), so a caller can see that today's tiers are declared
+  priors, not measurements dressed up as ones.
+- **Published response JSON Schemas** in `schemas/`:
+  `retrieval-verdict.schema.json` (the unified `_meta.verdict` contract),
+  `confidence-provenance.schema.json`, and
+  `ranked-context-response.schema.json` (the full `get_ranked_context` JSON
+  surface, including `match_channel`/`_meta.query_shape` from v1.108.137).
+  CI validates live responses against them; external pipelines and agents
+  can do the same.
+
 ## [1.108.137] - 2026-07-18 - source-shaped exact seeding in ranked context
 
 ### Added

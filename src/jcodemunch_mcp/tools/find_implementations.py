@@ -599,6 +599,8 @@ def find_implementations(
             **cost_avoided(tokens_saved, total_saved),
         },
     }
+    from ..retrieval.provenance import channel_provenance
+    result["_meta"]["confidence_provenance"] = channel_provenance("find_implementations")
     if scip_block is not None:
         result["_meta"]["scip"] = scip_block
     if cross_repo:
