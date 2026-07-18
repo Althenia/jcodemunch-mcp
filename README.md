@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.140](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.140)** (2026-07-18) — the first gold corpus: channel accuracy, measured
 - **[v1.108.139](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.139)** (2026-07-18) — measured provenance rides the reporting surfaces
 - **[v1.108.138](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.138)** (2026-07-18) — confidence provenance: every number states its basis
-- **[v1.108.137](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.137)** (2026-07-18) — source-shaped exact seeding in ranked context
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -328,6 +328,8 @@ The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine
 ### Confidence provenance — every number states its basis
 
 Every confidence constant the suite emits traces to a stated basis: **`measured`** (backed by a committed, reproducible benchmark artifact — `benchmarks/provenance/measured.json`, drift-guarded in CI so the constants and the artifact can never silently diverge) or **`declared`** (an engineering prior, honestly labeled as exactly that). `find_implementations` responses carry the per-channel basis in `_meta.confidence_provenance`, and the response contracts themselves are published as JSON Schemas in [`schemas/`](schemas/) (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so CI pipelines and agents can validate responses mechanically. A prior is never presented as a measurement: a `declared` value graduates to `measured` only when a gold-labeled corpus backs it, and a build that claims otherwise fails.
+
+The first gold corpus is in: `benchmarks/goldset/` is an authored implementation-pattern corpus (declared subclasses, duck-typed conformers, decorator-registered handlers — plus deliberate false-positive traps: module-homonym base classes, same-name-different-domain methods, substring decorator matches), fully labeled with per-pair rationale. `benchmarks/goldset/measure.py` re-runs `find_implementations` against it and CI asserts the committed results (`benchmarks/provenance/channel_accuracy.json`) match the live measurement — the numbers literally cannot drift from the reproducible run. Each resolution channel's registry entry now carries its `measured_ref` (precision/recall on the corpus) beside the declared ranking prior, and `_meta.confidence_provenance` surfaces both. Scope is stated in the artifact: authored-pattern discrimination, not in-the-wild base rates.
 
 ### Local-first speed
 

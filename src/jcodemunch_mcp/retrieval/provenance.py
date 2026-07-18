@@ -23,6 +23,7 @@ BASIS_MEASURED = "measured"
 BASIS_DECLARED = "declared"
 
 MEASURED_ARTIFACT = "benchmarks/provenance/measured.json"
+CHANNEL_ACCURACY_ARTIFACT = "benchmarks/provenance/channel_accuracy.json"
 
 # ── Declared constants (engineering priors) ─────────────────────────────────
 # tests/test_provenance.py asserts each `value` equals the live constant in
@@ -39,20 +40,43 @@ CONFIDENCE_PROVENANCE: dict[str, dict] = {
         "basis": BASIS_DECLARED,
         "note": "compile-time SCIP evidence — compiler-grade channel, prior not yet gold-measured",
     },
+    # The operating constants below stay DECLARED — they are ranking priors,
+    # and recalibrating them to the small-n corpus numbers would jitter
+    # ranking for false precision. Each carries its measured reference
+    # (CHANNEL_ACCURACY_ARTIFACT, re-measured in CI) so callers see both the
+    # prior in force and what the gold corpus actually measured.
     "find_implementations.ast": {
         "value": 0.85,
         "basis": BASIS_DECLARED,
         "note": "AST class-hierarchy channel",
+        "measured_ref": {
+            "precision": 0.833,
+            "recall": 1.0,
+            "corpus": "authored-scenarios-v1",
+            "source": "benchmarks/provenance/channel_accuracy.json",
+        },
     },
     "find_implementations.duck": {
         "value": 0.65,
         "basis": BASIS_DECLARED,
         "note": "duck-typed name-match channel",
+        "measured_ref": {
+            "precision": 0.6,
+            "recall": 1.0,
+            "corpus": "authored-scenarios-v1",
+            "source": "benchmarks/provenance/channel_accuracy.json",
+        },
     },
     "find_implementations.decorator": {
         "value": 0.45,
         "basis": BASIS_DECLARED,
-        "note": "decorator-registered handler channel",
+        "note": "decorator-registered handler channel; prior is more conservative than measured",
+        "measured_ref": {
+            "precision": 0.6,
+            "recall": 1.0,
+            "corpus": "authored-scenarios-v1",
+            "source": "benchmarks/provenance/channel_accuracy.json",
+        },
     },
     "retrieval.negative_evidence_threshold": {
         "value": 0.5,
@@ -87,6 +111,23 @@ MEASURED: dict[str, dict] = {
         "source": MEASURED_ARTIFACT,
         "ci_gated": True,
     },
+    "implementation_channel_accuracy": {
+        "corpus": "authored-scenarios-v1",
+        "language": "python",
+        "channels": {
+            "ast": {"precision": 0.833, "recall": 1.0},
+            "duck": {"precision": 0.6, "recall": 1.0},
+            "decorator": {"precision": 0.6, "recall": 1.0},
+        },
+        "basis": BASIS_MEASURED,
+        "source": CHANNEL_ACCURACY_ARTIFACT,
+        "ci_gated": True,
+        "scope_note": (
+            "authored gold corpus — channel discrimination on known patterns "
+            "and traps, not in-the-wild base rates; n small and disclosed in "
+            "the artifact"
+        ),
+    },
 }
 
 _CONTRACT_NOTE = (
@@ -116,9 +157,12 @@ def channel_provenance(prefix: str) -> dict:
     Returns ``{"channels": {<channel>: {"value", "basis"}}, "contract": ...}``
     for every registry key under ``<prefix>.``.
     """
-    channels = {
-        key.split(".", 1)[1]: {"value": entry["value"], "basis": entry["basis"]}
-        for key, entry in CONFIDENCE_PROVENANCE.items()
-        if key.startswith(prefix + ".")
-    }
+    channels = {}
+    for key, entry in CONFIDENCE_PROVENANCE.items():
+        if not key.startswith(prefix + "."):
+            continue
+        ch = {"value": entry["value"], "basis": entry["basis"]}
+        if "measured_ref" in entry:
+            ch["measured_ref"] = dict(entry["measured_ref"])
+        channels[key.split(".", 1)[1]] = ch
     return {"channels": channels, "contract": _CONTRACT_NOTE}

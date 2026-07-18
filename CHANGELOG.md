@@ -2,6 +2,41 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.140] - 2026-07-18 - the first gold corpus: channel accuracy, measured
+
+### Added
+- **An authored gold corpus for `find_implementations` channel accuracy**
+  (`benchmarks/goldset/`). Every implementation relation — declared
+  subclasses, duck-typed conformers, decorator-registered handlers — and
+  every deliberate false-positive trap (a module-homonym base class, same-
+  name-different-domain methods like electrical/legal `charge`, substring
+  decorator matches like a `/user_created_report` route against a
+  `user_created` event) is labeled in `gold.json` with a per-pair rationale,
+  so ground truth is exact by construction.
+- **A reproducible measurement harness** (`benchmarks/goldset/measure.py`):
+  snapshots the corpus to a temp dir, indexes it, runs
+  `find_implementations` per gold target, joins each surfaced implementation
+  to its label, and writes per-channel precision/recall to
+  `benchmarks/provenance/channel_accuracy.json`. First measured round: AST
+  0.833 precision (the homonym trap), duck 0.6, decorator 0.6 — recall 1.0
+  across all channels. Notably the shipped priors survive contact with
+  measurement: 0.85 declared vs 0.833 measured for AST, 0.65 vs 0.6 for
+  duck, and the 0.45 decorator prior is *more* conservative than measured.
+- **The measurement re-runs in CI** (`tests/test_channel_accuracy.py`): the
+  committed artifact must equal a live re-measurement and the corpus content
+  hash, so the numbers cannot drift from the reproducible run — a corpus or
+  channel change forces a deliberate artifact regeneration.
+- **Registry and responses carry the measured reference.** Each heuristic
+  channel's provenance entry gains `measured_ref` (precision/recall, corpus,
+  artifact path) beside its declared ranking prior, surfaced in
+  `_meta.confidence_provenance`; `MEASURED` gains
+  `implementation_channel_accuracy`. The operating constants deliberately
+  stay `declared` — they are ranking priors, and recalibrating them to a
+  small-n corpus would trade honest stability for false precision; the
+  artifact states its scope (authored-pattern discrimination, not
+  in-the-wild base rates). LSP/SCIP channels carry no `measured_ref` — they
+  are the ground-truth side of the comparison.
+
 ## [1.108.139] - 2026-07-18 - measured provenance rides the reporting surfaces
 
 ### Added

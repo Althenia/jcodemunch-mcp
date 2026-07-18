@@ -1,0 +1,41 @@
+{
+  "corpus_version": "authored-scenarios-v1",
+  "language": "python",
+  "scope": "Authored scenario corpus: measures channel discrimination on known implementation patterns and known false-positive traps (module-homonym bases, same-name-different-domain methods, substring decorator matches). It does NOT estimate in-the-wild base rates; n per channel is small and disclosed.",
+  "targets": [
+    {
+      "target": "payments/base.py::PaymentProvider#class",
+      "description": "Class target: declared subclasses, incl. a module-homonym trap.",
+      "labels": [
+        {"name": "StripeGateway", "file": "payments/stripe_impl.py", "channel": "ast", "true_impl": true, "why": "declared subclass implementing the full protocol"},
+        {"name": "PayPalGateway", "file": "payments/paypal_impl.py", "channel": "ast", "true_impl": true, "why": "declared subclass implementing charge"},
+        {"name": "LegacyBridgeGateway", "file": "payments/legacy.py", "channel": "ast", "true_impl": true, "why": "transitive subclass via StripeGateway"},
+        {"name": "CsvPaymentReport", "file": "reporting/csv_report.py", "channel": "ast", "true_impl": false, "why": "subclasses the unrelated reporting.PaymentProvider homonym — name-collision trap"}
+      ]
+    },
+    {
+      "target": "payments/base.py::PaymentProvider.charge#method",
+      "description": "Method target: subclass overrides plus duck-typed conformers and same-name-different-domain traps.",
+      "labels": [
+        {"name": "charge", "file": "payments/stripe_impl.py", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "charge", "file": "payments/paypal_impl.py", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "charge", "file": "pos/terminal.py", "channel": "duck", "true_impl": true, "why": "CardTerminal charges money with the protocol's signature — duck-typed conformer"},
+        {"name": "charge", "file": "payments/mock_provider.py", "channel": "duck", "true_impl": true, "why": "test double conforming to the protocol without inheritance"},
+        {"name": "charge", "file": "payments/applepay_adapter.py", "channel": "duck", "true_impl": true, "why": "adapter conforming to the protocol without inheritance"},
+        {"name": "charge", "file": "pos/hardware.py", "channel": "duck", "true_impl": false, "why": "BatteryPack.charge is electrical charging — same name, different domain"},
+        {"name": "charge", "file": "pos/legal.py", "channel": "duck", "true_impl": false, "why": "CriminalCase.charge is a legal indictment — same name, different domain"}
+      ]
+    },
+    {
+      "target": "events/protocol.py::user_created#function",
+      "description": "Event-protocol target: decorator-registered handlers plus substring-match traps.",
+      "labels": [
+        {"name": "send_welcome_email", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "provision_workspace", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "audit_log_user", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "show_user_created_report", "file": "events/web.py", "channel": "decorator", "true_impl": false, "why": "@route path merely CONTAINS the event name — substring trap"},
+        {"name": "cleanup_user_created_exports", "file": "events/web.py", "channel": "decorator", "true_impl": false, "why": "@task name merely CONTAINS the event name — substring trap"}
+      ]
+    }
+  ]
+}
