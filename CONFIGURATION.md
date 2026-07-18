@@ -103,11 +103,11 @@ The full list of supported language identifiers matches the values in `LANGUAGE_
 |-----|------|---------|-------------|
 | `disabled_tools` | list | `[]` | Tool names to remove from `list_tools()` schema. Project-level disabling also blocks execution via `call_tool()`. |
 | `descriptions` | dict | `{}` | Override tool and parameter descriptions. See [Descriptions](#descriptions) below. |
-| `tool_profile` | string | `"full"` (existing installs); new installs are initialized to the compact core tier | Which tool tier `list_tools()` exposes: `core`, `standard`, or `full`. `set_tool_tier` switches tiers in-session without editing config; `jcodemunch_guide` is present at every tier. |
+| `tool_profile` | string | `"full"` | Which tool tier `list_tools()` exposes: `core`, `standard`, or `full`. New installs are *initialized* to the compact core tier by `init`/`install` writing this key; the in-code fallback stays `"full"` so existing installs are unaffected. `set_tool_tier` switches tiers in-session without editing config; `jcodemunch_guide` is present at every tier. |
 | `tool_tier_bundles` | dict | `{}` | Override the tool lists per tier (`{"core": [...], "standard": [...]}`). Missing or malformed entries fall back to the built-in tier constants. |
 | `adaptive_tiering` | bool | `false` | Let the server recommend tier switches based on observed usage. Off = tiers only change when explicitly switched. |
 | `allow_disabling_tier_controls` | bool | `false` | By default the tier-control tools can't be removed via `disabled_tools` (a config typo could otherwise strand a session in a tier). Set `true` to allow disabling them anyway. |
-| `compact_schemas` | bool | (tier-dependent) | Emit compacted tool schemas; the compact core tier's full schema payload is held under a CI-enforced 4,000-token ceiling. |
+| `compact_schemas` | bool | `false` | Emit compacted tool schemas (stripped/demoted params). The core tier enables compaction in practice; its full schema payload is held under a CI-enforced 4,000-token ceiling. |
 
 **Example — disable tools you don't use:**
 
