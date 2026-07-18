@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.144](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.144)** (2026-07-18) — deep-doc currency sweep
 - **[v1.108.143](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.143)** (2026-07-18) — UNDER_THE_HOOD.md: the technical manual
 - **[v1.108.142](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.142)** (2026-07-18) — tool descriptions catch up with the contracts
-- **[v1.108.141](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.141)** (2026-07-18) — gold corpus v2: TypeScript and Go join the measurement
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)

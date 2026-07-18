@@ -2,6 +2,39 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.144] - 2026-07-18 - deep-doc currency sweep
+
+### Fixed
+- **ARCHITECTURE, SPEC, USER_GUIDE, CONFIGURATION, CONTEXT_PROVIDERS, and
+  TOKEN_SAVINGS brought current.** The deep references had not caught up
+  with recent subsystems; each gained targeted sections rather than a
+  rewrite:
+  - ARCHITECTURE: retrieval honesty signals (verdict/confidence/freshness),
+    query-shape exact seeding, signal-channel fusion,
+    `find_implementations` channels + the imported-never-generated
+    evidence rule, adaptive tool tiers + schema budget + annotations,
+    gold-corpus and confidence-provenance additions to the proof surface.
+  - SPEC: `_meta` honesty and provenance fields (`negative_evidence`
+    states, `confidence_provenance`, `query_shape`, `savings_provenance`),
+    tool annotations (`readOnlyHint`/`openWorldHint`), exact-seeding
+    semantics, meter conservatism guarantees.
+  - USER_GUIDE: `find_implementations` and `set_tool_tier` added to the
+    tool tables, exact-name pinning tip on `get_ranked_context`, verdict +
+    provenance entries under retrieval health signals, `receipt` CLI in
+    the savings section, UNDER_THE_HOOD in the reference sidebar.
+  - CONFIGURATION: documented `tool_profile`, `tool_tier_bundles`,
+    `adaptive_tiering`, `allow_disabling_tier_controls`,
+    `compact_schemas`, and `allow_paid_summaries`.
+  - CONTEXT_PROVIDERS: built-in provider table expanded from 1 to 9 rows
+    (django, express-family, rails, laravel, nextjs/nuxt, go_routers,
+    decorator_routes, git_blame), descriptions taken from the provider
+    docstrings.
+  - TOKEN_SAVINGS: meter conservatism, tokens-not-currency valuation at
+    display time, the lifetime meter + per-day buckets, and the `receipt`
+    CLI with its `savings_provenance` export.
+
+Documentation-only release: no behavior changes.
+
 ## [1.108.143] - 2026-07-18 - UNDER_THE_HOOD.md: the technical manual
 
 ### Added

@@ -432,6 +432,16 @@ When symbol names are unknown, file and repository outlines support navigation w
 
 `get_symbol_source` supports verification so a client can determine whether retrieved content still matches the indexed version. This helps mitigate stale-index problems in fast-changing repositories.
 
+### Retrieval honesty signals
+
+Retrieval responses carry three independent trust signals (see `retrieval/verdict.py`, `retrieval/confidence.py`, `retrieval/freshness.py`):
+
+* **Verdict** (`negative_evidence`): a four-state contract — `ok`, `low_confidence`, `absent`, `degraded`. `absent` is a positive claim backed by scan counts (the corpus was examined and the answer is not there); `degraded` means the index itself is impaired and silence proves nothing. The distinction prevents agents from hallucinating negatives off empty results.
+* **Calibrated confidence** (`_meta.confidence`): a 0–1 score composed from the top-1 vs top-2 gap, absolute top-1 strength, identity-match presence, and freshness.
+* **Per-symbol freshness**: each result entry is stamped `fresh`, `edited_uncommitted`, or `stale_index` from the index's recorded git HEAD vs the working tree plus per-file mtimes.
+
+The contracts are published as JSON Schemas in `schemas/` (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so clients and CI pipelines can validate responses mechanically. The narrative treatment is [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) Chapter 1.
+
 ---
 
 ## Search and Ranking
@@ -456,6 +466,14 @@ The current ranking model incorporates additional mechanisms, including:
 * bounded heap search for efficient top-k result handling
 * BM25-based symbol ranking
 * centrality-aware ranking using a log-scaled bonus for symbols in frequently imported files as a tiebreaker
+
+### Query-shape exact seeding
+
+`retrieval/query_shape.py` classifies *source-shaped tokens* in queries — qualified names (`a.b`, `A::B`), CamelCase, snake_case, and dunder forms, with filename look-alikes (`server.py`) deliberately excluded. In `get_ranked_context`'s default path, exact symbol-name matches for those tokens are pinned ahead of the lexical ranking, capped at 3 seeds per token and 5 total so pinning cannot crowd out ranked results. The response reports recognition and seeding in `_meta.query_shape`. The fusion path needs no separate seeding: its identity channel already covers exact matches.
+
+### Signal-channel fusion
+
+`retrieval/signal_fusion.py` fuses independent channels — lexical (BM25), structural (graph centrality), identity (exact/qualified-name), and similarity (embeddings, when enabled) — rather than betting on a single scoring model. Fusion weights are loadable per repo, and learned overrides from `tune_weights` apply at query time.
 
 ### Practical interpretation
 
@@ -498,6 +516,12 @@ This operation uses multiple heuristics, including:
 ### `get_class_hierarchy`
 
 This operation traverses inheritance chains upward and downward, including external bases not present in the index when they can be identified structurally.
+
+### `find_implementations` and evidence imports
+
+`find_implementations` resolves concrete implementations through multiple channels with per-channel confidence: compile-time SCIP evidence and LSP dispatch (1.0), AST class hierarchy (0.85), duck-typed name match (0.65), decorator handler (0.45). The scores are declared ranking priors, and each response's `_meta.confidence_provenance` states every channel's basis (`declared` or `measured`) with gold-corpus measured precision/recall where available (see Benchmarking and Proof below).
+
+Evidence stronger than static analysis is **imported, never generated**: `import-scip` ingests compiler-grade SCIP indexes, `import-trace` ingests runtime signal (feeding runtime-coverage and hot-path views). The server never executes repository code — strong evidence enters through files the operator hands it.
 
 ### `get_blast_radius`
 
@@ -567,6 +591,10 @@ The tool surface is best described by capability domain rather than by a fixed c
 * `get_changed_symbols` — git diff to affected symbols mapping
 * `get_symbol_importance` — PageRank centrality ranking
 * `get_symbol_complexity` — cyclomatic/nesting/param metrics
+
+### Adaptive tool tiers, schema budget, and annotations
+
+The tool surface is tiered: new installs default to a compact core tier, with `set_tool_tier` escalating on demand; the self-guide tool (`jcodemunch_guide`) is always present so a one-line CLAUDE.md setup works at any tier. The compact core tier's full schema payload is held under a 4,000-token hard ceiling by a CI test that measures it with a real tokenizer — the enforced remedy is trimming a description, never regenerating the baseline. Every retrieval tool ships MCP `readOnlyHint: true`, and the handful of tools that reach the network or write an index carry `openWorldHint`; both annotations are part of the tested contract, so hosts that gate on them (plan modes, approval UIs) can trust the surface.
 
 ### Batch query support
 
@@ -730,8 +758,14 @@ The benchmark surface has expanded to include:
 * methodology documentation
 * reproducible benchmark materials
 * canonical `tiktoken`-measured results
+* golden retrieval-quality fixtures and a CI regression gate (`benchmarks/replay/`, nDCG/MRR/Recall)
+* an authored gold-labeled implementation-pattern corpus (`benchmarks/goldset/`, Python/TypeScript/Go, seeded with deliberate false-positive traps) whose measurement CI re-runs on every build
 
 This is architecturally important because the system makes concrete efficiency claims. Reproducible benchmarking is therefore part of the product’s proof surface, not just a marketing artifact.
+
+### Confidence provenance
+
+The proof surface is bound to the responses by `retrieval/provenance.py`: every confidence constant carries a basis — `measured` (backed by a committed artifact in `benchmarks/provenance/`, with CI asserting the artifact matches a live re-run, so drift fails the build) or `declared` (an engineering prior, labeled as exactly that). A prior is never presented as a measurement; a `declared` value graduates to `measured` only when the gold corpus backs it, and operating priors change only through deliberate, replay-gated recalibration. Responses surface this via `_meta.confidence_provenance` and the receipt/session-stats `savings_provenance` blocks. Full treatment: [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) Chapter 3.
 
 ---
 

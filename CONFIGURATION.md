@@ -103,6 +103,11 @@ The full list of supported language identifiers matches the values in `LANGUAGE_
 |-----|------|---------|-------------|
 | `disabled_tools` | list | `[]` | Tool names to remove from `list_tools()` schema. Project-level disabling also blocks execution via `call_tool()`. |
 | `descriptions` | dict | `{}` | Override tool and parameter descriptions. See [Descriptions](#descriptions) below. |
+| `tool_profile` | string | `"full"` (existing installs); new installs are initialized to the compact core tier | Which tool tier `list_tools()` exposes: `core`, `standard`, or `full`. `set_tool_tier` switches tiers in-session without editing config; `jcodemunch_guide` is present at every tier. |
+| `tool_tier_bundles` | dict | `{}` | Override the tool lists per tier (`{"core": [...], "standard": [...]}`). Missing or malformed entries fall back to the built-in tier constants. |
+| `adaptive_tiering` | bool | `false` | Let the server recommend tier switches based on observed usage. Off = tiers only change when explicitly switched. |
+| `allow_disabling_tier_controls` | bool | `false` | By default the tier-control tools can't be removed via `disabled_tools` (a config typo could otherwise strand a session in a tier). Set `true` to allow disabling them anyway. |
+| `compact_schemas` | bool | (tier-dependent) | Emit compacted tool schemas; the compact core tier's full schema payload is held under a CI-enforced 4,000-token ceiling. |
 
 **Example — disable tools you don't use:**
 
@@ -217,6 +222,7 @@ The legacy `suppress_meta` per-call parameter still works for backward compatibi
 | `share_savings` | bool | `true` | Send anonymous token savings telemetry to the community counter. |
 | `perf_telemetry_enabled` | bool | `false` | Persist per-tool latency rows + the ranking ledger to `~/.code-index/telemetry.db`. The in-memory latency ring (queryable via `analyze_perf` and `get_session_stats`) is always tracked; this flag only controls durable persistence. |
 | `perf_telemetry_max_rows` | int | `100000` | Rolling cap on persisted perf rows; oldest rows trimmed in 1k-row batches once exceeded. |
+| `allow_paid_summaries` | bool | `false` | Paid-cloud summary providers (Anthropic, Gemini, and similar) are **never auto-selected** from a bare API key in the environment — a stray key must not silently bill you. Naming a provider explicitly via `summarizer_provider` always works; this flag (or `JCODEMUNCH_ALLOW_PAID_SUMMARIES=1`) additionally allows auto-detection to pick paid providers. Free/local endpoints (e.g. a localhost `OPENAI_API_BASE`) auto-detect regardless. |
 
 The perf telemetry sink (`telemetry.db`) is **local-only** — it never leaves the machine and contains no source code, only tool names, durations, query strings, and signal flags. Queryable via the `analyze_perf` tool. The ranking ledger (`ranking_events` table) feeds the `tune_weights` tool, which writes per-repo retrieval-weight overrides to `~/.code-index/tuning.jsonc`.
 

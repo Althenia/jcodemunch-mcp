@@ -24,6 +24,7 @@
   <ul>
     <li><a href="QUICKSTART.md">Quick Start</a></li>
     <li><a href="ARCHITECTURE.md">Architecture</a></li>
+    <li><a href="UNDER_THE_HOOD.md">Under the Hood (technical manual)</a></li>
   </ul>
 </div>
 
@@ -609,7 +610,7 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 |------|--------------|----------------|
 | `get_symbol_source` | Retrieve symbol source: `symbol_id` (single, flat response) or `symbol_ids[]` (batch, `{symbols,errors}`); supports verify and context_lines | `repo`, `symbol_id`, `symbol_ids`, `verify`, `context_lines` |
 | `get_context_bundle` | Symbol + its imports + optional callers in one bundle; supports multi-symbol, Markdown output, and token budgeting (`token_budget`, `budget_strategy`: `most_relevant`/`core_first`/`compact`, `include_budget_report`) | `repo`, `symbol_id`, `symbol_ids`, `include_callers`, `output_format`, `token_budget`, `budget_strategy`, `include_budget_report` |
-| `get_ranked_context` | Query-driven token-budgeted context assembler — returns the best-fit symbols for a task, ranked by relevance + centrality and greedily packed to fit the budget | `repo`, `query`, `token_budget`, `strategy`, `include_kinds`, `scope` |
+| `get_ranked_context` | Query-driven token-budgeted context assembler — returns the best-fit symbols for a task, ranked by relevance + centrality and greedily packed to fit the budget. Exact symbol names in the query (qualified, CamelCase, snake_case) are pinned ahead of the ranking, so include identifiers verbatim when you know them; `_meta.query_shape` reports what was recognized | `repo`, `query`, `token_budget`, `strategy`, `include_kinds`, `scope` |
 | `get_file_content` | Read cached file content, optionally sliced to a line range | `repo`, `file_path`, `start_line`, `end_line` |
 
 ### Search
@@ -639,6 +640,7 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 | `find_dead_code` | Find symbols and files unreachable from any entry point via the import graph; entry points auto-detected (main, __init__, CLI decorators, etc.) | `repo`, `granularity`, `min_confidence`, `include_tests`, `entry_point_patterns` |
 | `get_changed_symbols` | Map a git diff to affected symbols; detects added/modified/removed/renamed symbols between two commits; optionally includes blast radius per changed symbol | `repo`, `since_sha`, `until_sha`, `include_blast_radius`, `max_blast_depth` |
 | `get_class_hierarchy` | Full inheritance chain (ancestors + descendants) across Python, TS, Java, C#, and more | `repo`, `class_name` |
+| `find_implementations` | Concrete implementations of an interface, abstract class, or method via multiple channels — SCIP/LSP evidence (1.0), AST hierarchy (0.85), duck-typed match (0.65), decorator handler (0.45); `_meta.confidence_provenance` states each channel's basis and measured precision/recall. Import compiler evidence first with `jcodemunch-mcp import-scip` for compile-time-grade results | `repo`, `symbol`, `cross_repo` |
 | `get_related_symbols` | Symbols related to a given symbol via co-location, shared importers, and name-token overlap | `repo`, `symbol_id`, `max_results` |
 | `get_symbol_diff` | Diff symbol sets of two indexed repo snapshots; detects added, removed, and changed symbols | `repo_a`, `repo_b` |
 
@@ -650,6 +652,7 @@ These IDs stay stable across re-indexing as long as path, qualified name, and ki
 | `get_session_context` | Returns session history: files read, searches run, edits made, tool call counts — use to avoid re-reading the same files | — |
 | `get_session_snapshot` | Compact ~200-token markdown summary of session state (focus files, edits, searches, negative evidence) — designed for context injection after compaction | — |
 | `register_edit` | Post-edit cache invalidation: clears BM25 and search caches for edited files, optionally reindexes | `file_path`, `reindex` |
+| `set_tool_tier` | Switch the exposed tool surface between tiers in-session (new installs default to a compact core tier); `jcodemunch_guide` is always present at every tier | `tier` |
 | `get_dead_code_v2` | Multi-signal dead code detection: entry-point reachability, call graph, reference search, framework awareness | `repo`, `min_confidence`, `include_tests` |
 
 ### Utilities
@@ -668,6 +671,10 @@ Every retrieval response now carries:
 - `_meta.confidence` — calibrated 0–1 retrieval-quality score on `search_symbols` / `plan_turn` / `get_ranked_context`. Combine top-1/top-2 score gap, top-1 strength, identity match, and freshness.
 - `_meta.freshness` — `{fresh, edited_uncommitted, stale_index}` counts plus `repo_is_stale` flag derived from index SHA vs `git rev-parse HEAD` and per-file mtime checks.
 - Per-symbol `_freshness` field on each entry — useful when a partial reindex left some files stale.
+- `negative_evidence` — a four-state retrieval verdict on empty or weak results: `ok`, `low_confidence`, `absent` (the corpus was scanned, with scan counts, and the answer isn't there), or `degraded` (the index is impaired — don't treat silence as absence). Lets an agent distinguish "provably not here" from "couldn't look properly."
+- `_meta.confidence_provenance` (on `find_implementations`) — every channel confidence states its basis, `declared` (engineering prior) or `measured` (backed by a committed, CI-re-run benchmark artifact), with gold-corpus precision/recall where measured.
+
+These contracts are published as JSON Schemas in [`schemas/`](schemas/); the full design rationale is in [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md).
 
 
 
@@ -826,6 +833,8 @@ The data comes from:
 ```
 
 It tracks cumulative token savings and can be used to estimate avoided cost at a given model rate.
+
+The `jcodemunch-mcp receipt` CLI turns the same data into an itemized report: windowed savings from your local transcripts (`--since`/`--until`/`--by-day`), the persistent lifetime meter (which survives client reinstalls), and dollar valuations at current published input-token rates for a model you pick (`--model`, `--rates` to list). The JSON export (`--export json`) includes a `savings_provenance` block chaining the figures to the committed measurement artifacts, so the report carries its own receipts. The meter is conservative by design — every known error term rounds down; see [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) Chapter 4.
 
 ---
 
