@@ -2,6 +2,44 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.137] - 2026-07-18 - source-shaped exact seeding in ranked context
+
+### Added
+- **`get_ranked_context` recognizes source-shaped query tokens and pins their
+  exact symbol matches first.** A query that pastes an identifier straight out
+  of the source — `Store.get`, `FreshnessProbe`, `get_ranked_context()` — names
+  the one symbol the caller actually wants, but BM25 tokenization splits it
+  into fragments and dilutes it. New `retrieval/query_shape.py` classifies
+  query tokens into identifier shapes (qualified `A::B`/`a.b`, CamelCase,
+  snake_case, dunders; filenames deliberately excluded), and the default
+  ranking path resolves each shaped token to exact-name symbol matches
+  (case-sensitive first; a qualified token's parent segment narrows
+  candidates; PageRank ranks ties; caller `include_kinds`/`scope` filters
+  honored) pinned ahead of the ranked tail. Seeded items carry
+  `match_channel: "exact_name"`; `_meta.query_shape` reports the detected
+  tokens + seed count. An exact-name hit also floors the retrieval verdict at
+  confident, and a seeded result can no longer fall into negative evidence.
+  **Pure natural-language queries are byte-identical** — no shaped tokens, no
+  seeding. The `fusion=True` path already runs a weighted identity channel and
+  is unchanged. Name lookup is cached beside the BM25 corpus (`name_map`), so
+  the per-call cost is one dict probe per shaped token.
+
+### Changed
+- **Every tool annotation now carries `openWorldHint`.** `readOnlyHint` made
+  the read-only charter machine-checkable; this does the same for the network
+  posture. All tools annotate `openWorldHint: false` except the user-invoked,
+  README-disclosed network-capable set (`index_repo`, the summarizer-capable
+  indexers, `embed_repo`/`check_embedding_drift`/`test_summarizer`, and the
+  `order`/`route` front door, which can dispatch them). A gating client can
+  now prove "this tool never touches the network" per tool.
+
+### Fixed
+- **WAL growth is bounded in all three SQLite stores.** A long-lived reader (a
+  watcher or a long agent session) can starve WAL checkpoints and grow the log
+  without bound. `PRAGMA journal_size_limit = 64 MB` is now set on the index
+  store (`_PRAGMAS`), the embedding store, and the shared parse cache, so a
+  successful checkpoint reclaims the file.
+
 ## [1.108.136] - 2026-07-17 - the savings meter records a per-day rollup
 
 The lifetime meter (`_savings.json`, written on every tool call) is the

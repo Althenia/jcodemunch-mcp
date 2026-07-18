@@ -214,6 +214,10 @@ CREATE TABLE IF NOT EXISTS scip_meta (
 _PRAGMAS = [
     "PRAGMA synchronous = NORMAL",
     "PRAGMA wal_autocheckpoint = 1000",
+    # A long-lived reader (watcher, long agent session) can starve autocheckpoint
+    # and grow the WAL unbounded; this bounds it so a successful checkpoint
+    # reclaims the file back to 64 MB.
+    "PRAGMA journal_size_limit = 67108864",
     "PRAGMA cache_size = -8000",
     "PRAGMA busy_timeout = 5000",
     "PRAGMA mmap_size = 268435456",   # 256 MB memory-mapped I/O

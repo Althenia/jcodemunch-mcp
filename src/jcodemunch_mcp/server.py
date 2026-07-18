@@ -974,6 +974,24 @@ _NON_READONLY_TOOLS: frozenset[str] = _counter.STATE_CHANGING_ACTIONS | {
     "route",
 } | _ANNOTATION_ONLY_WRITERS
 
+# Tools that CAN reach the network (all user-invoked, all README-disclosed):
+# GitHub fetch, cloud summarizer (opt-in), or a cloud embedding provider.
+# Everything else is annotated openWorldHint=False — a gating client can prove
+# the suite's no-network claim per tool instead of taking the README's word.
+# order/route can dispatch any catalog action, so they inherit True.
+_OPEN_WORLD_TOOLS: frozenset[str] = frozenset({
+    "index_repo",         # GitHub API fetch
+    "index_folder",       # cloud summarizer when configured + opted in
+    "index_file",         # cloud summarizer when configured + opted in
+    "summarize_repo",     # cloud summarizer when configured + opted in
+    "embed_repo",         # cloud embedding provider when configured
+    "check_embedding_drift",  # re-embeds canaries via the provider
+    "test_summarizer",    # probes the configured provider
+    "install_pack",       # starter-pack download
+    "order",              # front door — can dispatch the above
+    "route",              # front door — can dispatch the above
+})
+
 
 def _apply_readonly_annotations(tools: list[Tool]) -> list[Tool]:
     """Attach ToolAnnotations(readOnlyHint=...) to any tool lacking annotations.
@@ -989,7 +1007,8 @@ def _apply_readonly_annotations(tools: list[Tool]) -> list[Tool]:
             tool = tool.model_copy(
                 update={
                     "annotations": ToolAnnotations(
-                        readOnlyHint=tool.name not in _NON_READONLY_TOOLS
+                        readOnlyHint=tool.name not in _NON_READONLY_TOOLS,
+                        openWorldHint=tool.name in _OPEN_WORLD_TOOLS,
                     )
                 }
             )

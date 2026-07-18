@@ -1,23 +1,23 @@
 {
-  "current": "1.108.94",
+  "current": "1.108.137",
   "entries": [
     {
-      "version": "1.108.94",
-      "date": "2026-07-02",
-      "title": "New tool: index_dependency (index the libraries a repo actually uses)",
-      "summary": "Agents constantly need API ground truth for third-party libraries, and until now the suite only indexed the repo's own code. `index_dependency` resolves an npm or PyPI package to the version ACTUALLY INSTALLED in the host repo (`node_modules`, or a repo-local `.venv`/`venv`/`env` virtualenv), reads the"
+      "version": "1.108.137",
+      "date": "2026-07-18",
+      "title": "source-shaped exact seeding in ranked context",
+      "summary": "- **`get_ranked_context` recognizes source-shaped query tokens and pins their exact symbol matches first.** A query that pastes an identifier straight out of the source \u2014 `Store.get`, `FreshnessProbe`, `get_ranked_context()` \u2014 names the one symbol the caller actually wants, but BM25 tokenization splits it"
     },
     {
-      "version": "1.108.93",
-      "date": "2026-07-02",
-      "title": "Upstream exposure links (get_endpoint_impact include_infra exposes)",
-      "summary": "`get_endpoint_impact(include_infra=True)` now answers the upstream question alongside v1.108.91's downstream one: **what infrastructure exposes the app that serves this endpoint?** The previously empty `infra.exposes[]` list is populated with evidence-anchored links, each carrying an explicit `precision`"
+      "version": "1.108.136",
+      "date": "2026-07-17",
+      "title": "the savings meter records a per-day rollup",
+      "summary": "The lifetime meter (`_savings.json`, written on every tool call) is the authoritative record of what each call actually avoided, but it stored only one number \u2014 so any windowed view (\"today\", \"this month\") had to fall back to scanning local transcripts, which miss cleared history and model savings with"
     },
     {
-      "version": "1.108.92",
-      "date": "2026-07-02",
-      "title": "Progress-notification flood control + response drain (#359)",
-      "summary": "Full-repo `index_folder` over MCP stdio could lose its tool result on large repos (reported by @Bamieh on a 2,118-file TS monorepo: the call \"hangs\", the client surfaces a missing tool result, yet the index completes fine server-side). Explicit-`paths` calls and the CLI were unaffected."
+      "version": "1.108.135",
+      "date": "2026-07-17",
+      "title": "`receipt --rates` publishes the model price table",
+      "summary": "The savings model values tokens at a model's input rate, and the rate table lived only inside `receipt`. Any consumer pricing its own token counts had to keep a copy \u2014 and a copy drifts silently: the jMunch Console's duplicate sat at the retired \\$15 Opus rate long after this table moved to \\$5, so its two dollar"
     }
   ]
 }

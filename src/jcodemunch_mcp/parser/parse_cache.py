@@ -98,6 +98,7 @@ def _connect(d: str) -> sqlite3.Connection:
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA journal_size_limit = 67108864")  # bound WAL growth under starved checkpoints
     conn.execute(
         "CREATE TABLE IF NOT EXISTS parse_cache "
         "(key TEXT PRIMARY KEY, symbols TEXT NOT NULL, created_at TEXT NOT NULL)"
