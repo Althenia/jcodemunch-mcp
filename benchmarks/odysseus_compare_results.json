@@ -1,0 +1,164 @@
+[
+  {
+    "repo": "expressjs/express",
+    "file_count": 172,
+    "baseline_tokens": 142414,
+    "chunk_count": 747,
+    "embed_time_s": 8.3,
+    "tasks": [
+      {
+        "query": "router route handler",
+        "tokens": 1488,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 0,
+        "chunks_split": 1,
+        "query_ms": 15.8
+      },
+      {
+        "query": "middleware",
+        "tokens": 1459,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 0,
+        "query_ms": 8.2
+      },
+      {
+        "query": "error exception",
+        "tokens": 625,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 0,
+        "chunks_split": 0,
+        "query_ms": 8.0
+      },
+      {
+        "query": "request response",
+        "tokens": 1293,
+        "chunks_returned": 5,
+        "chunks_with_terms": 4,
+        "chunks_complete": 0,
+        "chunks_split": 0,
+        "query_ms": 8.3
+      },
+      {
+        "query": "context bind",
+        "tokens": 1243,
+        "chunks_returned": 5,
+        "chunks_with_terms": 0,
+        "chunks_complete": 0,
+        "chunks_split": 1,
+        "query_ms": 8.1
+      }
+    ]
+  },
+  {
+    "repo": "fastapi/fastapi",
+    "file_count": 951,
+    "baseline_tokens": 699425,
+    "chunk_count": 5383,
+    "embed_time_s": 99.03,
+    "tasks": [
+      {
+        "query": "router route handler",
+        "tokens": 1219,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 1,
+        "query_ms": 19.4
+      },
+      {
+        "query": "middleware",
+        "tokens": 630,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 0,
+        "query_ms": 12.2
+      },
+      {
+        "query": "error exception",
+        "tokens": 317,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 0,
+        "chunks_split": 4,
+        "query_ms": 14.5
+      },
+      {
+        "query": "request response",
+        "tokens": 454,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 0,
+        "chunks_split": 5,
+        "query_ms": 13.9
+      },
+      {
+        "query": "context bind",
+        "tokens": 395,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 0,
+        "chunks_split": 5,
+        "query_ms": 13.9
+      }
+    ]
+  },
+  {
+    "repo": "gin-gonic/gin",
+    "file_count": 98,
+    "baseline_tokens": 187018,
+    "chunk_count": 890,
+    "embed_time_s": 19.99,
+    "tasks": [
+      {
+        "query": "router route handler",
+        "tokens": 1063,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 1,
+        "query_ms": 22.0
+      },
+      {
+        "query": "middleware",
+        "tokens": 1307,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 2,
+        "chunks_split": 0,
+        "query_ms": 13.8
+      },
+      {
+        "query": "error exception",
+        "tokens": 1187,
+        "chunks_returned": 5,
+        "chunks_with_terms": 4,
+        "chunks_complete": 3,
+        "chunks_split": 1,
+        "query_ms": 13.6
+      },
+      {
+        "query": "request response",
+        "tokens": 1380,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 0,
+        "query_ms": 13.3
+      },
+      {
+        "query": "context bind",
+        "tokens": 1591,
+        "chunks_returned": 5,
+        "chunks_with_terms": 5,
+        "chunks_complete": 1,
+        "chunks_split": 1,
+        "query_ms": 19.4
+      }
+    ]
+  }
+]

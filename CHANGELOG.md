@@ -2,6 +2,27 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.142] - 2026-07-18 - tool descriptions catch up with the contracts
+
+### Fixed
+- **`find_implementations` description now lists all five resolution
+  channels.** The SCIP compile-time evidence channel (1.0, active when a
+  compiler index is imported via `import-scip`) had been missing from the
+  agent-facing description since it shipped in v1.108.96. The description
+  also now says what the numbers are: declared ranking priors, with
+  `_meta.confidence_provenance` stating each channel's basis and
+  gold-corpus measured precision/recall where available — the description
+  no longer presents bare constants the response contract is careful to
+  qualify.
+- **`get_ranked_context` description documents exact-name pinning.**
+  Source-shaped identifiers in the query (qualified names, CamelCase,
+  snake_case) pin exact-name symbol matches ahead of the lexical ranking
+  (since v1.108.137); the description now tells agents to include the
+  identifier verbatim when they know it. README's tool listing gained the
+  same clause, including the `_meta.query_shape` report field.
+
+No behavior changes — documentation strings and README only.
+
 ## [1.108.141] - 2026-07-18 - gold corpus v2: TypeScript and Go join the measurement
 
 ### Added

@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.142](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.142)** (2026-07-18) — tool descriptions catch up with the contracts
 - **[v1.108.141](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.141)** (2026-07-18) — gold corpus v2: TypeScript and Go join the measurement
 - **[v1.108.140](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.140)** (2026-07-18) — the first gold corpus: channel accuracy, measured
-- **[v1.108.139](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.139)** (2026-07-18) — measured provenance rides the reporting surfaces
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -273,7 +273,7 @@ The retrieval primitives below are not a disconnected bag of tools the agent has
 
 - **`assemble_task_context`** takes a natural-language task and returns a single source-attributed context capsule under a token budget. It auto-classifies the task into one of six intents (explore / debug / refactor / extend / audit / review), auto-extracts the anchor symbols, and runs the intent-appropriate sequence of the tools below end-to-end — so the agent gets the whole context for a task in **one request** instead of chaining five. Every entry is tagged with its `stage` and `source_tool`, so the provenance is auditable.
 - **`plan_turn`** is the opening move: it analyzes the query against the index and returns a confidence-guided route — which tools to call, on which symbols, under a turn budget — *before* the first read. Low confidence means "this probably doesn't exist," so the agent stops instead of burning a budget hunting for a feature that isn't there.
-- **`get_ranked_context`** packs the most relevant symbols for a query into a fixed token budget (BM25 + PageRank), when you want a ranked context pack rather than a full intent sequence.
+- **`get_ranked_context`** packs the most relevant symbols for a query into a fixed token budget (BM25 + PageRank), when you want a ranked context pack rather than a full intent sequence. Source-shaped identifiers in the query (qualified names, CamelCase, snake_case) pin exact-name symbol matches ahead of the lexical ranking — include the identifier verbatim when you know it; `_meta.query_shape` reports what was recognized and seeded.
 
 The point: jCodeMunch is structured retrieval *with* an orchestration layer over it, not a pile of primitives. The composition tools run the right sub-tools, in the right order, under one budget, in one call.
 

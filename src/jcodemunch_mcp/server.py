@@ -2673,8 +2673,10 @@ def _build_tools_list() -> list[Tool]:
             name="find_implementations",
             description=(
                 "Find concrete implementations of an interface, abstract class, or method. "
-                "Multi-source resolution with confidence scoring: LSP dispatch (1.0), AST class "
-                "hierarchy (0.85), duck-typed name match (0.65), decorator handler (0.45). "
+                "Multi-source resolution with confidence scoring: SCIP/LSP evidence (1.0), AST class "
+                "hierarchy (0.85), duck-typed name match (0.65), decorator handler (0.45) — declared "
+                "priors; _meta.confidence_provenance states each channel's basis and measured "
+                "precision/recall. "
                 "Classifies each impl (subclass_override / interface_impl / duck_typed / "
                 "decorator_handler / subclass), ranks by PageRank × byte_length, attaches "
                 "differs_by breakdown. Optional cross_repo=true surfaces impls in other indexed "
@@ -3407,6 +3409,8 @@ def _build_tools_list() -> list[Tool]:
                 "Assemble the best-fit context for a query within a token budget. "
                 "Ranks all symbols by relevance (BM25) and/or centrality (PageRank), "
                 "loads source for the top candidates, and packs greedily until token_budget is exhausted. "
+                "Exact symbol names in the query (qualified, CamelCase, snake_case) are pinned ahead "
+                "of the ranking; include identifiers verbatim. "
                 "Use when you want 'the best N tokens of context for this task' without specifying exact symbols."
             ),
             inputSchema={
