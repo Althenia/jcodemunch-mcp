@@ -2,6 +2,33 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.141] - 2026-07-18 - gold corpus v2: TypeScript and Go join the measurement
+
+### Added
+- **The channel-accuracy gold corpus now spans three languages**
+  (`authored-scenarios-v2`). TypeScript scenarios mirror the Python design
+  with TS-native semantics: `extends`-declared notifier subclasses plus a
+  UI-toast `Notifier` homonym trap for the AST channel; a duck-typed
+  `PushGateway.send` conformer against `ConveyorBelt.send` (routing a
+  physical item) and `ElevatorBank.send` (dispatching an elevator car)
+  traps; `@On("invoice_paid")` handler methods against `@Get` route-path
+  and `@Task` job-name substring traps. Go scenarios exercise the duck
+  channel exclusively — deliberately, since Go's implicit interfaces have no
+  declared inheritance for the AST channel to walk and Go has no
+  decorators: `RingBuffer.Push`/`PriorityList.Push` conformers against
+  `Lawnmower.Push` (physically pushing the mower) and `Recruiter.Push`
+  (advocating a candidate) traps.
+- **Measured round 2 (aggregate, 3 languages):** AST precision 0.818
+  (tp=9 fp=2), duck 0.5 (tp=6 fp=6), decorator 0.556 (tp=5 fp=4) — recall
+  1.0 across every channel and language. The artifact gains a
+  `per_language` breakdown. The duck prior (0.65) now reads clearly
+  optimistic against the harder cross-language corpus (0.5 measured) —
+  exactly the kind of drift the measured_ref exists to make visible; the
+  operating constants stay declared pending a deliberate replay-gated
+  recalibration.
+- Harness: corpus hash covers `.py`/`.ts`/`.go`; per-language stats; the
+  unlabeled-pair guard and the CI re-measurement gate carry over unchanged.
+
 ## [1.108.140] - 2026-07-18 - the first gold corpus: channel accuracy, measured
 
 ### Added

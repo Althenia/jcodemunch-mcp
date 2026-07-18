@@ -128,9 +128,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.141](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.141)** (2026-07-18) — gold corpus v2: TypeScript and Go join the measurement
 - **[v1.108.140](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.140)** (2026-07-18) — the first gold corpus: channel accuracy, measured
 - **[v1.108.139](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.139)** (2026-07-18) — measured provenance rides the reporting surfaces
-- **[v1.108.138](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.138)** (2026-07-18) — confidence provenance: every number states its basis
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)

@@ -75,7 +75,7 @@ class TestResponseCarriesMeasuredRef:
     def test_channel_provenance_includes_measured_ref(self):
         from jcodemunch_mcp.retrieval.provenance import channel_provenance
         block = channel_provenance("find_implementations")
-        assert block["channels"]["ast"]["measured_ref"]["precision"] == 0.833
+        assert block["channels"]["ast"]["measured_ref"]["precision"] == 0.818
         assert "measured_ref" not in block["channels"]["lsp"]
 
     def test_block_still_validates_against_published_schema(self):

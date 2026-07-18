@@ -41,10 +41,17 @@ _SOURCE_TO_CHANNEL = {
 }
 
 
+_CORPUS_SUFFIXES = (".py", ".ts", ".go")
+
+
 def corpus_sha256(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> str:
     """Content hash over every corpus file + the gold manifest, path-ordered."""
     h = hashlib.sha256()
-    for p in sorted(corpus_dir.rglob("*.py")):
+    files = sorted(
+        p for p in corpus_dir.rglob("*")
+        if p.is_file() and p.suffix in _CORPUS_SUFFIXES
+    )
+    for p in files:
         h.update(p.relative_to(corpus_dir).as_posix().encode())
         h.update(p.read_bytes().replace(b"\r\n", b"\n"))
     h.update(gold_path.read_bytes().replace(b"\r\n", b"\n"))
@@ -69,9 +76,15 @@ def measure(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> dict:
             ch: {"tp": 0, "fp": 0, "fn": 0}
             for ch in ("ast", "duck", "decorator")
         }
+        per_lang: dict[str, dict] = {}
         unlabeled: list[str] = []
 
         for tgt in gold["targets"]:
+            lang = tgt.get("language", gold.get("language", ""))
+            lang_stats = per_lang.setdefault(
+                lang,
+                {ch: {"tp": 0, "fp": 0, "fn": 0} for ch in ("ast", "duck", "decorator")},
+            )
             labels = {
                 (lab["file"], lab["name"]): lab for lab in tgt["labels"]
             }
@@ -92,14 +105,14 @@ def measure(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> dict:
                     unlabeled.append(f"{tgt['target']} -> {key} via {channel}")
                     continue
                 found.add(key)
-                if lab["true_impl"]:
-                    stats[channel]["tp"] += 1
-                else:
-                    stats[channel]["fp"] += 1
+                bucket = "tp" if lab["true_impl"] else "fp"
+                stats[channel][bucket] += 1
+                lang_stats[channel][bucket] += 1
             # Recall: gold TRUE labels this target expected a channel to surface
             for key, lab in labels.items():
                 if lab["true_impl"] and key not in found and lab["channel"] in stats:
                     stats[lab["channel"]]["fn"] += 1
+                    lang_stats[lab["channel"]]["fn"] += 1
 
         if unlabeled:
             raise RuntimeError(
@@ -107,11 +120,10 @@ def measure(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> dict:
                 f"(label every surfaced pair): {unlabeled}"
             )
 
-    channels = {}
-    for ch, s in stats.items():
+    def _rollup(s: dict) -> dict:
         surfaced = s["tp"] + s["fp"]
         truth = s["tp"] + s["fn"]
-        channels[ch] = {
+        return {
             "precision": round(s["tp"] / surfaced, 3) if surfaced else None,
             "recall": round(s["tp"] / truth, 3) if truth else None,
             "tp": s["tp"],
@@ -119,6 +131,15 @@ def measure(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> dict:
             "fn": s["fn"],
             "n_surfaced": surfaced,
         }
+
+    channels = {ch: _rollup(s) for ch, s in stats.items()}
+    per_language = {
+        lang: {
+            ch: _rollup(s) for ch, s in lang_ch.items()
+            if s["tp"] + s["fp"] + s["fn"] > 0
+        }
+        for lang, lang_ch in per_lang.items()
+    }
 
     return {
         "comment": (
@@ -128,11 +149,12 @@ def measure(corpus_dir: Path = CORPUS_DIR, gold_path: Path = GOLD_PATH) -> dict:
             "in-the-wild base rates — n is small and disclosed."
         ),
         "corpus_version": gold["corpus_version"],
-        "language": gold["language"],
+        "languages": gold.get("languages") or [gold.get("language", "")],
         "scope": gold["scope"],
         "corpus_sha256": corpus_sha256(corpus_dir, gold_path),
         "generator": "benchmarks/goldset/measure.py",
         "channels": channels,
+        "per_language": per_language,
     }
 
 
