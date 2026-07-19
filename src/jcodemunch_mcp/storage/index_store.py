@@ -185,6 +185,7 @@ class CodeIndex:
     package_names: list[str] = field(default_factory=list)    # Package names published by this repo (from manifest files)
     branch: str = ""                 # Git branch name at index time (empty = base/default branch or non-git)
     file_cap_status: dict = field(default_factory=dict)  # v1.108.126: {truncated, files_discovered, files_indexed, files_skipped_cap, max_folder_files} when the max_folder_files walk cap dropped files; {"truncated": False} otherwise. Empty = pre-v1.108.126 index (unknown).
+    coverage: dict = field(default_factory=dict)  # v1.108.145: coverage contract for absence claims — {files_discovered, files_indexed, skip_counts{reason:count}, no_symbols_count, walk, recorded_at} from the last full discovery walk. Empty = unknown (pre-upgrade index or no full walk recorded).
 
     def __post_init__(self) -> None:
         if not self.display_name:

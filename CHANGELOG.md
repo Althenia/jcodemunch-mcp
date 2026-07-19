@@ -2,6 +2,41 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.145] - 2026-07-19 - coverage contract for absence claims + scorer-pinned calibration
+
+### Added
+- **Coverage contract on `absent`/`degraded` verdicts.** A scan count alone
+  can't back an absence claim when files never entered the corpus. Every full
+  discovery walk now persists a coverage block into the index meta
+  (`files_indexed`, nonzero skip counts by reason — wrong_extension,
+  too_large, binary, secret, symlink, file_limit — plus the count of files
+  that parsed to zero symbols), and `_meta.verdict` on `absent`/`degraded`
+  states discloses it alongside index generation (`indexed_at`,
+  `index_version`, truncated `git_head`) and `included_scopes`. Attached
+  across `search_symbols`, `search_text`, `get_ranked_context`, and the
+  file/symbol verdict wrappers (`get_file_outline`, `get_symbol_source`).
+  An index that predates the contract simply omits the block — coverage
+  unknown is never presented as "nothing was excluded". `ok`/`low_confidence`
+  verdicts stay lean. Explicit-`paths` subset indexing does not overwrite
+  the last full-walk coverage.
+- **`_meta.verdict.scorer` version pin + planted-query calibration
+  artifact.** The verdict now carries `scorer` (currently 1) so confidence
+  claims tie to the scoring heuristics that produced them. New
+  `benchmarks/calibration/planted_queries.json` records measured
+  planted-positive hit rate and planted-negative absent rate;
+  `tests/test_verdict_coverage_calibration.py` re-runs the measurement live
+  in CI (slug-unique planted names, immune to corpus drift) and fails when
+  the scorer changes without a re-measured artifact.
+- `schemas/retrieval-verdict.schema.json` documents both additions.
+
+### Notes
+- Origin: community feedback on the retrieval-verdict article (coverage
+  contract for `absent`; empirical calibration of the confidence surface).
+  Full reliability curves (ECE/Brier per query class) remain the end state;
+  the scorer pin + planted harness is the v1 gate.
+- No INDEX_VERSION bump (coverage rides the meta k-v table, self-heals on
+  every full-walk save). No tool-count or input-schema change.
+
 ## [1.108.144] - 2026-07-18 - deep-doc currency sweep
 
 ### Fixed

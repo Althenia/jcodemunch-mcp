@@ -1037,6 +1037,7 @@ def search_symbols(
     )
 
     from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     _vres = _build_verdict(
         result_count=len(scored_results),
         scanned_symbols=candidates_scored if candidates_scored > 0 else len(index.symbols),
@@ -1047,6 +1048,7 @@ def search_symbols(
         source_files=index.source_files,
         semantic_requested=bool(semantic or semantic_only),
         index_stale=_probe.repo_is_stale,
+        coverage=_index_coverage_meta(index),
     )
     negative_evidence = _vres["negative_evidence"]
     meta["verdict"] = _vres["verdict"]

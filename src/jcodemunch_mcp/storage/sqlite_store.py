@@ -1165,6 +1165,7 @@ class SQLiteIndexStore:
             package_names=getattr(base_index, "package_names", []),
             branch=branch,
             file_cap_status=getattr(base_index, "file_cap_status", {}) or {},
+            coverage=getattr(base_index, "coverage", {}) or {},
         )
 
     def _symbol_to_dict_for_delta(self, symbol: "Symbol") -> dict:
@@ -2043,6 +2044,59 @@ class SQLiteIndexStore:
             logger.debug("Failed to get file_cap_status for %s/%s", owner, name, exc_info=True)
             return {}
 
+    def get_coverage(self, owner: str, name: str) -> dict:
+        """Fast metadata-only read of the persisted coverage contract.
+
+        Returns ``{}`` when unknown (repo not indexed, or indexed before the
+        coverage contract was recorded).
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return {}
+        try:
+            conn = self._connect(db_path)
+            try:
+                meta = self._read_meta(conn)
+            finally:
+                conn.close()
+            return json.loads(meta.get("coverage", "{}")) or {}
+        except Exception:
+            logger.debug("Failed to get coverage for %s/%s", owner, name, exc_info=True)
+            return {}
+
+    def set_coverage(self, owner: str, name: str, coverage: dict) -> None:
+        """Persist the coverage contract into the meta table (post-save).
+
+        Written after every save that ran a full discovery walk, so the
+        recorded skip counts always describe the corpus the index was built
+        from. Best-effort: a failure never breaks the save that preceded it.
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return
+        try:
+            conn = self._connect(db_path)
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("coverage", json.dumps(coverage or {})),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            # Keep any cached in-process CodeIndex consistent without waiting
+            # for the mtime-keyed cache to miss.
+            with _cache_lock:
+                for key, entry in _index_cache.items():
+                    if key[0] == owner and key[1] == name:
+                        entry.code_index.coverage = coverage or {}
+        except Exception:
+            logger.debug("Failed to set coverage for %s/%s", owner, name, exc_info=True)
+
     def list_repos(self) -> list[dict]:
         """List all indexed repositories (scans .db files only)."""
         _pairs = parse_path_map()
@@ -2561,6 +2615,14 @@ class SQLiteIndexStore:
         else:
             new_file_cap_status = getattr(old, "file_cap_status", {})
 
+        if "coverage" in meta:
+            try:
+                new_coverage = json.loads(meta.get("coverage", "{}")) or {}
+            except (json.JSONDecodeError, ValueError):
+                new_coverage = getattr(old, "coverage", {})
+        else:
+            new_coverage = getattr(old, "coverage", {})
+
         return CodeIndex(
             repo=old.repo,
             owner=old.owner,
@@ -2585,6 +2647,7 @@ class SQLiteIndexStore:
             file_sizes=new_file_sizes,
             package_names=getattr(old, "package_names", []),
             file_cap_status=new_file_cap_status,
+            coverage=new_coverage,
         )
 
     def _build_index_from_rows(
@@ -2653,6 +2716,10 @@ class SQLiteIndexStore:
             file_cap_status = json.loads(meta.get("file_cap_status", "{}")) or {}
         except (json.JSONDecodeError, ValueError):
             file_cap_status = {}
+        try:
+            coverage = json.loads(meta.get("coverage", "{}")) or {}
+        except (json.JSONDecodeError, ValueError):
+            coverage = {}
 
         return CodeIndex(
             repo=meta.get("repo", f"{owner}/{name}"),
@@ -2678,6 +2745,7 @@ class SQLiteIndexStore:
             file_sizes=file_sizes,
             package_names=package_names,
             file_cap_status=file_cap_status,
+            coverage=coverage,
         )
 
     def _write_meta(self, conn: sqlite3.Connection, index: "CodeIndex") -> None:
@@ -2699,6 +2767,7 @@ class SQLiteIndexStore:
             "package_names": json.dumps(getattr(index, "package_names", []) or []),
             "base_branch": getattr(index, "branch", "") or "",
             "file_cap_status": json.dumps(getattr(index, "file_cap_status", {}) or {}),
+            "coverage": json.dumps(getattr(index, "coverage", {}) or {}),
         }
         conn.executemany(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",

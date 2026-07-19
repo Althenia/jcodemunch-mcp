@@ -4,40 +4,146 @@
   "title": "jCodeMunch retrieval verdict",
   "description": "The unified _meta.verdict block attached to retrieval responses (search_symbols, search_text, get_ranked_context). Grounded symbolic retrieval proves absence: an 'absent' state carries the scan counts that back the claim, and 'degraded' means the scan was partial so absence is NOT proven.",
   "type": "object",
-  "required": ["state", "scanned", "channels", "note"],
+  "required": [
+    "state",
+    "scanned",
+    "channels",
+    "note"
+  ],
   "properties": {
     "state": {
-      "enum": ["ok", "low_confidence", "absent", "degraded"],
-      "description": "ok = confident matches; low_confidence = non-empty but below threshold; absent = nothing matched and the scan was complete; degraded = partial scan (timeout, or semantic requested with no embedder) — absence not proven."
+      "enum": [
+        "ok",
+        "low_confidence",
+        "absent",
+        "degraded"
+      ],
+      "description": "ok = confident matches; low_confidence = non-empty but below threshold; absent = nothing matched and the scan was complete; degraded = partial scan (timeout, or semantic requested with no embedder) \u2014 absence not proven."
     },
     "scanned": {
       "type": "object",
-      "required": ["symbols", "files"],
+      "required": [
+        "symbols",
+        "files"
+      ],
       "properties": {
-        "symbols": {"type": "integer", "minimum": 0},
-        "files": {"type": "integer", "minimum": 0}
+        "symbols": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "integer",
+          "minimum": 0
+        }
       },
       "additionalProperties": false
     },
     "best_score": {
-      "type": ["number", "null"],
+      "type": [
+        "number",
+        "null"
+      ],
       "description": "Best raw match score backing the state, null when no scoring ran."
     },
     "channels": {
       "type": "object",
-      "required": ["lexical", "semantic", "index"],
+      "required": [
+        "lexical",
+        "semantic",
+        "index"
+      ],
       "properties": {
-        "lexical": {"enum": ["ok"]},
-        "semantic": {"enum": ["ok", "off", "unavailable"]},
-        "index": {"enum": ["fresh", "stale"]}
+        "lexical": {
+          "enum": [
+            "ok"
+          ]
+        },
+        "semantic": {
+          "enum": [
+            "ok",
+            "off",
+            "unavailable"
+          ]
+        },
+        "index": {
+          "enum": [
+            "fresh",
+            "stale"
+          ]
+        }
       },
       "additionalProperties": false
     },
-    "note": {"type": "string"},
+    "note": {
+      "type": "string"
+    },
     "did_you_mean": {
       "type": "array",
-      "items": {"type": "string"},
+      "items": {
+        "type": "string"
+      },
       "description": "Near-miss suggestions when the state is absent/low_confidence."
+    },
+    "scorer": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version pin for the scoring heuristics behind state/best_score. Calibration claims (benchmarks/calibration/planted_queries.json) are pinned to this version; a scorer change without a re-measured artifact fails CI."
+    },
+    "coverage": {
+      "type": "object",
+      "description": "Coverage contract backing an absence claim (attached on absent/degraded states only). Discloses what the corpus EXCLUDED at index time so a scan count cannot lie by omission. Absent block = coverage unknown (pre-upgrade index), never 'nothing was excluded'.",
+      "properties": {
+        "generation": {
+          "type": "object",
+          "description": "Index generation the scan ran against.",
+          "properties": {
+            "indexed_at": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "index_version": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "git_head": {
+              "type": "string",
+              "description": "Truncated HEAD SHA at index time."
+            }
+          },
+          "additionalProperties": false
+        },
+        "files_indexed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "included_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Git-root-relative subdir prefixes walked into this index; [\"\"] = full walk."
+        },
+        "excluded": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "description": "Nonzero skip counts by reason from the last full discovery walk (wrong_extension, too_large, binary, secret, symlink, skip_dir [directories], file_limit)."
+        },
+        "no_symbols_files": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Files indexed but yielding zero symbols (parser gaps included)."
+        }
+      },
+      "additionalProperties": false
     }
   },
   "additionalProperties": true
