@@ -326,6 +326,15 @@ The `tune_weights` tool reads the persistent ranking ledger and learns per-repo 
 
 The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine the same ranking ledger for **retrieval regret** — where retrieval failed and the agent had to re-ask — and return a prioritized, explainable set of *suggested* fixes (a CLAUDE.md routing or glossary line as a unified-diff preview, an index-freshness hint, a stale-config finding, a dry-run weight proposal). It is read-only by design: it suggests a patch and shows you the diff; applying it is your keystroke, never the server's. Requires `perf_telemetry_enabled` (it has a ledger to read only then) and returns an honest hint when off.
 
+### Token yield and advisory session budgets
+
+`get_session_stats` speaks the FinOps vocabulary natively:
+
+- **`yield`** — of the context served this session, how much showed downstream follow-through: served search results later fetched via `get_symbol_source`/`get_context_bundle`, or whose file was subsequently edited (`register_edit`/`index_file`). Reports `rate` with its components (`served_results`, `followed_through`) plus `repeated_identical_calls` per tool — the agent's redundant context spend, distinct from cache hits (those measure the server's cost; repeats cost the agent's context window even on a hit). One honest caveat: a search whose result lines answered the question outright has yield the call sequence can't see, which is why `rate` ships with its components and never as a lone grade.
+- **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
+
+Both are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
+
 ### Confidence provenance — every number states its basis
 
 Every confidence constant the suite emits traces to a stated basis: **`measured`** (backed by a committed, reproducible benchmark artifact — `benchmarks/provenance/measured.json`, drift-guarded in CI so the constants and the artifact can never silently diverge) or **`declared`** (an engineering prior, honestly labeled as exactly that). `find_implementations` responses carry the per-channel basis in `_meta.confidence_provenance`, and the response contracts themselves are published as JSON Schemas in [`schemas/`](schemas/) (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so CI pipelines and agents can validate responses mechanically. A prior is never presented as a measurement: a `declared` value graduates to `measured` only when a gold-labeled corpus backs it, and a build that claims otherwise fails.

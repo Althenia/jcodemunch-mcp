@@ -57,6 +57,9 @@ _BYTES_PER_TOKEN = 4  # ~4 bytes per token (rough but consistent)
 _TELEMETRY_URL = "https://j.gravelle.us/APIs/savings/post.php"
 _FLUSH_INTERVAL = 3  # flush to disk every N calls
 _RESULT_CACHE_MAXSIZE = 256  # max tool-result cache entries per session
+_YIELD_SERVED_MAXSIZE = 5000  # max served-symbol-id entries tracked per session
+_CALL_SIG_MAXSIZE = 2000  # max distinct (tool, args_hash) signatures tracked
+_BUDGET_APPROACHING_PCT = 0.8  # _meta.budget appears at >=80% of the limit
 _LATENCY_RING_DEFAULT = 512  # per-tool latency ring size
 _PERF_DB_MAX_ROWS_DEFAULT = 100_000  # rolling cap on persisted perf rows
 
@@ -104,6 +107,16 @@ class _State:
         # Per-tool latency ring (process-lifetime; cap _LATENCY_RING_DEFAULT entries)
         self._tool_latencies: dict[str, deque] = {}
         self._tool_errors: dict[str, int] = {}
+        # Session budget + yield tracking (v1.108.146; process lifetime only).
+        # _session_response_tokens counts response tokens SERVED (the context
+        # this server injects into the agent) — distinct from tokens SAVED.
+        self._session_response_tokens: int = 0
+        # served symbol id -> followed-through flag (insertion-ordered, capped)
+        self._yield_served: OrderedDict = OrderedDict()
+        # (tool, args_hash) -> times seen (capped); repeats beyond the first
+        # accumulate into _repeat_calls[tool]
+        self._call_signatures: OrderedDict = OrderedDict()
+        self._repeat_calls: dict[str, int] = {}
         # Perf SQLite sink (opt-in via config "perf_telemetry_enabled")
         self._perf_db_path_cached: Optional[Path] = None
         self._perf_db_failed: bool = False
@@ -209,6 +222,94 @@ class _State:
                 "by_tool": by_tool,
             }
 
+    # ---------------------------------------------------------------------
+    # Session budget + yield (v1.108.146)
+    # ---------------------------------------------------------------------
+
+    def record_response_tokens(self, tokens: int) -> int:
+        """Add served response tokens to the session counter. Thread-safe."""
+        with self._lock:
+            self._session_response_tokens += max(0, int(tokens))
+            return self._session_response_tokens
+
+    def _budget_locked(self) -> Optional[dict]:
+        """Budget block, or None when no budget is configured. Lock held."""
+        try:
+            limit = int(_config.get("session_token_budget", 0) or 0)
+        except Exception:
+            limit = 0
+        if limit <= 0:
+            return None
+        spent = self._session_response_tokens
+        if spent >= limit:
+            state = "over"
+        elif spent >= limit * _BUDGET_APPROACHING_PCT:
+            state = "approaching"
+        else:
+            state = "ok"
+        return {"limit": limit, "spent": spent, "state": state}
+
+    def budget_status(self) -> Optional[dict]:
+        """Public budget snapshot ({limit, spent, state}) or None. Thread-safe."""
+        with self._lock:
+            return self._budget_locked()
+
+    def note_served(self, symbol_ids) -> None:
+        """Record symbol ids served by a ranking/search tool. Thread-safe."""
+        with self._lock:
+            for sid in symbol_ids:
+                if not sid:
+                    continue
+                if sid not in self._yield_served:
+                    self._yield_served[sid] = False
+                    if len(self._yield_served) > _YIELD_SERVED_MAXSIZE:
+                        self._yield_served.popitem(last=False)
+
+    def note_fetched(self, symbol_ids) -> None:
+        """Mark previously served symbol ids as followed through. Thread-safe."""
+        with self._lock:
+            for sid in symbol_ids:
+                if sid in self._yield_served:
+                    self._yield_served[sid] = True
+
+    def note_edited_files(self, file_paths) -> None:
+        """Mark served symbols in edited files as followed through (edit-through)."""
+        norm = {str(p).replace("\\", "/").lstrip("./") for p in file_paths if p}
+        if not norm:
+            return
+        with self._lock:
+            for sid in self._yield_served:
+                sym_file = sid.split("::", 1)[0].replace("\\", "/").lstrip("./")
+                if any(sym_file == f or sym_file.endswith("/" + f) or f.endswith("/" + sym_file) for f in norm):
+                    self._yield_served[sid] = True
+
+    def note_call_signature(self, tool_name: str, args_hash: str) -> None:
+        """Count repeated identical (tool, args) calls. Thread-safe."""
+        with self._lock:
+            key = (tool_name, args_hash)
+            if key in self._call_signatures:
+                self._call_signatures[key] += 1
+                self._repeat_calls[tool_name] = self._repeat_calls.get(tool_name, 0) + 1
+            else:
+                self._call_signatures[key] = 1
+                if len(self._call_signatures) > _CALL_SIG_MAXSIZE:
+                    self._call_signatures.popitem(last=False)
+
+    def _yield_locked(self) -> Optional[dict]:
+        """Yield block, or None when nothing rankable was served. Lock held."""
+        served = len(self._yield_served)
+        if served == 0:
+            return None
+        followed = sum(1 for v in self._yield_served.values() if v)
+        block = {
+            "rate": round(followed / served, 3),
+            "served_results": served,
+            "followed_through": followed,
+        }
+        if self._repeat_calls:
+            block["repeated_identical_calls"] = dict(self._repeat_calls)
+        return block
+
     def _build_stats_locked(self) -> dict:
         """Build session stats dict. Must be called with _lock held."""
         elapsed = time.monotonic() - self._session_start
@@ -222,15 +323,23 @@ class _State:
             "hit_rate": round(total_hits / total_lookups, 3) if total_lookups else 0.0,
             "cached_entries": len(self._result_cache),
         }
-        return {
+        stats = {
             "session_tokens_saved": self._session_tokens,
             "session_calls": self._session_calls,
             "session_duration_s": round(elapsed, 1),
+            "session_response_tokens": self._session_response_tokens,
             "total_tokens_saved": self._total,
             "tool_breakdown": dict(self._session_tool_breakdown),
             "result_cache": cache_stats,
             "latency_per_tool": self._latency_stats_locked(),
         }
+        budget = self._budget_locked()
+        if budget is not None:
+            stats["budget"] = budget
+        yield_block = self._yield_locked()
+        if yield_block is not None:
+            stats["yield"] = yield_block
+        return stats
 
     # ---------------------------------------------------------------------
     # Latency tracking + perf SQLite sink (v1.74.0)
@@ -920,6 +1029,45 @@ def perf_db_query(
     except Exception:
         logger.debug("perf_db_query failed at %s", path, exc_info=True)
         return []
+
+
+def record_response_text(text: str) -> int:
+    """Count a serialized tool response toward the session budget.
+
+    Returns the cumulative session response tokens. Uses the same
+    ~4-bytes-per-token estimate as the savings meter, so budget and
+    savings figures share one scale.
+    """
+    try:
+        tokens = len(text.encode("utf-8")) // _BYTES_PER_TOKEN
+    except Exception:
+        tokens = len(text) // _BYTES_PER_TOKEN
+    return _state.record_response_tokens(tokens)
+
+
+def budget_status() -> Optional[dict]:
+    """Session budget snapshot ({limit, spent, state}) or None when unset."""
+    return _state.budget_status()
+
+
+def note_served(symbol_ids) -> None:
+    """Record symbol ids served by a ranking/search tool (yield tracking)."""
+    _state.note_served(symbol_ids)
+
+
+def note_fetched(symbol_ids) -> None:
+    """Mark served symbol ids as followed through (fetch-through)."""
+    _state.note_fetched(symbol_ids)
+
+
+def note_edited_files(file_paths) -> None:
+    """Mark served symbols in edited files as followed through (edit-through)."""
+    _state.note_edited_files(file_paths)
+
+
+def note_call_signature(tool_name: str, args_hash: str) -> None:
+    """Count repeated identical (tool, args) calls for the yield block."""
+    _state.note_call_signature(tool_name, args_hash)
 
 
 def estimate_savings(raw_bytes: int, response_bytes: int) -> int:

@@ -4471,7 +4471,20 @@ def _error_call_result(text: str) -> CallToolResult:
     ``list[TextContent]`` (the SDK wraps them ``isError=False``), so this is
     additive on the wire — only failures gain the ``isError`` signal.
     """
+    _record_response_tokens(text)
     return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
+def _record_response_tokens(text: str) -> None:
+    """Count served response text toward the session budget (v1.108.146).
+
+    Best-effort — a tracker failure never affects the response.
+    """
+    try:
+        from .storage.token_tracker import record_response_text
+        record_response_text(text)
+    except Exception:
+        logger.debug("Response token recording failed", exc_info=True)
 
 
 @server.call_tool(validate_input=False)
@@ -4506,6 +4519,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         # re-enters call_tool for the real action, which then runs those hooks).
         if name in _COUNTER_FRONT_DOOR:
             return await _handle_counter_tool(name, arguments)
+
+        # Session yield tracking (v1.108.146): repeated identical calls +
+        # follow-through/edit-through signals for get_session_stats' `yield`
+        # block. Observation only — never alters dispatch.
+        try:
+            from .storage import token_tracker as _yield_tracker
+            if name != "get_session_stats":
+                import hashlib as _hashlib
+                _sig = _hashlib.sha1(
+                    json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()[:16]
+                _yield_tracker.note_call_signature(name, _sig)
+            if name in ("get_symbol_source", "get_context_bundle"):
+                _fetch_ids = []
+                if arguments.get("symbol_id"):
+                    _fetch_ids.append(arguments["symbol_id"])
+                if isinstance(arguments.get("symbol_ids"), list):
+                    _fetch_ids.extend(s for s in arguments["symbol_ids"] if s)
+                if _fetch_ids:
+                    _yield_tracker.note_fetched(_fetch_ids)
+            elif name == "register_edit" and isinstance(arguments.get("file_paths"), list):
+                _yield_tracker.note_edited_files(arguments["file_paths"])
+            elif name == "index_file" and arguments.get("path"):
+                _yield_tracker.note_edited_files([arguments["path"]])
+        except Exception:
+            logger.debug("Yield tracking failed", exc_info=True)
 
         # jcm#329: cheap per-tool argument validation BEFORE strict-freshness
         # waits and auto-watch reindexing. A call doomed to instant rejection
@@ -5829,6 +5868,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         _saved = result.get("_meta", {}).get("tokens_saved", 0) if isinstance(result, dict) else 0
         _write_pulse(name, tokens_saved=_saved, base_path=storage_path)
 
+        # Session yield: record which symbol ids this response served, and
+        # attach the advisory budget block when the session is approaching or
+        # over its configured session_token_budget (v1.108.146). `spent`
+        # covers responses served BEFORE this one (recorded at return time).
+        try:
+            from .storage import token_tracker as _budget_tracker
+            if isinstance(result, dict):
+                if name == "search_symbols":
+                    _budget_tracker.note_served(
+                        e.get("id") for e in result.get("results", []) if isinstance(e, dict)
+                    )
+                elif name == "get_ranked_context":
+                    _budget_tracker.note_served(
+                        e.get("symbol_id") or e.get("id")
+                        for e in result.get("context_items", []) if isinstance(e, dict)
+                    )
+                _b = _budget_tracker.budget_status()
+                if _b is not None and _b["state"] in ("approaching", "over"):
+                    result.setdefault("_meta", {})["budget"] = _b
+        except Exception:
+            logger.debug("Budget/yield attach failed", exc_info=True)
+
         # Response-level secret redaction — scrub leaked credentials
         # before they reach the LLM context window. Skipped for tools that
         # return raw cached source (any "secret" found is the user's own
@@ -5863,6 +5924,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     m["encoding"] = enc_meta["encoding"]
                     m["encoding_tokens_saved"] = saved
                     m["total_encoding_tokens_saved"] = total_enc
+                _record_response_tokens(encoded)
                 return [TextContent(type="text", text=encoded)]
         except Exception:
             logger.debug("Compact encoding failed; emitting JSON", exc_info=True)
@@ -5874,6 +5936,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             # on it (F-P01); the v1.108.30 passthrough already kept errors JSON.
             _call_ok = False
             return _error_call_result(_text)
+        _record_response_tokens(_text)
         return [TextContent(type="text", text=_text)]
 
     except KeyError as e:

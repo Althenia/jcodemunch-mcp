@@ -2,6 +2,43 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.146] - 2026-07-19 - token yield + advisory session budgets
+
+### Added
+- **Advisory session token budget (`session_token_budget` config).** An
+  advisory ceiling over response tokens served — the context this server
+  injects into the agent, counted at the response chokepoint with the same
+  ~4-bytes-per-token estimate the savings meter uses. When configured,
+  every response past 80% of the limit carries `_meta.budget =
+  {limit, spent, state}` (`approaching` at >=80%, `over` at >=100%) so a
+  runaway loop sees the warning in-band, and `get_session_stats` always
+  reports the block (all three states). Never blocks, throttles, or
+  truncates — awareness only; hard caps belong to the gateway layer.
+  `0` (the default) disables the feature entirely and no block appears.
+- **`yield` block in `get_session_stats`.** The positive counterpart to the
+  retrieval-regret loop: of the context served this session, how much showed
+  downstream follow-through. `rate` = followed_through / served_results,
+  where a served search result (from `search_symbols` /
+  `get_ranked_context`) counts as followed through when it is later fetched
+  via `get_symbol_source`/`get_context_bundle` (fetch-through) or its file
+  is subsequently edited via `register_edit`/`index_file` (edit-through).
+  `repeated_identical_calls` counts identical (tool, args) calls beyond the
+  first, per tool — the agent's redundant context spend, deliberately
+  distinct from cache hits (cache measures the server's cost; a repeat
+  costs the agent's context window even on a hit). The block is omitted
+  when nothing rankable was served; components ship alongside `rate`
+  because unfollowed does not mean useless (a search whose result lines
+  answered the question has yield the call sequence can't see).
+- `session_response_tokens` in session stats (the budget denominator).
+
+### Notes
+- Inline compute only — no new background/persistent/network behavior; no
+  INDEX_VERSION bump; no tool-count or schema change (`_meta` additions +
+  session-stats keys only). Origin: PRD
+  `C:\MCPs\business\jcm-yield-and-budgets\PRD.md` (Token Cost Radar
+  2026-07-19: FinOps token-yield metric + agent budget-overrun literature).
+  Suite parity for `_meta.budget` ships in jdocmunch-mcp / jdatamunch-mcp.
+
 ## [1.108.145] - 2026-07-19 - coverage contract for absence claims + scorer-pinned calibration
 
 ### Added

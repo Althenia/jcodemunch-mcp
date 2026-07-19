@@ -463,6 +463,7 @@ DEFAULTS = {
     "plan_turn_medium_threshold": 0.5,
     "turn_budget_tokens": 20000,
     "turn_gap_seconds": 30.0,
+    "session_token_budget": 0,
     "session_resume": False,
     "session_max_age_minutes": 30,
     "session_max_queries": 50,
@@ -558,6 +559,7 @@ CONFIG_TYPES = {
     "plan_turn_medium_threshold": float,
     "turn_budget_tokens": int,
     "turn_gap_seconds": float,
+    "session_token_budget": int,
     "session_resume": bool,
     "session_max_age_minutes": int,
     "session_max_queries": int,
@@ -2373,6 +2375,11 @@ def generate_template() -> str:
   //   Max tokens returned across all tool calls in a turn. 0 = disabled.
   // "turn_gap_seconds": 30.0,
   //   Seconds of silence before a new "turn" begins (heuristic).
+  // "session_token_budget": 0,
+  //   Advisory session budget over response tokens served. When set (> 0),
+  //   responses carry _meta.budget at >=80% (approaching) and >=100% (over),
+  //   and get_session_stats always reports the budget block. Never blocks
+  //   or truncates — awareness only. 0 = disabled.
   // "session_resume": false,
   //   Persist and restore session state (journal, cache) across restarts.
   //   Writes only on clean shutdown (NVME-friendly). State validated
