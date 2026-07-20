@@ -106,7 +106,9 @@ def fuse(
             entry.channel_contributions[ch.name] = contribution
             entry.channel_ranks[ch.name] = rank_1
 
-    results = sorted(accum.values(), key=lambda r: r.score, reverse=True)
+    # Total-order tiebreak on symbol id: tied fused scores must not fall back
+    # to channel insertion order.
+    results = sorted(accum.values(), key=lambda r: (-r.score, r.symbol_id))
     return results
 
 

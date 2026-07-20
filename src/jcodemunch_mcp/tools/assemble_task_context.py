@@ -252,7 +252,8 @@ def assemble_task_context(
                 candidates_sorted = sorted(
                     candidates,
                     key=lambda s: (s.get("kind") == "import",
-                                   -int(s.get("byte_length", 0) or 0)),
+                                   -int(s.get("byte_length", 0) or 0),
+                                   s.get("id", "")),
                 )
                 anchor_syms.append(candidates_sorted[0])
 
@@ -329,7 +330,8 @@ def assemble_task_context(
                 # Compact: top 5 plates by file_count
                 plates = sorted(
                     (out.get("plates", []) or []),
-                    key=lambda p: -int(p.get("file_count", 0) or 0),
+                    key=lambda p: (-int(p.get("file_count", 0) or 0),
+                                   str(p.get("anchor", ""))),
                 )
                 _add_entry("tectonic", "get_tectonic_map", {
                     "plates": [

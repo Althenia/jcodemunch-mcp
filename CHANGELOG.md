@@ -2,6 +2,33 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.149] - 2026-07-20 - deterministic emission + cache-stability baseline
+
+### Changed
+- **Context-serving sorts carry total-order tiebreaks.** Six float-keyed sort
+  sites (`get_ranked_context` exact-seed and scoring paths, `get_repo_map`
+  file ranking, `signal_fusion.fuse`, `assemble_task_context` anchor and
+  plate picks) resolved ties by list insertion order — which traces back to
+  index storage order and can shuffle across rebuilds of an unchanged tree.
+  Ties now break on symbol id / file path, making result ordering a function
+  of content and scores alone: two indexes built from the same tree in
+  different discovery orders serve identical rankings. Positions driven by
+  real score differences are unchanged. Foundation for any future
+  cache-stable emission work, and removes a latent flake source for replay
+  baselines and cross-process result caching.
+
+### Added
+- **`benchmarks/cache_stability/` measurement harness.** Quantifies, against
+  a pinned self-index snapshot, how much of what `get_ranked_context` serves
+  across realistic drill-down query sequences is repeated symbols in a
+  different order — the waste a byte-stable emission mode would target.
+  Measured baseline (committed in `results.json`): 15.8% of served bytes are
+  repeats, 13.9% re-shuffled, byte-prefix overlap ~0. That lands **below**
+  the pre-registered 30% go/no-go threshold, so the stable/delta partition
+  and pinnable-prelude phases of the cache-stability PRD are deliberately
+  **on hold** — the measurement is the deliverable, and it says the bigger
+  win isn't there yet at current usage shapes.
+
 ## [1.108.148] - 2026-07-20 - estimate-vs-actual consumption receipts
 
 ### Added

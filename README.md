@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.149](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.149)** (2026-07-20) — deterministic emission + cache-stability baseline
 - **[v1.108.148](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.148)** (2026-07-20) — estimate-vs-actual consumption receipts
 - **[v1.108.147](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.147)** (2026-07-19) — single-flight cold index loads and BM25 builds
-- **[v1.108.146](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.146)** (2026-07-19) — token yield + advisory session budgets
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
