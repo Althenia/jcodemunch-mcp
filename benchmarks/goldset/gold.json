@@ -1,0 +1,88 @@
+{
+  "corpus_version": "authored-scenarios-v2",
+  "languages": ["python", "typescript", "go"],
+  "scope": "Authored scenario corpus: measures channel discrimination on known implementation patterns and known false-positive traps (module-homonym bases, same-name-different-domain methods, substring decorator matches). Go scenarios exercise the duck channel exclusively — Go's implicit interfaces have no declared inheritance for the AST channel to walk, and Go has no decorators. It does NOT estimate in-the-wild base rates; n per channel is small and disclosed.",
+  "targets": [
+    {
+      "target": "payments/base.py::PaymentProvider#class",
+      "language": "python",
+      "description": "Class target: declared subclasses, incl. a module-homonym trap.",
+      "labels": [
+        {"name": "StripeGateway", "file": "payments/stripe_impl.py", "channel": "ast", "true_impl": true, "why": "declared subclass implementing the full protocol"},
+        {"name": "PayPalGateway", "file": "payments/paypal_impl.py", "channel": "ast", "true_impl": true, "why": "declared subclass implementing charge"},
+        {"name": "LegacyBridgeGateway", "file": "payments/legacy.py", "channel": "ast", "true_impl": true, "why": "transitive subclass via StripeGateway"},
+        {"name": "CsvPaymentReport", "file": "reporting/csv_report.py", "channel": "ast", "true_impl": false, "why": "subclasses the unrelated reporting.PaymentProvider homonym — name-collision trap"}
+      ]
+    },
+    {
+      "target": "payments/base.py::PaymentProvider.charge#method",
+      "language": "python",
+      "description": "Method target: subclass overrides plus duck-typed conformers and same-name-different-domain traps.",
+      "labels": [
+        {"name": "charge", "file": "payments/stripe_impl.py", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "charge", "file": "payments/paypal_impl.py", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "charge", "file": "pos/terminal.py", "channel": "duck", "true_impl": true, "why": "CardTerminal charges money with the protocol's signature — duck-typed conformer"},
+        {"name": "charge", "file": "payments/mock_provider.py", "channel": "duck", "true_impl": true, "why": "test double conforming to the protocol without inheritance"},
+        {"name": "charge", "file": "payments/applepay_adapter.py", "channel": "duck", "true_impl": true, "why": "adapter conforming to the protocol without inheritance"},
+        {"name": "charge", "file": "pos/hardware.py", "channel": "duck", "true_impl": false, "why": "BatteryPack.charge is electrical charging — same name, different domain"},
+        {"name": "charge", "file": "pos/legal.py", "channel": "duck", "true_impl": false, "why": "CriminalCase.charge is a legal indictment — same name, different domain"}
+      ]
+    },
+    {
+      "target": "events/protocol.py::user_created#function",
+      "language": "python",
+      "description": "Event-protocol target: decorator-registered handlers plus substring-match traps.",
+      "labels": [
+        {"name": "send_welcome_email", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "provision_workspace", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "audit_log_user", "file": "events/handlers.py", "channel": "decorator", "true_impl": true, "why": "@on(\"user_created\") registered handler"},
+        {"name": "show_user_created_report", "file": "events/web.py", "channel": "decorator", "true_impl": false, "why": "@route path merely CONTAINS the event name — substring trap"},
+        {"name": "cleanup_user_created_exports", "file": "events/web.py", "channel": "decorator", "true_impl": false, "why": "@task name merely CONTAINS the event name — substring trap"}
+      ]
+    },
+    {
+      "target": "ts/notify/base.ts::Notifier#class",
+      "language": "typescript",
+      "description": "TS class target: declared extends, incl. a module-homonym trap (UI toast Notifier).",
+      "labels": [
+        {"name": "EmailNotifier", "file": "ts/notify/email.ts", "channel": "ast", "true_impl": true, "why": "extends the notification protocol class"},
+        {"name": "SmsNotifier", "file": "ts/notify/sms.ts", "channel": "ast", "true_impl": true, "why": "extends the notification protocol class"},
+        {"name": "BannerNotifier", "file": "ts/analytics/banner.ts", "channel": "ast", "true_impl": false, "why": "extends the unrelated UI toast Notifier homonym — name-collision trap"}
+      ]
+    },
+    {
+      "target": "ts/notify/base.ts::Notifier.send#method",
+      "language": "typescript",
+      "description": "TS method target: extends-overrides plus duck conformers and physical-dispatch traps.",
+      "labels": [
+        {"name": "send", "file": "ts/notify/email.ts", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "send", "file": "ts/notify/sms.ts", "channel": "ast", "true_impl": true, "why": "override in a declared subclass"},
+        {"name": "send", "file": "ts/gateway/push.ts", "channel": "duck", "true_impl": true, "why": "PushGateway sends messages with the protocol's signature — duck-typed conformer"},
+        {"name": "send", "file": "ts/factory/conveyor.ts", "channel": "duck", "true_impl": false, "why": "ConveyorBelt.send routes a physical item to a station — same name, different domain"},
+        {"name": "send", "file": "ts/building/elevator.ts", "channel": "duck", "true_impl": false, "why": "ElevatorBank.send dispatches an elevator car — same name, different domain"}
+      ]
+    },
+    {
+      "target": "ts/billing/protocol.ts::invoice_paid#function",
+      "language": "typescript",
+      "description": "TS event-protocol target: decorator-registered handlers plus substring traps.",
+      "labels": [
+        {"name": "applyCredit", "file": "ts/billing/handlers.ts", "channel": "decorator", "true_impl": true, "why": "@On(\"invoice_paid\") registered handler"},
+        {"name": "notifyAccounting", "file": "ts/billing/handlers.ts", "channel": "decorator", "true_impl": true, "why": "@On(\"invoice_paid\") registered handler"},
+        {"name": "showInvoicePaidSummary", "file": "ts/billing/reports.ts", "channel": "decorator", "true_impl": false, "why": "@Get route path merely CONTAINS the event name — substring trap"},
+        {"name": "archiveInvoicePaidEvents", "file": "ts/billing/reports.ts", "channel": "decorator", "true_impl": false, "why": "@Task name merely CONTAINS the event name — substring trap"}
+      ]
+    },
+    {
+      "target": "go/collect/queue.go::Push#method",
+      "language": "go",
+      "description": "Go method target: implicit-interface conformers (duck is Go's native semantics) plus physical/advocacy traps. No AST channel — Go has no declared inheritance.",
+      "labels": [
+        {"name": "Push", "file": "go/collect/ring.go", "channel": "duck", "true_impl": true, "why": "RingBuffer conforms to the collection Push protocol"},
+        {"name": "Push", "file": "go/collect/plist.go", "channel": "duck", "true_impl": true, "why": "PriorityList conforms to the collection Push protocol"},
+        {"name": "Push", "file": "go/mower/mower.go", "channel": "duck", "true_impl": false, "why": "Lawnmower.Push means physically pushing the mower — same name, different domain"},
+        {"name": "Push", "file": "go/talent/recruiter.go", "channel": "duck", "true_impl": false, "why": "Recruiter.Push means advocating a candidate — same name, different domain"}
+      ]
+    }
+  ]
+}

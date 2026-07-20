@@ -2,6 +2,391 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.147] - 2026-07-19 - single-flight cold index loads and BM25 builds
+
+### Fixed
+- **Concurrent cold searches no longer repeat whole-index work (#370,
+  reported by @rknighton).** Two thundering-herd defects, both visible at
+  scale (a 665k-symbol, ~0.5 GB index took 7.5–11.4 minutes and ~16 GiB
+  when 13 cold searches landed at once):
+  - `load_index`'s cold path hydrated the same repository once per
+    concurrent caller — the cache *check* was locked but the hydration was
+    not. A per-repo single-flight lock now serializes cold hydration: one
+    caller reads the rows and builds the `CodeIndex`, the rest wake up and
+    take the freshly cached object. N simultaneous cold callers cost one
+    hydration's time and memory instead of N.
+  - The per-index `_bm25_cache` check-then-build was unsynchronized, so
+    every cold search independently built the full-corpus BM25/centrality/
+    PageRank state. `CodeIndex` now carries a `_bm25_lock`, used
+    double-checked at every build site (`search_symbols`,
+    `get_ranked_context`, `plan_turn`, `find_implementations`,
+    `get_repo_map`) and around `register_edit`'s cache clear.
+  Warm-path behavior, result shapes, and ranking are byte-identical; the
+  change only removes duplicated work. Known residual (documented, not
+  fixed here): cancelling a client request cannot stop in-flight
+  server-side work — tool bodies run to completion in a worker thread.
+
+## [1.108.146] - 2026-07-19 - token yield + advisory session budgets
+
+### Added
+- **Advisory session token budget (`session_token_budget` config).** An
+  advisory ceiling over response tokens served — the context this server
+  injects into the agent, counted at the response chokepoint with the same
+  ~4-bytes-per-token estimate the savings meter uses. When configured,
+  every response past 80% of the limit carries `_meta.budget =
+  {limit, spent, state}` (`approaching` at >=80%, `over` at >=100%) so a
+  runaway loop sees the warning in-band, and `get_session_stats` always
+  reports the block (all three states). Never blocks, throttles, or
+  truncates — awareness only; hard caps belong to the gateway layer.
+  `0` (the default) disables the feature entirely and no block appears.
+- **`yield` block in `get_session_stats`.** The positive counterpart to the
+  retrieval-regret loop: of the context served this session, how much showed
+  downstream follow-through. `rate` = followed_through / served_results,
+  where a served search result (from `search_symbols` /
+  `get_ranked_context`) counts as followed through when it is later fetched
+  via `get_symbol_source`/`get_context_bundle` (fetch-through) or its file
+  is subsequently edited via `register_edit`/`index_file` (edit-through).
+  `repeated_identical_calls` counts identical (tool, args) calls beyond the
+  first, per tool — the agent's redundant context spend, deliberately
+  distinct from cache hits (cache measures the server's cost; a repeat
+  costs the agent's context window even on a hit). The block is omitted
+  when nothing rankable was served; components ship alongside `rate`
+  because unfollowed does not mean useless (a search whose result lines
+  answered the question has yield the call sequence can't see).
+- `session_response_tokens` in session stats (the budget denominator).
+
+### Notes
+- Inline compute only — no new background/persistent/network behavior; no
+  INDEX_VERSION bump; no tool-count or schema change (`_meta` additions +
+  session-stats keys only). Origin: PRD
+  `C:\MCPs\business\jcm-yield-and-budgets\PRD.md` (Token Cost Radar
+  2026-07-19: FinOps token-yield metric + agent budget-overrun literature).
+  Suite parity for `_meta.budget` ships in jdocmunch-mcp / jdatamunch-mcp.
+
+## [1.108.145] - 2026-07-19 - coverage contract for absence claims + scorer-pinned calibration
+
+### Added
+- **Coverage contract on `absent`/`degraded` verdicts.** A scan count alone
+  can't back an absence claim when files never entered the corpus. Every full
+  discovery walk now persists a coverage block into the index meta
+  (`files_indexed`, nonzero skip counts by reason — wrong_extension,
+  too_large, binary, secret, symlink, file_limit — plus the count of files
+  that parsed to zero symbols), and `_meta.verdict` on `absent`/`degraded`
+  states discloses it alongside index generation (`indexed_at`,
+  `index_version`, truncated `git_head`) and `included_scopes`. Attached
+  across `search_symbols`, `search_text`, `get_ranked_context`, and the
+  file/symbol verdict wrappers (`get_file_outline`, `get_symbol_source`).
+  An index that predates the contract simply omits the block — coverage
+  unknown is never presented as "nothing was excluded". `ok`/`low_confidence`
+  verdicts stay lean. Explicit-`paths` subset indexing does not overwrite
+  the last full-walk coverage.
+- **`_meta.verdict.scorer` version pin + planted-query calibration
+  artifact.** The verdict now carries `scorer` (currently 1) so confidence
+  claims tie to the scoring heuristics that produced them. New
+  `benchmarks/calibration/planted_queries.json` records measured
+  planted-positive hit rate and planted-negative absent rate;
+  `tests/test_verdict_coverage_calibration.py` re-runs the measurement live
+  in CI (slug-unique planted names, immune to corpus drift) and fails when
+  the scorer changes without a re-measured artifact.
+- `schemas/retrieval-verdict.schema.json` documents both additions.
+
+### Notes
+- Origin: community feedback on the retrieval-verdict article (coverage
+  contract for `absent`; empirical calibration of the confidence surface).
+  Full reliability curves (ECE/Brier per query class) remain the end state;
+  the scorer pin + planted harness is the v1 gate.
+- No INDEX_VERSION bump (coverage rides the meta k-v table, self-heals on
+  every full-walk save). No tool-count or input-schema change.
+
+## [1.108.144] - 2026-07-18 - deep-doc currency sweep
+
+### Fixed
+- **ARCHITECTURE, SPEC, USER_GUIDE, CONFIGURATION, CONTEXT_PROVIDERS, and
+  TOKEN_SAVINGS brought current.** The deep references had not caught up
+  with recent subsystems; each gained targeted sections rather than a
+  rewrite:
+  - ARCHITECTURE: retrieval honesty signals (verdict/confidence/freshness),
+    query-shape exact seeding, signal-channel fusion,
+    `find_implementations` channels + the imported-never-generated
+    evidence rule, adaptive tool tiers + schema budget + annotations,
+    gold-corpus and confidence-provenance additions to the proof surface.
+  - SPEC: `_meta` honesty and provenance fields (`negative_evidence`
+    states, `confidence_provenance`, `query_shape`, `savings_provenance`),
+    tool annotations (`readOnlyHint`/`openWorldHint`), exact-seeding
+    semantics, meter conservatism guarantees.
+  - USER_GUIDE: `find_implementations` and `set_tool_tier` added to the
+    tool tables, exact-name pinning tip on `get_ranked_context`, verdict +
+    provenance entries under retrieval health signals, `receipt` CLI in
+    the savings section, UNDER_THE_HOOD in the reference sidebar.
+  - CONFIGURATION: documented `tool_profile`, `tool_tier_bundles`,
+    `adaptive_tiering`, `allow_disabling_tier_controls`,
+    `compact_schemas`, and `allow_paid_summaries`.
+  - CONTEXT_PROVIDERS: built-in provider table expanded from 1 to 9 rows
+    (django, express-family, rails, laravel, nextjs/nuxt, go_routers,
+    decorator_routes, git_blame), descriptions taken from the provider
+    docstrings.
+  - TOKEN_SAVINGS: meter conservatism, tokens-not-currency valuation at
+    display time, the lifetime meter + per-day buckets, and the `receipt`
+    CLI with its `savings_provenance` export.
+
+Documentation-only release: no behavior changes.
+
+## [1.108.143] - 2026-07-18 - UNDER_THE_HOOD.md: the technical manual
+
+### Added
+- **`UNDER_THE_HOOD.md` — a workshop-manual counterpart to USER_GUIDE.md.**
+  Six chapters on the machinery an advanced developer can exploit but the
+  owner's manual doesn't cover: the retrieval-verdict / confidence /
+  freshness honesty signals; ranking internals (channel fusion, exact-name
+  pinning, PageRank, learned per-repo weights, the regret loop); the
+  declared-vs-measured provenance contract and the gold corpus behind it;
+  the token meter's every-error-points-down design; tool tiers and the
+  CI-enforced schema token budget; and the imported-never-executed
+  evidence rule (`import-scip` / `import-trace`). Includes a chapter map
+  ("spine") positioning the existing deep references (ARCHITECTURE, SPEC,
+  CONFIGURATION, CONTEXT_PROVIDERS, TOKEN_SAVINGS, schemas/) and names the
+  forthcoming chapters. Linked from README's doc table.
+
+Documentation-only release: no behavior changes.
+
+## [1.108.142] - 2026-07-18 - tool descriptions catch up with the contracts
+
+### Fixed
+- **`find_implementations` description now lists all five resolution
+  channels.** The SCIP compile-time evidence channel (1.0, active when a
+  compiler index is imported via `import-scip`) had been missing from the
+  agent-facing description since it shipped in v1.108.96. The description
+  also now says what the numbers are: declared ranking priors, with
+  `_meta.confidence_provenance` stating each channel's basis and
+  gold-corpus measured precision/recall where available — the description
+  no longer presents bare constants the response contract is careful to
+  qualify.
+- **`get_ranked_context` description documents exact-name pinning.**
+  Source-shaped identifiers in the query (qualified names, CamelCase,
+  snake_case) pin exact-name symbol matches ahead of the lexical ranking
+  (since v1.108.137); the description now tells agents to include the
+  identifier verbatim when they know it. README's tool listing gained the
+  same clause, including the `_meta.query_shape` report field.
+
+No behavior changes — documentation strings and README only.
+
+## [1.108.141] - 2026-07-18 - gold corpus v2: TypeScript and Go join the measurement
+
+### Added
+- **The channel-accuracy gold corpus now spans three languages**
+  (`authored-scenarios-v2`). TypeScript scenarios mirror the Python design
+  with TS-native semantics: `extends`-declared notifier subclasses plus a
+  UI-toast `Notifier` homonym trap for the AST channel; a duck-typed
+  `PushGateway.send` conformer against `ConveyorBelt.send` (routing a
+  physical item) and `ElevatorBank.send` (dispatching an elevator car)
+  traps; `@On("invoice_paid")` handler methods against `@Get` route-path
+  and `@Task` job-name substring traps. Go scenarios exercise the duck
+  channel exclusively — deliberately, since Go's implicit interfaces have no
+  declared inheritance for the AST channel to walk and Go has no
+  decorators: `RingBuffer.Push`/`PriorityList.Push` conformers against
+  `Lawnmower.Push` (physically pushing the mower) and `Recruiter.Push`
+  (advocating a candidate) traps.
+- **Measured round 2 (aggregate, 3 languages):** AST precision 0.818
+  (tp=9 fp=2), duck 0.5 (tp=6 fp=6), decorator 0.556 (tp=5 fp=4) — recall
+  1.0 across every channel and language. The artifact gains a
+  `per_language` breakdown. The duck prior (0.65) now reads clearly
+  optimistic against the harder cross-language corpus (0.5 measured) —
+  exactly the kind of drift the measured_ref exists to make visible; the
+  operating constants stay declared pending a deliberate replay-gated
+  recalibration.
+- Harness: corpus hash covers `.py`/`.ts`/`.go`; per-language stats; the
+  unlabeled-pair guard and the CI re-measurement gate carry over unchanged.
+
+## [1.108.140] - 2026-07-18 - the first gold corpus: channel accuracy, measured
+
+### Added
+- **An authored gold corpus for `find_implementations` channel accuracy**
+  (`benchmarks/goldset/`). Every implementation relation — declared
+  subclasses, duck-typed conformers, decorator-registered handlers — and
+  every deliberate false-positive trap (a module-homonym base class, same-
+  name-different-domain methods like electrical/legal `charge`, substring
+  decorator matches like a `/user_created_report` route against a
+  `user_created` event) is labeled in `gold.json` with a per-pair rationale,
+  so ground truth is exact by construction.
+- **A reproducible measurement harness** (`benchmarks/goldset/measure.py`):
+  snapshots the corpus to a temp dir, indexes it, runs
+  `find_implementations` per gold target, joins each surfaced implementation
+  to its label, and writes per-channel precision/recall to
+  `benchmarks/provenance/channel_accuracy.json`. First measured round: AST
+  0.833 precision (the homonym trap), duck 0.6, decorator 0.6 — recall 1.0
+  across all channels. Notably the shipped priors survive contact with
+  measurement: 0.85 declared vs 0.833 measured for AST, 0.65 vs 0.6 for
+  duck, and the 0.45 decorator prior is *more* conservative than measured.
+- **The measurement re-runs in CI** (`tests/test_channel_accuracy.py`): the
+  committed artifact must equal a live re-measurement and the corpus content
+  hash, so the numbers cannot drift from the reproducible run — a corpus or
+  channel change forces a deliberate artifact regeneration.
+- **Registry and responses carry the measured reference.** Each heuristic
+  channel's provenance entry gains `measured_ref` (precision/recall, corpus,
+  artifact path) beside its declared ranking prior, surfaced in
+  `_meta.confidence_provenance`; `MEASURED` gains
+  `implementation_channel_accuracy`. The operating constants deliberately
+  stay `declared` — they are ranking priors, and recalibrating them to a
+  small-n corpus would trade honest stability for false precision; the
+  artifact states its scope (authored-pattern discrimination, not
+  in-the-wild base rates). LSP/SCIP channels carry no `measured_ref` — they
+  are the ground-truth side of the comparison.
+
+## [1.108.139] - 2026-07-18 - measured provenance rides the reporting surfaces
+
+### Added
+- **The measured-artifact block now attaches where the numbers get read.**
+  New `measured_provenance()` (`retrieval/provenance.py`) returns the
+  committed measurement artifacts behind the suite's savings and quality
+  claims (the tiktoken token-reduction methodology + the CI-gated replay
+  retrieval golden, both drift-guarded against
+  `benchmarks/provenance/measured.json`), and it now rides:
+  - `receipt --export json` — a `provenance` block beside the totals, so an
+    exported ledger carries its own receipts;
+  - `receipt` text output — the methodology footer cites the committed
+    artifact path;
+  - `get_session_stats` — a `savings_provenance` block beside the savings
+    figures;
+  - `jcodemunch_guide` — a `provenance` key beside the policy snippet, so an
+    agent reading the guide sees the declared-vs-measured contract up front.
+
+  Deliberately kept OFF the hot retrieval path: provenance rides the
+  reporting surfaces a human or auditor reads, not every query. Suite
+  parity note: the same reporting-surface shape belongs on jdocmunch /
+  jdatamunch session stats in their next releases.
+
+## [1.108.138] - 2026-07-18 - confidence provenance: every number states its basis
+
+### Added
+- **Confidence provenance registry** (`retrieval/provenance.py`). Every
+  confidence constant the suite emits now traces to a stated basis:
+  `measured` — backed by a committed, reproducible benchmark artifact
+  (`benchmarks/provenance/measured.json`: the tiktoken token-reduction
+  methodology and the CI-gated replay retrieval-quality golden) — or
+  `declared` — an engineering prior, honestly labeled as exactly that. The
+  contract's load-bearing rule: **a prior is never presented as a
+  measurement.** A `declared` value graduates to `measured` only when a
+  gold-labeled corpus backs it, and `tests/test_provenance.py` fails the
+  build otherwise. Drift guards run in three directions: registry values
+  must equal the live constants in the emitting modules, registry `measured`
+  entries must equal the committed artifact, and the artifact must equal the
+  underlying benchmark results it cites (replay golden, methodology doc) —
+  no number can silently diverge from its receipt.
+- **`find_implementations` responses carry `_meta.confidence_provenance`** —
+  the per-channel basis for its resolution-confidence tiers (LSP/SCIP/AST/
+  duck-typed/decorator), so a caller can see that today's tiers are declared
+  priors, not measurements dressed up as ones.
+- **Published response JSON Schemas** in `schemas/`:
+  `retrieval-verdict.schema.json` (the unified `_meta.verdict` contract),
+  `confidence-provenance.schema.json`, and
+  `ranked-context-response.schema.json` (the full `get_ranked_context` JSON
+  surface, including `match_channel`/`_meta.query_shape` from v1.108.137).
+  CI validates live responses against them; external pipelines and agents
+  can do the same.
+
+## [1.108.137] - 2026-07-18 - source-shaped exact seeding in ranked context
+
+### Added
+- **`get_ranked_context` recognizes source-shaped query tokens and pins their
+  exact symbol matches first.** A query that pastes an identifier straight out
+  of the source — `Store.get`, `FreshnessProbe`, `get_ranked_context()` — names
+  the one symbol the caller actually wants, but BM25 tokenization splits it
+  into fragments and dilutes it. New `retrieval/query_shape.py` classifies
+  query tokens into identifier shapes (qualified `A::B`/`a.b`, CamelCase,
+  snake_case, dunders; filenames deliberately excluded), and the default
+  ranking path resolves each shaped token to exact-name symbol matches
+  (case-sensitive first; a qualified token's parent segment narrows
+  candidates; PageRank ranks ties; caller `include_kinds`/`scope` filters
+  honored) pinned ahead of the ranked tail. Seeded items carry
+  `match_channel: "exact_name"`; `_meta.query_shape` reports the detected
+  tokens + seed count. An exact-name hit also floors the retrieval verdict at
+  confident, and a seeded result can no longer fall into negative evidence.
+  **Pure natural-language queries are byte-identical** — no shaped tokens, no
+  seeding. The `fusion=True` path already runs a weighted identity channel and
+  is unchanged. Name lookup is cached beside the BM25 corpus (`name_map`), so
+  the per-call cost is one dict probe per shaped token.
+
+### Changed
+- **Every tool annotation now carries `openWorldHint`.** `readOnlyHint` made
+  the read-only charter machine-checkable; this does the same for the network
+  posture. All tools annotate `openWorldHint: false` except the user-invoked,
+  README-disclosed network-capable set (`index_repo`, the summarizer-capable
+  indexers, `embed_repo`/`check_embedding_drift`/`test_summarizer`, and the
+  `order`/`route` front door, which can dispatch them). A gating client can
+  now prove "this tool never touches the network" per tool.
+
+### Fixed
+- **WAL growth is bounded in all three SQLite stores.** A long-lived reader (a
+  watcher or a long agent session) can starve WAL checkpoints and grow the log
+  without bound. `PRAGMA journal_size_limit = 64 MB` is now set on the index
+  store (`_PRAGMAS`), the embedding store, and the shared parse cache, so a
+  successful checkpoint reclaims the file.
+
+## [1.108.136] - 2026-07-17 - the savings meter records a per-day rollup
+
+The lifetime meter (`_savings.json`, written on every tool call) is the
+authoritative record of what each call actually avoided, but it stored only one
+number — so any windowed view ("today", "this month") had to fall back to
+scanning local transcripts, which miss cleared history and model savings with
+deliberately conservative multipliers. On a heavy install the gap is not subtle:
+the transcript scan could prove ~2.2M tokens all-time while the meter had
+recorded 34.3B — four orders of magnitude. A dashboard drawing windows from
+transcripts next to a lifetime tile from the meter showed \$7.73 "this month"
+beside \$171K all-time, which reads as a broken product rather than two sources.
+
+The flush now also credits each batch to a per-local-day bucket in a `daily` map
+alongside `total_tokens_saved`. Same file, same read-modify-write chokepoint, so
+multiple server processes keep accumulating correctly; capped at 750 days so the
+file stays a few KB. Flush batches are small, so crediting a batch to its flush
+day mis-dates at most one batch across midnight. History accrues from the first
+flush under this version forward — the single lifetime total can't be
+back-distributed into days it never recorded.
+
+New `tests/test_v1_108_136.py` (6). NO INDEX_VERSION / tool-count / wire change;
+the file was already disclosed in the README's background-behavior section.
+
+## [1.108.135] - 2026-07-17 - `receipt --rates` publishes the model price table
+
+The savings model values tokens at a model's input rate, and the rate table lived
+only inside `receipt`. Any consumer pricing its own token counts had to keep a
+copy — and a copy drifts silently: the jMunch Console's duplicate sat at the
+retired \$15 Opus rate long after this table moved to \$5, so its two dollar
+figures disagreed by 3x with nothing to catch it.
+
+`receipt --rates` prints the table as JSON (`rates_usd_per_mtok` + `default_model`)
+and exits. It scans no transcripts, so a consumer can read it cheaply and offer
+every model this table prices — including any model added later — without a code
+change on its side. `--model`'s choices already derive from the same table
+(1.108.131), so the CLI and its published rates cannot disagree.
+
++3 tests in `tests/test_v1_108_134.py`. NO INDEX_VERSION / tool-count / wire change.
+
+## [1.108.134] - 2026-07-17 - `receipt` gains calendar windows and a per-day series
+
+`receipt --days N` is a rolling window measured back from now, so it can express
+"the last 24 hours" but not "today", and "yesterday" not at all. Two additions:
+
+- **`--since` / `--until`** bound the window explicitly. A bare date (`2026-07-16`)
+  means local midnight — "yesterday" means yesterday where the person is sitting,
+  not in UTC — and a full ISO datetime works too. `--until` is **exclusive**, so
+  two adjacent calendar windows can never both claim a call that lands on the
+  boundary. `--days` still applies when neither is given, so existing callers are
+  unaffected.
+- **`--by-day`** adds a `by_day` series to the JSON export: one row per calendar
+  day with any calls, carrying calls/actual/baseline/savings plus the dollar value
+  at the selected model's rate. `iter_calls` already yielded a per-call timestamp
+  and `aggregate` discarded it; the new `aggregate_by_day` keeps it. The series
+  sums to the window total by construction, so a chart drawn from it always
+  reconciles with the headline figure beside it — and a caller wanting several
+  ranges can slice one scan instead of paying one scan per range.
+
+The JSON export also gains a `window` block recording the bounds it actually used.
+Both new flags are additive: without them the output is unchanged. The `server.py`
+CLI dispatcher (which re-declares the receipt flags) forwards them too — the same
+duplicate-parser surface that stranded `--model fable` in 1.108.131.
+
+New `tests/test_v1_108_134.py` (16). NO INDEX_VERSION / tool-count / wire change.
+
 ## [1.108.133] - 2026-07-16 - cache hits count toward the savings meter
 
 `search_symbols` records the tokens it saves into the persistent lifetime meter

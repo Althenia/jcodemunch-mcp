@@ -47,6 +47,55 @@ def index_truncation_meta(cap: Optional[dict]) -> Optional[dict]:
     }
 
 
+# Version pin for the confidence/score heuristics the verdict reports.
+# Bump whenever the scoring formula (BM25 blending, thresholds, seeding
+# floors) changes, so calibration claims tie to the scorer that produced
+# them: "0.8 under scorer v1" is a measurable statement, "0.8" is not.
+SCORER_VERSION = 1
+
+
+def index_coverage_meta(index) -> Optional[dict]:
+    """Query-time coverage disclosure backing an absence claim.
+
+    Pulls the persisted coverage contract (recorded at the last full
+    discovery walk) plus generation metadata off the index. Returns None when
+    the index predates coverage recording — absence of the block means
+    "coverage unknown", never "nothing was excluded".
+    """
+    cov = getattr(index, "coverage", None)
+    if not isinstance(cov, dict) or not cov:
+        return None
+    out: dict = {
+        "generation": {
+            "indexed_at": getattr(index, "indexed_at", "") or None,
+            "index_version": getattr(index, "index_version", None),
+        },
+        "files_indexed": cov.get("files_indexed"),
+    }
+    head = getattr(index, "git_head", "") or ""
+    if head:
+        out["generation"]["git_head"] = head[:12]
+    scopes = getattr(index, "source_roots", None)
+    if scopes:
+        out["included_scopes"] = scopes
+    skips = cov.get("skip_counts") or {}
+    if skips:
+        out["excluded"] = skips
+    if cov.get("no_symbols_count"):
+        out["no_symbols_files"] = cov["no_symbols_count"]
+    return out
+
+
+def _attach_coverage(verdict: dict, coverage: Optional[dict]) -> None:
+    """Attach coverage disclosure to absent/degraded verdicts (in place).
+
+    Only the states where "what wasn't scanned" changes the meaning of the
+    result carry the block; ok/low_confidence stay lean.
+    """
+    if coverage and verdict.get("state") in (STATE_ABSENT, STATE_DEGRADED):
+        verdict["coverage"] = coverage
+
+
 # Emitted as verdict["state"].
 STATE_OK = "ok"
 STATE_LOW_CONFIDENCE = "low_confidence"
@@ -119,6 +168,7 @@ def build_verdict(
     semantic_requested: bool = False,
     index_stale: bool = False,
     timed_out: bool = False,
+    coverage: Optional[dict] = None,
 ) -> dict:
     """Compute the unified verdict plus the legacy negative_evidence dict.
 
@@ -165,10 +215,12 @@ def build_verdict(
             "semantic": semantic_channel,
             "index": "stale" if index_stale else "fresh",
         },
+        "scorer": SCORER_VERSION,
         "note": _NOTES[state],
     }
     if did_you_mean:
         verdict["did_you_mean"] = did_you_mean
+    _attach_coverage(verdict, coverage)
 
     # --- legacy negative_evidence: unchanged trigger + shape ---
     negative_evidence = None
@@ -317,12 +369,14 @@ def symbol_verdict_for_index(
     requested_id: Optional[str] = None,
 ) -> dict:
     """Index-aware wrapper over :func:`build_symbol_verdict`."""
-    return build_symbol_verdict(
+    verdict = build_symbol_verdict(
         found_count=found_count,
         requested_id=requested_id,
         symbols=getattr(index, "symbols", None) if found_count == 0 else None,
         index_stale=_index_is_stale(index),
     )
+    _attach_coverage(verdict, index_coverage_meta(index))
+    return verdict
 
 
 def _index_source_files(index) -> list:
@@ -357,13 +411,15 @@ def file_verdict_for_index(
     empty_symbols: bool = False,
 ) -> dict:
     """Index-aware wrapper over :func:`build_file_verdict` for the file tools."""
-    return build_file_verdict(
+    verdict = build_file_verdict(
         present=present,
         requested_path=requested_path,
         source_files=_index_source_files(index) if not present else None,
         index_stale=_index_is_stale(index),
         empty_symbols=empty_symbols,
     )
+    _attach_coverage(verdict, index_coverage_meta(index))
+    return verdict
 
 
 def build_symbol_verdict(

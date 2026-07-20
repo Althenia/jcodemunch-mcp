@@ -190,6 +190,7 @@ def search_text(
     total_saved = record_savings(tokens_saved, tool_name="search_text")
 
     from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     from ..retrieval.verdict import index_truncation_meta as _index_truncation_meta
     _vres = _build_verdict(
         result_count=result_count,
@@ -197,6 +198,7 @@ def search_text(
         query_terms=(query.lower().split() if not is_regex else None),
         source_files=index.source_files,
         timed_out=timed_out,
+        coverage=_index_coverage_meta(index),
     )
     _meta = {
         "timing_ms": round(elapsed, 1),

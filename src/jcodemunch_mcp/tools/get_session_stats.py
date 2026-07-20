@@ -12,6 +12,12 @@ def get_session_stats(storage_path: Optional[str] = None) -> dict:
 
     Returns:
         Dict with session and all-time token savings, cost avoided estimates,
-        per-tool breakdown, and session duration.
+        per-tool breakdown, and session duration. ``savings_provenance``
+        cites the committed benchmark artifacts behind the savings model
+        (basis: measured — see benchmarks/provenance/measured.json).
     """
-    return _get_session_stats(base_path=storage_path)
+    from ..retrieval.provenance import measured_provenance
+
+    result = _get_session_stats(base_path=storage_path)
+    result["savings_provenance"] = measured_provenance()
+    return result

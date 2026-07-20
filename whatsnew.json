@@ -1,23 +1,23 @@
 {
-  "current": "1.108.94",
+  "current": "1.108.147",
   "entries": [
     {
-      "version": "1.108.94",
-      "date": "2026-07-02",
-      "title": "New tool: index_dependency (index the libraries a repo actually uses)",
-      "summary": "Agents constantly need API ground truth for third-party libraries, and until now the suite only indexed the repo's own code. `index_dependency` resolves an npm or PyPI package to the version ACTUALLY INSTALLED in the host repo (`node_modules`, or a repo-local `.venv`/`venv`/`env` virtualenv), reads the"
+      "version": "1.108.147",
+      "date": "2026-07-19",
+      "title": "single-flight cold index loads and BM25 builds",
+      "summary": "- **Concurrent cold searches no longer repeat whole-index work (#370, reported by @rknighton).** Two thundering-herd defects, both visible at scale (a 665k-symbol, ~0.5 GB index took 7.5\u201311.4 minutes and ~16 GiB when 13 cold searches landed at once):"
     },
     {
-      "version": "1.108.93",
-      "date": "2026-07-02",
-      "title": "Upstream exposure links (get_endpoint_impact include_infra exposes)",
-      "summary": "`get_endpoint_impact(include_infra=True)` now answers the upstream question alongside v1.108.91's downstream one: **what infrastructure exposes the app that serves this endpoint?** The previously empty `infra.exposes[]` list is populated with evidence-anchored links, each carrying an explicit `precision`"
+      "version": "1.108.146",
+      "date": "2026-07-19",
+      "title": "token yield + advisory session budgets",
+      "summary": "- **Advisory session token budget (`session_token_budget` config).** An advisory ceiling over response tokens served \u2014 the context this server injects into the agent, counted at the response chokepoint with the same ~4-bytes-per-token estimate the savings meter uses. When configured,"
     },
     {
-      "version": "1.108.92",
-      "date": "2026-07-02",
-      "title": "Progress-notification flood control + response drain (#359)",
-      "summary": "Full-repo `index_folder` over MCP stdio could lose its tool result on large repos (reported by @Bamieh on a 2,118-file TS monorepo: the call \"hangs\", the client surfaces a missing tool result, yet the index completes fine server-side). Explicit-`paths` calls and the CLI were unaffected."
+      "version": "1.108.145",
+      "date": "2026-07-19",
+      "title": "coverage contract for absence claims + scorer-pinned calibration",
+      "summary": "- **Coverage contract on `absent`/`degraded` verdicts.** A scan count alone can't back an absence claim when files never entered the corpus. Every full discovery walk now persists a coverage block into the index meta (`files_indexed`, nonzero skip counts by reason \u2014 wrong_extension,"
     }
   ]
 }

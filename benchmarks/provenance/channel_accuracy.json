@@ -1,0 +1,102 @@
+{
+  "comment": "find_implementations channel accuracy on the authored gold corpus. Reproducible: tests/test_channel_accuracy.py re-runs this measurement in CI and fails on divergence. Scope is the authored corpus, NOT in-the-wild base rates \u2014 n is small and disclosed.",
+  "corpus_version": "authored-scenarios-v2",
+  "languages": [
+    "python",
+    "typescript",
+    "go"
+  ],
+  "scope": "Authored scenario corpus: measures channel discrimination on known implementation patterns and known false-positive traps (module-homonym bases, same-name-different-domain methods, substring decorator matches). Go scenarios exercise the duck channel exclusively \u2014 Go's implicit interfaces have no declared inheritance for the AST channel to walk, and Go has no decorators. It does NOT estimate in-the-wild base rates; n per channel is small and disclosed.",
+  "corpus_sha256": "4b8a530adfec0825b9bdc9872598ac88448258033af4ba7b55fef68fddc3bb3d",
+  "generator": "benchmarks/goldset/measure.py",
+  "channels": {
+    "ast": {
+      "precision": 0.818,
+      "recall": 1.0,
+      "tp": 9,
+      "fp": 2,
+      "fn": 0,
+      "n_surfaced": 11
+    },
+    "duck": {
+      "precision": 0.5,
+      "recall": 1.0,
+      "tp": 6,
+      "fp": 6,
+      "fn": 0,
+      "n_surfaced": 12
+    },
+    "decorator": {
+      "precision": 0.556,
+      "recall": 1.0,
+      "tp": 5,
+      "fp": 4,
+      "fn": 0,
+      "n_surfaced": 9
+    }
+  },
+  "per_language": {
+    "python": {
+      "ast": {
+        "precision": 0.833,
+        "recall": 1.0,
+        "tp": 5,
+        "fp": 1,
+        "fn": 0,
+        "n_surfaced": 6
+      },
+      "duck": {
+        "precision": 0.6,
+        "recall": 1.0,
+        "tp": 3,
+        "fp": 2,
+        "fn": 0,
+        "n_surfaced": 5
+      },
+      "decorator": {
+        "precision": 0.6,
+        "recall": 1.0,
+        "tp": 3,
+        "fp": 2,
+        "fn": 0,
+        "n_surfaced": 5
+      }
+    },
+    "typescript": {
+      "ast": {
+        "precision": 0.8,
+        "recall": 1.0,
+        "tp": 4,
+        "fp": 1,
+        "fn": 0,
+        "n_surfaced": 5
+      },
+      "duck": {
+        "precision": 0.333,
+        "recall": 1.0,
+        "tp": 1,
+        "fp": 2,
+        "fn": 0,
+        "n_surfaced": 3
+      },
+      "decorator": {
+        "precision": 0.5,
+        "recall": 1.0,
+        "tp": 2,
+        "fp": 2,
+        "fn": 0,
+        "n_surfaced": 4
+      }
+    },
+    "go": {
+      "duck": {
+        "precision": 0.5,
+        "recall": 1.0,
+        "tp": 2,
+        "fp": 2,
+        "fn": 0,
+        "n_surfaced": 4
+      }
+    }
+  }
+}

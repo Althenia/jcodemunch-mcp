@@ -974,6 +974,10 @@ Symbol search combines multiple ranking signals, including:
 
 The search model is therefore hybrid rather than purely lexical.
 
+### Query-shape exact seeding
+
+In `get_ranked_context`'s default path, source-shaped tokens in the query (qualified names, CamelCase, snake_case, dunders; filename look-alikes excluded) pin exact symbol-name matches ahead of the lexical ranking, bounded at 3 seeds per token and 5 total. Seeded items carry `match_channel: "exact_name"`, and `_meta.query_shape` reports what was recognized and seeded. An exact seed floors the verdict's best-score so a seeded response is never misreported as negative evidence.
+
 ### Bounded result handling
 
 When only top-k results are required, the system may use bounded heap strategies rather than full sorting over all candidates.
@@ -1038,6 +1042,23 @@ Representative envelope:
 * **`estimate_method`**: label describing how the savings estimate was computed
 
 The exact `_meta` shape may vary by tool, but the response contract emphasizes explicit operational metadata rather than opaque output.
+
+### Honesty and provenance fields
+
+Retrieval responses additionally carry machine-readable trust signals:
+
+* **`_meta.confidence`**: calibrated 0–1 score (top-1/top-2 gap, top-1 strength, identity-match presence, freshness).
+* **`_freshness`** per result entry (`fresh` / `edited_uncommitted` / `stale_index`) plus a `_meta.freshness` summary.
+* **`negative_evidence`**: the retrieval verdict on empty or weak results, with `state` ∈ `ok` / `low_confidence` / `absent` / `degraded` and scan counts. `absent` asserts the corpus was scanned and the answer is not present; `degraded` asserts the index is impaired and a missing result may be truncation rather than absence.
+* **`_meta.query_shape`** (`get_ranked_context`): which query tokens were recognized as source-shaped identifiers and how many exact-name symbols were seeded ahead of the ranking.
+* **`_meta.confidence_provenance`** (`find_implementations`): per-channel basis (`declared` / `measured`), with `measured_ref` (precision/recall on the gold corpus) where available. A prior is never presented as a measurement.
+* **`savings_provenance`** (`get_session_stats`, `receipt --export json`): the measured artifacts behind savings/quality claims plus the declared-vs-measured rule.
+
+These contracts are published as JSON Schemas in `schemas/` (`retrieval-verdict.schema.json`, `confidence-provenance.schema.json`, `ranked-context-response.schema.json`); conforming clients may validate responses against them mechanically.
+
+### Tool annotations
+
+Every retrieval tool declares MCP `readOnlyHint: true`. Tools that reach the network or write index state (`index_repo`, `index_folder`, `index_file`, `summarize_repo`, `embed_repo`, and similar) declare `openWorldHint: true`. The annotations are part of the tested contract: hosts may gate approval flows on them.
 
 ---
 
@@ -1213,6 +1234,10 @@ Savings are derived from the difference between a larger baseline payload, such 
 * `tokens_saved` refers to the current call
 * `total_tokens_saved` refers to the cumulative persisted total
 * `estimate_method` indicates how the figure was calculated
+
+### Conservatism guarantees
+
+Every known error term in the meter points down: the byte-to-token conversion (~4 bytes/token) undercounts denser code, each matched file is credited once per call regardless of matched symbols, and empty or negative results credit zero (the counter clamps at zero). Cache hits record the same savings as the miss that populated them — a repeat query avoids the same raw reads. Savings are stored as tokens, never as currency; monetary valuations are applied at display time at current published input-token rates. The lifetime meter persists in `~/.code-index/_savings.json` (with per-day buckets), and the `receipt` CLI's JSON export carries a `savings_provenance` block chaining the figures to the committed measurement artifacts.
 
 ### Important interpretation note
 

@@ -49,6 +49,7 @@ class EmbeddingStore:
         conn = sqlite3.connect(str(self._db_path), isolation_level=None)
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA journal_size_limit = 67108864")  # bound WAL growth under starved checkpoints
         conn.executescript(_EMBEDDINGS_SCHEMA)
         return conn
 

@@ -680,8 +680,12 @@ def search_symbols(
     query_terms = [t for t in query_terms if t]
     cache = index._bm25_cache
     if "idf" not in cache:
-        cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
-        cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
+        # Single-flight: concurrent cold searches must not each build the
+        # full-corpus BM25 state (#370)
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "idf" not in cache:
+                cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
+                cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
     idf = cache["idf"]
     avgdl = cache["avgdl"]
     centrality = cache["centrality"]
@@ -691,11 +695,13 @@ def search_symbols(
     pagerank: dict = {}
     if sort_by in ("centrality", "combined"):
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     has_filters = bool(kind or file_pattern or language or decorator)
@@ -1037,6 +1043,7 @@ def search_symbols(
     )
 
     from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     _vres = _build_verdict(
         result_count=len(scored_results),
         scanned_symbols=candidates_scored if candidates_scored > 0 else len(index.symbols),
@@ -1047,6 +1054,7 @@ def search_symbols(
         source_files=index.source_files,
         semantic_requested=bool(semantic or semantic_only),
         index_stale=_probe.repo_is_stale,
+        coverage=_index_coverage_meta(index),
     )
     negative_evidence = _vres["negative_evidence"]
     meta["verdict"] = _vres["verdict"]
@@ -1469,12 +1477,14 @@ def _search_symbols_fusion(
     if not pagerank:
         cache = index._bm25_cache
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map,
-                psr4_map=getattr(index, "psr4_map", None),
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map,
+                        psr4_map=getattr(index, "psr4_map", None),
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     if pagerank:

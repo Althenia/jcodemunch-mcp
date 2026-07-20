@@ -184,6 +184,7 @@ def iter_calls(
     projects_root: Path,
     *,
     since: Optional[_dt.datetime] = None,
+    until: Optional[_dt.datetime] = None,
 ) -> Iterable[dict]:
     """Yield {tool, result_tokens, timestamp, project, session} per jcodemunch call.
 
@@ -191,13 +192,17 @@ def iter_calls(
     naming an mcp__jcodemunch__* tool, finds the matching tool_result
     (by tool_use_id) in subsequent user events within the same session
     file, and yields one entry per resolved pair.
+
+    ``since``/``until`` bound the window on the tool_use timestamp;
+    ``until`` is exclusive so adjacent calendar windows can't double-count
+    a call that lands exactly on the boundary.
     """
     if not projects_root.exists():
         return
 
     for jsonl in sorted(projects_root.rglob("*.jsonl")):
         try:
-            yield from _iter_calls_in_file(jsonl, since=since)
+            yield from _iter_calls_in_file(jsonl, since=since, until=until)
         except OSError:
             continue
 
@@ -206,6 +211,7 @@ def _iter_calls_in_file(
     jsonl: Path,
     *,
     since: Optional[_dt.datetime],
+    until: Optional[_dt.datetime] = None,
 ) -> Iterable[dict]:
     """Walk one transcript file once; pair tool_use → tool_result by id."""
     pending: dict[str, dict] = {}  # tool_use_id → call metadata
@@ -263,7 +269,10 @@ def _iter_calls_in_file(
                         if not tu_id or tu_id not in pending:
                             continue
                         meta = pending.pop(tu_id)
-                        if since and meta["_ts_parsed"] and meta["_ts_parsed"] < since:
+                        call_ts = meta["_ts_parsed"]
+                        if since and call_ts and call_ts < since:
+                            continue
+                        if until and call_ts and call_ts >= until:
                             continue
                         result_bytes = _result_byte_length(block.get("content"))
                         result_tokens = max(1, result_bytes // _BYTES_PER_TOKEN)
@@ -307,6 +316,38 @@ def aggregate(calls: Iterable[dict]) -> dict:
     return {"totals": totals, "per_tool": dict(per_tool)}
 
 
+def aggregate_by_day(calls: Iterable[dict], *, model: str) -> list[dict]:
+    """Bucket a stream of call records into per-calendar-day savings rows.
+
+    Days are the caller's LOCAL calendar days (transcript timestamps are
+    UTC), because a window like "yesterday" means yesterday where the
+    person is sitting, not in UTC. Days with no calls are absent — the
+    caller decides whether a gap renders as zero or as nothing.
+    """
+    per_day: dict[str, dict] = {}
+    for call in calls:
+        ts = _parse_iso(call.get("timestamp", ""))
+        if ts is None:
+            continue
+        day = ts.astimezone().date().isoformat()
+        actual = call["result_tokens"]
+        mult = _TOOL_MULTIPLIERS.get(call["tool"], _DEFAULT_MULTIPLIER)
+        baseline = int(actual * mult)
+        bucket = per_day.setdefault(
+            day,
+            {"date": day, "calls": 0, "actual_tokens": 0, "baseline_tokens": 0, "savings_tokens": 0},
+        )
+        bucket["calls"] += 1
+        bucket["actual_tokens"] += actual
+        bucket["baseline_tokens"] += baseline
+        bucket["savings_tokens"] += baseline - actual
+
+    rows = [per_day[d] for d in sorted(per_day)]
+    for row in rows:
+        row["savings_usd"] = dollar_savings(row["savings_tokens"], model)
+    return rows
+
+
 def dollar_savings(savings_tokens: int, model: str) -> float:
     rate = _MODEL_PRICES_USD_PER_MTOK.get(model.lower())
     if rate is None:
@@ -329,6 +370,15 @@ def _write_lifetime(out: "io.StringIO", meter: dict, model: str) -> None:
     out.write("    tool calls still present in local transcripts.\n\n")
 
 
+def _window_label(since: Optional[_dt.datetime], until: Optional[_dt.datetime]) -> str:
+    """Human phrase for an explicit --since/--until window."""
+    if since and until:
+        return f"{since.date().isoformat()} to {until.date().isoformat()} (end exclusive)"
+    if since:
+        return f"since {since.date().isoformat()}"
+    return f"up to {until.date().isoformat()} (exclusive)"
+
+
 def render_text(
     agg: dict,
     *,
@@ -336,12 +386,14 @@ def render_text(
     model: str,
     primary_only: bool = False,
     meter: Optional[dict] = None,
+    window_label: Optional[str] = None,
 ) -> str:
     """Human-readable ledger output."""
     out = io.StringIO()
     totals = agg["totals"]
     per_tool = agg["per_tool"]
-    out.write(f"jCodeMunch token-economy ledger — last {days} days\n")
+    header = window_label or f"last {days} days"
+    out.write(f"jCodeMunch token-economy ledger — {header}\n")
     out.write("=" * 56 + "\n\n")
 
     if totals["calls"] == 0:
@@ -391,6 +443,9 @@ def render_text(
     out.write("  Methodology: per-tool savings multipliers calibrated against\n")
     out.write("  published RAG benchmarks (Express/FastAPI/Gin). Run with --explain\n")
     out.write("  to see the full multiplier table; --export csv|json for raw data.\n")
+    out.write("  Provenance: basis = measured — committed, drift-guarded artifacts\n")
+    out.write("  at benchmarks/provenance/measured.json (tiktoken methodology +\n")
+    out.write("  CI-gated replay retrieval golden). --export json carries the block.\n")
 
     return out.getvalue()
 
@@ -420,6 +475,24 @@ def render_explain() -> str:
     return out.getvalue()
 
 
+def render_rates() -> str:
+    """The model input-price table as JSON. Cheap — scans no transcripts.
+
+    Exists so a consumer that prices its own token counts (the jMunch Console
+    values jcm's lifetime meter, which the receipt never scans) reads the rates
+    from the one table instead of keeping a copy. A copy is not a hypothetical
+    hazard: the Console's duplicate sat at the retired $15 Opus rate long after
+    this table moved to $5, and its two dollar figures silently disagreed by 3x.
+    """
+    return json.dumps(
+        {
+            "rates_usd_per_mtok": _MODEL_PRICES_USD_PER_MTOK,
+            "default_model": _DEFAULT_MODEL,
+        },
+        indent=2,
+    )
+
+
 def render_csv(agg: dict) -> str:
     out = io.StringIO()
     w = csv.writer(out)
@@ -429,19 +502,57 @@ def render_csv(agg: dict) -> str:
     return out.getvalue()
 
 
-def render_json(agg: dict, *, model: str, meter: Optional[dict] = None) -> str:
+def render_json(
+    agg: dict,
+    *,
+    model: str,
+    meter: Optional[dict] = None,
+    by_day: Optional[list[dict]] = None,
+    window: Optional[dict] = None,
+) -> str:
+    from ..retrieval.provenance import measured_provenance
+
     payload = {
         "totals": agg["totals"],
         "per_tool": agg["per_tool"],
         "model": model,
         "savings_usd": dollar_savings(agg["totals"]["savings_tokens"], model),
+        "provenance": measured_provenance(),
     }
+    if window:
+        payload["window"] = window
+    if by_day is not None:
+        payload["by_day"] = by_day
     if meter:
         payload["lifetime"] = {
             "tokens_saved": meter["total_tokens_saved"],
             "usd": dollar_savings(meter["total_tokens_saved"], model),
         }
     return json.dumps(payload, indent=2)
+
+
+def parse_window_bound(value: str) -> _dt.datetime:
+    """Parse a --since/--until bound into an aware datetime.
+
+    Accepts a calendar date (``2026-07-16`` → local midnight) or a full
+    ISO datetime (``2026-07-16T09:30``, trailing ``Z`` allowed). A naive
+    datetime is read as local time, since that's what the person meant.
+    """
+    text = (value or "").strip()
+    if not text:
+        raise argparse.ArgumentTypeError("expected a date (YYYY-MM-DD) or ISO datetime")
+    try:
+        parsed = _dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            parsed = _dt.datetime.combine(_dt.date.fromisoformat(text), _dt.time())
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"not a date or ISO datetime: {value!r} (try 2026-07-16 or 2026-07-16T09:30)"
+            ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -452,7 +563,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--days",
         type=int,
         default=30,
-        help="Window size in days (default 30; use 0 for all-time).",
+        help="Rolling window size in days back from now (default 30; use 0 for all-time). "
+             "Ignored when --since or --until is given.",
+    )
+    parser.add_argument(
+        "--since",
+        type=parse_window_bound,
+        default=None,
+        metavar="DATE",
+        help="Window start, inclusive. A date (2026-07-16) means local midnight. "
+             "Use with --until for calendar windows (today, yesterday, this month).",
+    )
+    parser.add_argument(
+        "--until",
+        type=parse_window_bound,
+        default=None,
+        metavar="DATE",
+        help="Window end, EXCLUSIVE — so --since 2026-07-16 --until 2026-07-17 is "
+             "exactly that one day, and adjacent windows never double-count a call.",
+    )
+    parser.add_argument(
+        "--by-day",
+        action="store_true",
+        help="Include a per-calendar-day savings series in the JSON export "
+             "(--export FILE.json). One scan, one row per day with any calls.",
     )
     parser.add_argument(
         "--model",
@@ -471,6 +605,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Print the per-tool savings multiplier table + methodology, then exit.",
     )
     parser.add_argument(
+        "--rates",
+        action="store_true",
+        help="Print the model input-price table as JSON, then exit. Scans nothing, so "
+             "a consumer pricing its own token counts can read the rates from here "
+             "instead of hardcoding a copy that silently drifts when pricing changes.",
+    )
+    parser.add_argument(
         "--projects-root",
         type=Path,
         default=None,
@@ -482,19 +623,43 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stdout.write(render_explain())
         return 0
 
+    if args.rates:
+        sys.stdout.write(render_rates())
+        return 0
+
     root = args.projects_root or _projects_root()
-    since = None
-    if args.days > 0:
+    since, until = args.since, args.until
+    explicit_window = since is not None or until is not None
+    if since is not None and until is not None and until <= since:
+        print("--until must be after --since", file=sys.stderr)
+        return 2
+    if not explicit_window and args.days > 0:
         since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=args.days)
 
-    agg = aggregate(iter_calls(root, since=since))
+    calls = list(iter_calls(root, since=since, until=until))
+    agg = aggregate(calls)
     meter = lifetime_meter()
 
     if args.export:
         target = Path(args.export)
         ext = target.suffix.lower()
         if ext == ".json":
-            target.write_text(render_json(agg, model=args.model, meter=meter), encoding="utf-8")
+            window = {
+                "since": since.isoformat() if since else None,
+                "until": until.isoformat() if until else None,
+            }
+            if not explicit_window:
+                window["days"] = args.days
+            target.write_text(
+                render_json(
+                    agg,
+                    model=args.model,
+                    meter=meter,
+                    by_day=aggregate_by_day(calls, model=args.model) if args.by_day else None,
+                    window=window,
+                ),
+                encoding="utf-8",
+            )
         elif ext == ".csv":
             target.write_text(render_csv(agg), encoding="utf-8")
         else:
@@ -506,7 +671,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"wrote {target}")
         return 0
 
-    sys.stdout.write(render_text(agg, days=args.days, model=args.model, meter=meter))
+    sys.stdout.write(
+        render_text(
+            agg,
+            days=args.days,
+            model=args.model,
+            meter=meter,
+            window_label=_window_label(since, until) if explicit_window else None,
+        )
+    )
     return 0
 
 

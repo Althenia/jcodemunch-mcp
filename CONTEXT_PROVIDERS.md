@@ -19,6 +19,16 @@ Context enrichment is **automatic** — no configuration required. Providers sel
 | Provider   | Detects              | Metadata Source                     | Enriches With                                  |
 | ---------- | -------------------- | ----------------------------------- | ---------------------------------------------- |
 | dbt        | `dbt_project.yml`    | `schema.yml`, `{% docs %}` blocks   | Model descriptions, tags, column names/descriptions |
+| django     | Django projects      | URL patterns, DRF decorators        | Route + middleware metadata on view symbols    |
+| express    | Express / Fastify / Hono / Koa | Call-expression routing (`app.get('/path', handler)`) | Routes + middleware on handler symbols |
+| rails      | Rails projects       | `routes.rb`                         | Resource and verb routes on controller actions |
+| laravel    | Laravel projects (`artisan` + `composer.json`) | Route files       | Framework route metadata on symbols            |
+| nextjs / nuxt | `next.config.*` / Nuxt conventions | App-Router / file-based routing | Route metadata on page and API components |
+| go_routers | Gin / Chi / Echo / Fiber | Call-expression routing (`r.GET("/path", handler)`) | Routes + middleware on handler symbols |
+| decorator_routes | Flask / FastAPI / Spring Boot / NestJS / ASP.NET | Route decorators and annotations | HTTP method + path on decorated handlers |
+| git_blame  | Any git repository   | Commit history (bounded walk)       | `last_author` / `last_modified` on files       |
+
+The exact provider list grows over time; `src/jcodemunch_mcp/parser/context/` is authoritative. The dbt provider below is documented in depth as the reference example — the others follow the same lifecycle.
 
 ---
 

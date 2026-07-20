@@ -1,0 +1,14 @@
+{
+  "scorer_version": 1,
+  "measured_at": "2026-07-19",
+  "method": "tests/test_verdict_coverage_calibration.py re-runs this measurement live in CI; planted names are slug-unique so hit/miss is unambiguous and immune to corpus drift.",
+  "planted_positive": {
+    "n": 4,
+    "hit_rate": 1.0
+  },
+  "planted_negative": {
+    "n": 4,
+    "absent_rate": 1.0
+  },
+  "note": "Calibration claims about verdict confidence are pinned to scorer_version. A scorer change without a re-measured artifact fails CI."
+}

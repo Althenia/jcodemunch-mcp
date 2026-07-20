@@ -67,8 +67,14 @@ def register_edit(
             sym.pop("_dl", None)
             invalidated_symbols += 1
 
-    # Clear BM25 cache
-    index._bm25_cache.clear()
+    # Clear BM25 cache (under the build lock so a concurrent cold build can't
+    # interleave with the clear and leave stale entries, #370)
+    _lock = getattr(index, "_bm25_lock", None)
+    if _lock is not None:
+        with _lock:
+            index._bm25_cache.clear()
+    else:
+        index._bm25_cache.clear()
     bm25_cleared = True
 
     # Clear import name index

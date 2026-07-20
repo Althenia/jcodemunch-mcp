@@ -974,6 +974,24 @@ _NON_READONLY_TOOLS: frozenset[str] = _counter.STATE_CHANGING_ACTIONS | {
     "route",
 } | _ANNOTATION_ONLY_WRITERS
 
+# Tools that CAN reach the network (all user-invoked, all README-disclosed):
+# GitHub fetch, cloud summarizer (opt-in), or a cloud embedding provider.
+# Everything else is annotated openWorldHint=False — a gating client can prove
+# the suite's no-network claim per tool instead of taking the README's word.
+# order/route can dispatch any catalog action, so they inherit True.
+_OPEN_WORLD_TOOLS: frozenset[str] = frozenset({
+    "index_repo",         # GitHub API fetch
+    "index_folder",       # cloud summarizer when configured + opted in
+    "index_file",         # cloud summarizer when configured + opted in
+    "summarize_repo",     # cloud summarizer when configured + opted in
+    "embed_repo",         # cloud embedding provider when configured
+    "check_embedding_drift",  # re-embeds canaries via the provider
+    "test_summarizer",    # probes the configured provider
+    "install_pack",       # starter-pack download
+    "order",              # front door — can dispatch the above
+    "route",              # front door — can dispatch the above
+})
+
 
 def _apply_readonly_annotations(tools: list[Tool]) -> list[Tool]:
     """Attach ToolAnnotations(readOnlyHint=...) to any tool lacking annotations.
@@ -989,7 +1007,8 @@ def _apply_readonly_annotations(tools: list[Tool]) -> list[Tool]:
             tool = tool.model_copy(
                 update={
                     "annotations": ToolAnnotations(
-                        readOnlyHint=tool.name not in _NON_READONLY_TOOLS
+                        readOnlyHint=tool.name not in _NON_READONLY_TOOLS,
+                        openWorldHint=tool.name in _OPEN_WORLD_TOOLS,
                     )
                 }
             )
@@ -2654,8 +2673,10 @@ def _build_tools_list() -> list[Tool]:
             name="find_implementations",
             description=(
                 "Find concrete implementations of an interface, abstract class, or method. "
-                "Multi-source resolution with confidence scoring: LSP dispatch (1.0), AST class "
-                "hierarchy (0.85), duck-typed name match (0.65), decorator handler (0.45). "
+                "Multi-source resolution with confidence scoring: SCIP/LSP evidence (1.0), AST class "
+                "hierarchy (0.85), duck-typed name match (0.65), decorator handler (0.45) — declared "
+                "priors; _meta.confidence_provenance states each channel's basis and measured "
+                "precision/recall. "
                 "Classifies each impl (subclass_override / interface_impl / duck_typed / "
                 "decorator_handler / subclass), ranks by PageRank × byte_length, attaches "
                 "differs_by breakdown. Optional cross_repo=true surfaces impls in other indexed "
@@ -3388,6 +3409,8 @@ def _build_tools_list() -> list[Tool]:
                 "Assemble the best-fit context for a query within a token budget. "
                 "Ranks all symbols by relevance (BM25) and/or centrality (PageRank), "
                 "loads source for the top candidates, and packs greedily until token_budget is exhausted. "
+                "Exact symbol names in the query (qualified, CamelCase, snake_case) are pinned ahead "
+                "of the ranking; include identifiers verbatim. "
                 "Use when you want 'the best N tokens of context for this task' without specifying exact symbols."
             ),
             inputSchema={
@@ -4448,7 +4471,20 @@ def _error_call_result(text: str) -> CallToolResult:
     ``list[TextContent]`` (the SDK wraps them ``isError=False``), so this is
     additive on the wire — only failures gain the ``isError`` signal.
     """
+    _record_response_tokens(text)
     return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
+def _record_response_tokens(text: str) -> None:
+    """Count served response text toward the session budget (v1.108.146).
+
+    Best-effort — a tracker failure never affects the response.
+    """
+    try:
+        from .storage.token_tracker import record_response_text
+        record_response_text(text)
+    except Exception:
+        logger.debug("Response token recording failed", exc_info=True)
 
 
 @server.call_tool(validate_input=False)
@@ -4483,6 +4519,32 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         # re-enters call_tool for the real action, which then runs those hooks).
         if name in _COUNTER_FRONT_DOOR:
             return await _handle_counter_tool(name, arguments)
+
+        # Session yield tracking (v1.108.146): repeated identical calls +
+        # follow-through/edit-through signals for get_session_stats' `yield`
+        # block. Observation only — never alters dispatch.
+        try:
+            from .storage import token_tracker as _yield_tracker
+            if name != "get_session_stats":
+                import hashlib as _hashlib
+                _sig = _hashlib.sha1(
+                    json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()[:16]
+                _yield_tracker.note_call_signature(name, _sig)
+            if name in ("get_symbol_source", "get_context_bundle"):
+                _fetch_ids = []
+                if arguments.get("symbol_id"):
+                    _fetch_ids.append(arguments["symbol_id"])
+                if isinstance(arguments.get("symbol_ids"), list):
+                    _fetch_ids.extend(s for s in arguments["symbol_ids"] if s)
+                if _fetch_ids:
+                    _yield_tracker.note_fetched(_fetch_ids)
+            elif name == "register_edit" and isinstance(arguments.get("file_paths"), list):
+                _yield_tracker.note_edited_files(arguments["file_paths"])
+            elif name == "index_file" and arguments.get("path"):
+                _yield_tracker.note_edited_files([arguments["path"]])
+        except Exception:
+            logger.debug("Yield tracking failed", exc_info=True)
 
         # jcm#329: cheap per-tool argument validation BEFORE strict-freshness
         # waits and auto-watch reindexing. A call doomed to instant rejection
@@ -5626,9 +5688,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 result = await _apply_model_announcement(model)
         elif name == "jcodemunch_guide":
             from . import __version__ as _ver
+            from .retrieval.provenance import measured_provenance as _measured_provenance
             result = {
                 "version": _ver,
                 "content": _generate_claude_md_snippet(missing_only=False),
+                # Self-attesting contract: the measured artifacts behind the
+                # suite's savings/quality claims, plus the declared-vs-measured
+                # rule. Rides the guide (on-demand) — never the hot path.
+                "provenance": _measured_provenance(),
             }
         else:
             result = {"error": f"Unknown tool: {name}"}
@@ -5801,6 +5868,28 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         _saved = result.get("_meta", {}).get("tokens_saved", 0) if isinstance(result, dict) else 0
         _write_pulse(name, tokens_saved=_saved, base_path=storage_path)
 
+        # Session yield: record which symbol ids this response served, and
+        # attach the advisory budget block when the session is approaching or
+        # over its configured session_token_budget (v1.108.146). `spent`
+        # covers responses served BEFORE this one (recorded at return time).
+        try:
+            from .storage import token_tracker as _budget_tracker
+            if isinstance(result, dict):
+                if name == "search_symbols":
+                    _budget_tracker.note_served(
+                        e.get("id") for e in result.get("results", []) if isinstance(e, dict)
+                    )
+                elif name == "get_ranked_context":
+                    _budget_tracker.note_served(
+                        e.get("symbol_id") or e.get("id")
+                        for e in result.get("context_items", []) if isinstance(e, dict)
+                    )
+                _b = _budget_tracker.budget_status()
+                if _b is not None and _b["state"] in ("approaching", "over"):
+                    result.setdefault("_meta", {})["budget"] = _b
+        except Exception:
+            logger.debug("Budget/yield attach failed", exc_info=True)
+
         # Response-level secret redaction — scrub leaked credentials
         # before they reach the LLM context window. Skipped for tools that
         # return raw cached source (any "secret" found is the user's own
@@ -5835,6 +5924,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     m["encoding"] = enc_meta["encoding"]
                     m["encoding_tokens_saved"] = saved
                     m["total_encoding_tokens_saved"] = total_enc
+                _record_response_tokens(encoded)
                 return [TextContent(type="text", text=encoded)]
         except Exception:
             logger.debug("Compact encoding failed; emitting JSON", exc_info=True)
@@ -5846,6 +5936,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
             # on it (F-P01); the v1.108.30 passthrough already kept errors JSON.
             _call_ok = False
             return _error_call_result(_text)
+        _record_response_tokens(_text)
         return [TextContent(type="text", text=_text)]
 
     except KeyError as e:
@@ -7990,13 +8081,22 @@ def main(argv: Optional[list[str]] = None):
         help="Token-economy ledger: parse Claude transcripts, show modeled tokens-saved + dollar value",
     )
     receipt_parser.add_argument("--days", type=int, default=30,
-        help="Window size in days (default 30; use 0 for all-time).")
+        help="Rolling window size in days back from now (default 30; 0 = all-time). "
+             "Ignored when --since/--until is given.")
+    receipt_parser.add_argument("--since", default=None, metavar="DATE",
+        help="Window start, inclusive (YYYY-MM-DD = local midnight, or an ISO datetime).")
+    receipt_parser.add_argument("--until", default=None, metavar="DATE",
+        help="Window end, exclusive. Pair with --since for calendar windows.")
+    receipt_parser.add_argument("--by-day", action="store_true",
+        help="Include a per-calendar-day series in the JSON export.")
     receipt_parser.add_argument("--model", choices=_receipt_model_choices, default="opus",
         help="Model rate to apply for the dollar conversion (default opus).")
     receipt_parser.add_argument("--export", metavar="FILE.csv|FILE.json", default=None,
         help="Write raw per-tool data to a file instead of the human report.")
     receipt_parser.add_argument("--explain", action="store_true",
         help="Print the per-tool savings multiplier table + methodology, then exit.")
+    receipt_parser.add_argument("--rates", action="store_true",
+        help="Print the model input-price table as JSON, then exit (scans nothing).")
     receipt_parser.add_argument("--projects-root", default=None,
         help="Override Claude Code projects directory (default ~/.claude/projects).")
 
@@ -8716,10 +8816,18 @@ def main(argv: Optional[list[str]] = None):
     if args.command == "receipt":
         from .cli.receipt import main as receipt_main
         argv = ["--days", str(args.days), "--model", args.model]
+        if args.since:
+            argv += ["--since", args.since]
+        if args.until:
+            argv += ["--until", args.until]
+        if args.by_day:
+            argv += ["--by-day"]
         if args.export:
             argv += ["--export", args.export]
         if args.explain:
             argv += ["--explain"]
+        if args.rates:
+            argv += ["--rates"]
         if args.projects_root:
             argv += ["--projects-root", args.projects_root]
         sys.exit(receipt_main(argv))

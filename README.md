@@ -85,6 +85,7 @@ Index once. Query cheaply. Keep moving.
 |-----|----------------|
 | [QUICKSTART.md](QUICKSTART.md) | Zero-to-indexed in three steps |
 | [USER_GUIDE.md](USER_GUIDE.md) | Full tool reference, workflows, and best practices |
+| [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) | **The technical manual** — verdicts, ranking internals, provenance contracts, the meter's design, evidence imports. For developers who want the machinery, not just the workflows |
 | [AGENT_HOOKS.md](AGENT_HOOKS.md) | Agent hooks and prompt policies |
 | [CONFIGURATION.md](CONFIGURATION.md) | JSONC config file reference, migration from env vars |
 | [GROQ.md](GROQ.md) | Groq Remote MCP integration, deployment, gcm CLI |
@@ -128,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.94](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.94)** (2026-07-02) — New tool: index_dependency (index the libraries a repo actually uses)
-- **[v1.108.93](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.93)** (2026-07-02) — Upstream exposure links (get_endpoint_impact include_infra exposes)
-- **[v1.108.92](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.92)** (2026-07-02) — Progress-notification flood control + response drain (#359)
+- **[v1.108.147](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.147)** (2026-07-19) — single-flight cold index loads and BM25 builds
+- **[v1.108.146](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.146)** (2026-07-19) — token yield + advisory session budgets
+- **[v1.108.145](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.145)** (2026-07-19) — coverage contract for absence claims + scorer-pinned calibration
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -273,7 +274,7 @@ The retrieval primitives below are not a disconnected bag of tools the agent has
 
 - **`assemble_task_context`** takes a natural-language task and returns a single source-attributed context capsule under a token budget. It auto-classifies the task into one of six intents (explore / debug / refactor / extend / audit / review), auto-extracts the anchor symbols, and runs the intent-appropriate sequence of the tools below end-to-end — so the agent gets the whole context for a task in **one request** instead of chaining five. Every entry is tagged with its `stage` and `source_tool`, so the provenance is auditable.
 - **`plan_turn`** is the opening move: it analyzes the query against the index and returns a confidence-guided route — which tools to call, on which symbols, under a turn budget — *before* the first read. Low confidence means "this probably doesn't exist," so the agent stops instead of burning a budget hunting for a feature that isn't there.
-- **`get_ranked_context`** packs the most relevant symbols for a query into a fixed token budget (BM25 + PageRank), when you want a ranked context pack rather than a full intent sequence.
+- **`get_ranked_context`** packs the most relevant symbols for a query into a fixed token budget (BM25 + PageRank), when you want a ranked context pack rather than a full intent sequence. Source-shaped identifiers in the query (qualified names, CamelCase, snake_case) pin exact-name symbol matches ahead of the lexical ranking — include the identifier verbatim when you know it; `_meta.query_shape` reports what was recognized and seeded.
 
 The point: jCodeMunch is structured retrieval *with* an orchestration layer over it, not a pile of primitives. The composition tools run the right sub-tools, in the right order, under one budget, in one call.
 
@@ -324,6 +325,23 @@ Every retrieval result now ships with three machine-readable health signals so a
 The `tune_weights` tool reads the persistent ranking ledger and learns per-repo retrieval weights (saved to `~/.code-index/tuning.jsonc`). `check_embedding_drift` pins a 16-string canary to detect silent provider model changes. `benchmarks/replay/` provides a CI-friendly retrieval-quality regression gate (nDCG/MRR/Recall) that every release runs against.
 
 The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine the same ranking ledger for **retrieval regret** — where retrieval failed and the agent had to re-ask — and return a prioritized, explainable set of *suggested* fixes (a CLAUDE.md routing or glossary line as a unified-diff preview, an index-freshness hint, a stale-config finding, a dry-run weight proposal). It is read-only by design: it suggests a patch and shows you the diff; applying it is your keystroke, never the server's. Requires `perf_telemetry_enabled` (it has a ledger to read only then) and returns an honest hint when off.
+
+### Token yield and advisory session budgets
+
+`get_session_stats` speaks the FinOps vocabulary natively:
+
+- **`yield`** — of the context served this session, how much showed downstream follow-through: served search results later fetched via `get_symbol_source`/`get_context_bundle`, or whose file was subsequently edited (`register_edit`/`index_file`). Reports `rate` with its components (`served_results`, `followed_through`) plus `repeated_identical_calls` per tool — the agent's redundant context spend, distinct from cache hits (those measure the server's cost; repeats cost the agent's context window even on a hit). One honest caveat: a search whose result lines answered the question outright has yield the call sequence can't see, which is why `rate` ships with its components and never as a lone grade.
+- **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
+
+Both are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
+
+### Confidence provenance — every number states its basis
+
+Every confidence constant the suite emits traces to a stated basis: **`measured`** (backed by a committed, reproducible benchmark artifact — `benchmarks/provenance/measured.json`, drift-guarded in CI so the constants and the artifact can never silently diverge) or **`declared`** (an engineering prior, honestly labeled as exactly that). `find_implementations` responses carry the per-channel basis in `_meta.confidence_provenance`, and the response contracts themselves are published as JSON Schemas in [`schemas/`](schemas/) (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so CI pipelines and agents can validate responses mechanically. A prior is never presented as a measurement: a `declared` value graduates to `measured` only when a gold-labeled corpus backs it, and a build that claims otherwise fails.
+
+Absence claims carry their own receipts: an `absent` or `degraded` verdict discloses a **coverage contract** — what the corpus *excluded* at index time (unsupported extensions, oversize/binary/secret skips, cap-dropped files, zero-symbol files) plus the index generation it was scanned against — so "scanned N symbols, found nothing" can't lie by omission. An index that predates the contract omits the block: coverage unknown is never presented as "nothing was excluded". Every verdict is also pinned to a `scorer` version, and `benchmarks/calibration/planted_queries.json` records planted positive/negative query rates re-measured live in CI — a scorer change without a re-measured artifact fails the build.
+
+The first gold corpus is in: `benchmarks/goldset/` is an authored implementation-pattern corpus (declared subclasses, duck-typed conformers, decorator-registered handlers — plus deliberate false-positive traps: module-homonym base classes, same-name-different-domain methods, substring decorator matches), fully labeled with per-pair rationale. `benchmarks/goldset/measure.py` re-runs `find_implementations` against it and CI asserts the committed results (`benchmarks/provenance/channel_accuracy.json`) match the live measurement — the numbers literally cannot drift from the reproducible run. Each resolution channel's registry entry now carries its `measured_ref` (precision/recall on the corpus) beside the declared ranking prior, and `_meta.confidence_provenance` surfaces both. Scope is stated in the artifact: authored-pattern discrimination, not in-the-wild base rates.
 
 ### Local-first speed
 

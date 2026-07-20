@@ -1,5 +1,6 @@
 """Standalone token-budgeted context assembler: best-K-tokens for a query."""
 
+import threading
 import time
 from fnmatch import fnmatch
 from typing import Optional
@@ -144,6 +145,78 @@ def _pack_budget(
     return packed, total_tokens
 
 
+# Verdict floor credited when an exact-name seed matched (raw-BM25 scale, vs
+# the 0.5 negative-evidence threshold): an exact symbol-name hit is never a
+# low-confidence result.
+_EXACT_SEED_VERDICT_SCORE = 1.0
+
+_SEED_MAX_PER_TOKEN = 3   # exact matches pinned per source-shaped token
+_SEED_MAX_TOTAL = 5       # exact matches pinned per query
+
+
+def _name_map(index) -> dict:
+    """name → [symbol dict] lookup, cached beside the BM25 corpus."""
+    cache = index._bm25_cache
+    if "name_map" not in cache:
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "name_map" not in cache:
+                m: dict[str, list] = {}
+                for sym in index.symbols:
+                    m.setdefault(sym.get("name", ""), []).append(sym)
+                cache["name_map"] = m
+    return cache["name_map"]
+
+
+def _exact_seed_symbols(
+    index,
+    shaped: list[dict],
+    include_kinds,
+    scope,
+    pagerank: dict,
+) -> list[dict]:
+    """Resolve source-shaped query tokens to exact-name symbol matches.
+
+    For each shaped token, symbols whose ``name`` equals the token's identifier
+    (case-sensitive first, case-insensitive fallback) are candidates; a
+    qualified token's parent segment narrows them when it matches. Candidates
+    are ranked by PageRank and capped per token and per query. Honors the
+    caller's ``include_kinds``/``scope`` filters.
+    """
+    nm = _name_map(index)
+    lower_index: dict[str, list] = {}
+    seeded: list[dict] = []
+    seen_ids: set[str] = set()
+    for tok in shaped:
+        cands = nm.get(tok["name"])
+        if not cands:
+            if not lower_index:
+                for k, v in nm.items():
+                    lower_index.setdefault(k.lower(), []).extend(v)
+            cands = lower_index.get(tok["name"].lower(), [])
+        cands = [
+            s for s in cands
+            if (not include_kinds or s.get("kind") in include_kinds)
+            and (not scope or fnmatch(s.get("file", ""), scope))
+        ]
+        if tok.get("parent"):
+            want = f"{tok['parent']}.{tok['name']}".lower()
+            narrowed = [
+                s for s in cands
+                if want in s.get("id", "").lower()
+                or tok["parent"].lower() in (s.get("parent") or "").lower()
+            ]
+            if narrowed:
+                cands = narrowed
+        cands.sort(key=lambda s: pagerank.get(s.get("file", ""), 0.0), reverse=True)
+        for s in cands[:_SEED_MAX_PER_TOKEN]:
+            if s["id"] not in seen_ids:
+                seen_ids.add(s["id"])
+                seeded.append(s)
+            if len(seeded) >= _SEED_MAX_TOTAL:
+                return seeded
+    return seeded
+
+
 def get_ranked_context(
     repo: str,
     query: str,
@@ -160,6 +233,12 @@ def get_ranked_context(
     Ranks all symbols by relevance (BM25) and/or centrality (PageRank),
     loads source for the top candidates, and packs greedily until
     ``token_budget`` is exhausted.
+
+    Source-shaped query tokens (``Store.get`` / ``FreshnessProbe`` /
+    ``get_ranked_context``) additionally resolve to exact-name symbol matches
+    pinned ahead of the ranked results (items carry
+    ``match_channel: "exact_name"``; ``_meta.query_shape`` reports what was
+    detected). Pure natural-language queries are unaffected.
 
     Args:
         repo: Repository identifier (owner/repo or just repo name).
@@ -214,9 +293,13 @@ def get_ranked_context(
     query_terms = [t for t in query_terms if t]
     cache = index._bm25_cache
     if "idf" not in cache:
-        from .search_symbols import _compute_centrality  # noqa: PLC0415
-        cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
-        cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
+        # Single-flight: concurrent cold callers must not each build the
+        # full-corpus BM25 state (#370)
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "idf" not in cache:
+                from .search_symbols import _compute_centrality  # noqa: PLC0415
+                cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
+                cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
     idf = cache["idf"]
     avgdl = cache["avgdl"]
     inverted = cache["inverted"]
@@ -225,11 +308,13 @@ def get_ranked_context(
     pagerank: dict = {}
     if strategy in ("centrality", "combined"):
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank  # noqa: PLC0415
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank  # noqa: PLC0415
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     # ── Fusion path ─────────────────────────────────────────────────────
@@ -285,7 +370,16 @@ def get_ranked_context(
             max_bm25 = bm25
         raw_scores.append((bm25, pr_raw, sym))
 
-    if not raw_scores:
+    # Source-shaped exact seeding: identifiers the caller pasted verbatim
+    # (Store.get / FreshnessProbe / get_ranked_context) resolve to exact-name
+    # symbol matches pinned ahead of the ranked results. Pure-prose queries
+    # yield no shaped tokens and this is a no-op.
+    from ..retrieval.query_shape import source_shaped_tokens as _source_shaped_tokens
+    shaped = _source_shaped_tokens(query)
+    seeded = _exact_seed_symbols(index, shaped, include_kinds, scope, pagerank) if shaped else []
+    exact_ids = {s["id"] for s in seeded}
+
+    if not raw_scores and not seeded:
         elapsed = (time.perf_counter() - start) * 1000
         # Negative evidence: signal that nothing matched
         related_existing = [
@@ -337,6 +431,24 @@ def get_ranked_context(
 
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    if seeded:
+        # Pin exact matches ahead of the ranked tail: drop any ranked
+        # occurrence of a seeded symbol, then prepend seeds in token order
+        # with scores strictly above the ranked maximum (honest per-channel
+        # scores still surface via relevance_score/centrality_score).
+        top = scored[0][0] if scored else 0.0
+        ranked_by_id = {sym["id"]: (b, p) for _, b, p, sym in scored}
+        scored = [t for t in scored if t[3]["id"] not in exact_ids]
+        norm_pr = max(pagerank.values()) if pagerank else 1.0
+        pinned = []
+        for i, sym in enumerate(seeded):
+            bm25_norm, pr_norm = ranked_by_id.get(
+                sym["id"],
+                (0.0, pagerank.get(sym.get("file", ""), 0.0) / (norm_pr or 1.0)),
+            )
+            pinned.append((top + (len(seeded) - i) * 1e-4, bm25_norm, pr_norm, sym))
+        scored = pinned + scored
+
     items_considered = len(scored)
 
     # Build score lookup for BM25/PR per symbol
@@ -366,6 +478,7 @@ def get_ranked_context(
         bm25_norm, pr_norm = _score_lookup.get(sym["id"], (0.0, 0.0))
         context_items.append({
             "symbol_id": sym["id"],
+            **({"match_channel": "exact_name"} if sym["id"] in exact_ids else {}),
             "relevance_score": round(bm25_norm, 4),
             "centrality_score": round(pr_norm, 4),
             "combined_score": round(adj_score, 4),
@@ -413,6 +526,11 @@ def get_ranked_context(
             **_cost_avoided(tokens_saved, total_saved),
         },
     }
+    if shaped:
+        result["_meta"]["query_shape"] = {
+            "source_shaped": [t["token"] for t in shaped],
+            "exact_seeded": len(exact_ids),
+        }
     from ..retrieval.confidence import attach_confidence as _attach_confidence
     from ..retrieval.freshness import FreshnessProbe as _FreshnessProbe
     from ..storage.token_tracker import record_ranking_event as _record_ranking_event
@@ -426,16 +544,18 @@ def get_ranked_context(
     result["_meta"]["freshness"] = _probe.summary(context_items)
     _attach_confidence(result, context_items, is_stale=_probe.repo_is_stale)
     from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     _vres = _build_verdict(
         result_count=len(context_items),
         scanned_symbols=items_considered,
         scanned_files=len(set(s.get("file", "") for _, _, _, s in scored)),
-        best_score=max_bm25,
+        best_score=max(max_bm25, _EXACT_SEED_VERDICT_SCORE) if exact_ids else max_bm25,
         threshold=_ne_threshold,
         query_terms=query_terms,
         source_files=index.source_files,
         semantic_requested=False,
         index_stale=_probe.repo_is_stale,
+        coverage=_index_coverage_meta(index),
     )
     negative_evidence = _vres["negative_evidence"]
     result["_meta"]["verdict"] = _vres["verdict"]
@@ -514,10 +634,12 @@ def _get_ranked_context_fusion(
     # Centrality for BM25 tiebreaker
     cache = index._bm25_cache
     if "centrality" not in cache:
-        cache["centrality"] = _compute_centrality(
-            index.symbols, index.imports, index.alias_map,
-            getattr(index, "psr4_map", None),
-        )
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "centrality" not in cache:
+                cache["centrality"] = _compute_centrality(
+                    index.symbols, index.imports, index.alias_map,
+                    getattr(index, "psr4_map", None),
+                )
     centrality = cache["centrality"]
 
     weights, smoothing = load_fusion_weights()

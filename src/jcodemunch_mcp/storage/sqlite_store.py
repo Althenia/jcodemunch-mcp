@@ -214,6 +214,10 @@ CREATE TABLE IF NOT EXISTS scip_meta (
 _PRAGMAS = [
     "PRAGMA synchronous = NORMAL",
     "PRAGMA wal_autocheckpoint = 1000",
+    # A long-lived reader (watcher, long agent session) can starve autocheckpoint
+    # and grow the WAL unbounded; this bounds it so a successful checkpoint
+    # reclaims the file back to 64 MB.
+    "PRAGMA journal_size_limit = 67108864",
     "PRAGMA cache_size = -8000",
     "PRAGMA busy_timeout = 5000",
     "PRAGMA mmap_size = 268435456",   # 256 MB memory-mapped I/O
@@ -306,6 +310,24 @@ def _cache_put(owner: str, name: str, mtime_ns: int, code_index: "CodeIndex", br
         _index_cache.move_to_end(key)
         while len(_index_cache) > _CACHE_MAX_SIZE:
             _index_cache.popitem(last=False)
+
+
+# Single-flight guards for cold index hydration (#370): concurrent cold
+# callers against the same repo must not each independently read the full
+# symbol table and build a CodeIndex — one hydrates, the rest wait and take
+# the cached object. Keys mirror _index_cache; entries are tiny (one Lock
+# per repo ever loaded in this process), so no eviction is needed.
+_load_locks: dict[tuple[str, str, str], threading.Lock] = {}
+_load_locks_guard = threading.Lock()
+
+
+def _load_lock_for(key: tuple[str, str, str]) -> threading.Lock:
+    with _load_locks_guard:
+        lock = _load_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _load_locks[key] = lock
+        return lock
 
 
 def _cache_evict(owner: str, name: str) -> None:
@@ -1161,6 +1183,7 @@ class SQLiteIndexStore:
             package_names=getattr(base_index, "package_names", []),
             branch=branch,
             file_cap_status=getattr(base_index, "file_cap_status", {}) or {},
+            coverage=getattr(base_index, "coverage", {}) or {},
         )
 
     def _symbol_to_dict_for_delta(self, symbol: "Symbol") -> dict:
@@ -1406,68 +1429,81 @@ class SQLiteIndexStore:
             if cached is not None:
                 return cached
 
-        try:
-            conn = self._connect(db_path)
+        # Single-flight cold hydration (#370): concurrent cold callers against
+        # the same repo serialize here — one reads the rows and builds the
+        # CodeIndex, the rest wake up, re-check the cache, and take the
+        # freshly cached object instead of duplicating the whole load.
+        with _load_lock_for(key):
             try:
-                meta = self._read_meta(conn)
-                if not meta:
-                    return None
+                mtime_ns = _db_mtime_ns(db_path)
+            except OSError:
+                return None  # file was deleted while waiting on the lock
+            cached = _cache_get(owner, safe_name, mtime_ns, branch)
+            if cached is not None:
+                return cached
 
+            try:
+                conn = self._connect(db_path)
                 try:
-                    stored_version = int(meta.get("index_version", "0"))
-                except (TypeError, ValueError):
-                    logger.warning("Corrupt index version for %s/%s", owner, name)
-                    return None
-                if stored_version > cast(int, _INDEX_VERSION):
-                    logger.warning("Index version %d > current %d for %s/%s", stored_version, _INDEX_VERSION, owner, name)
-                    return None
+                    meta = self._read_meta(conn)
+                    if not meta:
+                        return None
 
-                symbol_rows = conn.execute("SELECT * FROM symbols").fetchall()
-                file_rows = conn.execute("SELECT * FROM files").fetchall()
+                    try:
+                        stored_version = int(meta.get("index_version", "0"))
+                    except (TypeError, ValueError):
+                        logger.warning("Corrupt index version for %s/%s", owner, name)
+                        return None
+                    if stored_version > cast(int, _INDEX_VERSION):
+                        logger.warning("Index version %d > current %d for %s/%s", stored_version, _INDEX_VERSION, owner, name)
+                        return None
 
-                index = self._build_index_from_rows(meta, symbol_rows, file_rows, owner, name)
+                    symbol_rows = conn.execute("SELECT * FROM symbols").fetchall()
+                    file_rows = conn.execute("SELECT * FROM files").fetchall()
 
-                # Warn if call references were not migrated (v7→v8 case)
-                if meta.get("call_refs_missing") == "1":
-                    logger.warning(
-                        "Index %s/%s was migrated from v7 which did not store call references. "
-                        "get_call_hierarchy and get_impact_preview will use text heuristics. "
-                        "Run 'jcodemunch-mcp index-folder' to re-index for AST-based call graphs.",
-                        owner, name,
-                    )
-            finally:
-                conn.close()
-        except sqlite3.DatabaseError:
-            # A corrupt DB must not raise a raw traceback out of a retrieval
-            # tool (audit V9b). Return None; callers routed through
-            # load_repo_index_or_error then fall through to inspect_index, which
-            # reports sqlite_corrupt + a re-index hint. Mirrors inspect_index's
-            # own DatabaseError guard.
-            logger.debug("Corrupt SQLite index at %s; treating as unloadable", db_path, exc_info=True)
-            return None
+                    index = self._build_index_from_rows(meta, symbol_rows, file_rows, owner, name)
 
-        # If a branch is requested, compose the delta on top of the base
-        if branch:
-            delta = self.load_branch_delta(owner, name, branch)
-            if delta is not None:
-                # Check if delta is stale (base has been re-indexed since delta was created)
-                if delta.get("base_head") and delta["base_head"] != index.git_head:
-                    logger.warning(
-                        "Branch delta for '%s' on %s/%s is stale "
-                        "(base_head %s != current %s). Delta will be applied but may be inaccurate. "
-                        "Re-run index_folder on the branch to refresh.",
-                        branch, owner, name,
-                        delta["base_head"][:8], (index.git_head or "")[:8],
-                    )
-                index = self.compose_branch_index(index, branch, delta)
+                    # Warn if call references were not migrated (v7→v8 case)
+                    if meta.get("call_refs_missing") == "1":
+                        logger.warning(
+                            "Index %s/%s was migrated from v7 which did not store call references. "
+                            "get_call_hierarchy and get_impact_preview will use text heuristics. "
+                            "Run 'jcodemunch-mcp index-folder' to re-index for AST-based call graphs.",
+                            owner, name,
+                        )
+                finally:
+                    conn.close()
+            except sqlite3.DatabaseError:
+                # A corrupt DB must not raise a raw traceback out of a retrieval
+                # tool (audit V9b). Return None; callers routed through
+                # load_repo_index_or_error then fall through to inspect_index, which
+                # reports sqlite_corrupt + a re-index hint. Mirrors inspect_index's
+                # own DatabaseError guard.
+                logger.debug("Corrupt SQLite index at %s; treating as unloadable", db_path, exc_info=True)
+                return None
 
-        # Populate cache (re-stat to capture any WAL checkpoint mtime change)
-        try:
-            post_mtime_ns = _db_mtime_ns(db_path)
-        except OSError:
-            post_mtime_ns = 0
-        _cache_put(owner, safe_name, post_mtime_ns, index, branch)
-        return index
+            # If a branch is requested, compose the delta on top of the base
+            if branch:
+                delta = self.load_branch_delta(owner, name, branch)
+                if delta is not None:
+                    # Check if delta is stale (base has been re-indexed since delta was created)
+                    if delta.get("base_head") and delta["base_head"] != index.git_head:
+                        logger.warning(
+                            "Branch delta for '%s' on %s/%s is stale "
+                            "(base_head %s != current %s). Delta will be applied but may be inaccurate. "
+                            "Re-run index_folder on the branch to refresh.",
+                            branch, owner, name,
+                            delta["base_head"][:8], (index.git_head or "")[:8],
+                        )
+                    index = self.compose_branch_index(index, branch, delta)
+
+            # Populate cache (re-stat to capture any WAL checkpoint mtime change)
+            try:
+                post_mtime_ns = _db_mtime_ns(db_path)
+            except OSError:
+                post_mtime_ns = 0
+            _cache_put(owner, safe_name, post_mtime_ns, index, branch)
+            return index
 
     def inspect_index(self, owner: str, name: str, branch: str = ""):
         """Check SQLite index presence and compatibility without loading rows."""
@@ -2039,6 +2075,59 @@ class SQLiteIndexStore:
             logger.debug("Failed to get file_cap_status for %s/%s", owner, name, exc_info=True)
             return {}
 
+    def get_coverage(self, owner: str, name: str) -> dict:
+        """Fast metadata-only read of the persisted coverage contract.
+
+        Returns ``{}`` when unknown (repo not indexed, or indexed before the
+        coverage contract was recorded).
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return {}
+        try:
+            conn = self._connect(db_path)
+            try:
+                meta = self._read_meta(conn)
+            finally:
+                conn.close()
+            return json.loads(meta.get("coverage", "{}")) or {}
+        except Exception:
+            logger.debug("Failed to get coverage for %s/%s", owner, name, exc_info=True)
+            return {}
+
+    def set_coverage(self, owner: str, name: str, coverage: dict) -> None:
+        """Persist the coverage contract into the meta table (post-save).
+
+        Written after every save that ran a full discovery walk, so the
+        recorded skip counts always describe the corpus the index was built
+        from. Best-effort: a failure never breaks the save that preceded it.
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return
+        try:
+            conn = self._connect(db_path)
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("coverage", json.dumps(coverage or {})),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            # Keep any cached in-process CodeIndex consistent without waiting
+            # for the mtime-keyed cache to miss.
+            with _cache_lock:
+                for key, entry in _index_cache.items():
+                    if key[0] == owner and key[1] == name:
+                        entry.code_index.coverage = coverage or {}
+        except Exception:
+            logger.debug("Failed to set coverage for %s/%s", owner, name, exc_info=True)
+
     def list_repos(self) -> list[dict]:
         """List all indexed repositories (scans .db files only)."""
         _pairs = parse_path_map()
@@ -2557,6 +2646,14 @@ class SQLiteIndexStore:
         else:
             new_file_cap_status = getattr(old, "file_cap_status", {})
 
+        if "coverage" in meta:
+            try:
+                new_coverage = json.loads(meta.get("coverage", "{}")) or {}
+            except (json.JSONDecodeError, ValueError):
+                new_coverage = getattr(old, "coverage", {})
+        else:
+            new_coverage = getattr(old, "coverage", {})
+
         return CodeIndex(
             repo=old.repo,
             owner=old.owner,
@@ -2581,6 +2678,7 @@ class SQLiteIndexStore:
             file_sizes=new_file_sizes,
             package_names=getattr(old, "package_names", []),
             file_cap_status=new_file_cap_status,
+            coverage=new_coverage,
         )
 
     def _build_index_from_rows(
@@ -2649,6 +2747,10 @@ class SQLiteIndexStore:
             file_cap_status = json.loads(meta.get("file_cap_status", "{}")) or {}
         except (json.JSONDecodeError, ValueError):
             file_cap_status = {}
+        try:
+            coverage = json.loads(meta.get("coverage", "{}")) or {}
+        except (json.JSONDecodeError, ValueError):
+            coverage = {}
 
         return CodeIndex(
             repo=meta.get("repo", f"{owner}/{name}"),
@@ -2674,6 +2776,7 @@ class SQLiteIndexStore:
             file_sizes=file_sizes,
             package_names=package_names,
             file_cap_status=file_cap_status,
+            coverage=coverage,
         )
 
     def _write_meta(self, conn: sqlite3.Connection, index: "CodeIndex") -> None:
@@ -2695,6 +2798,7 @@ class SQLiteIndexStore:
             "package_names": json.dumps(getattr(index, "package_names", []) or []),
             "base_branch": getattr(index, "branch", "") or "",
             "file_cap_status": json.dumps(getattr(index, "file_cap_status", {}) or {}),
+            "coverage": json.dumps(getattr(index, "coverage", {}) or {}),
         }
         conn.executemany(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",

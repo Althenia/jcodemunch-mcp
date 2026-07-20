@@ -128,6 +128,16 @@ Every tool response includes real-time savings data in the `_meta` field:
 
 No extra API calls or file reads — computed using fast `os.stat` only.
 
+### The meter is conservative by design
+
+Every known error term points down. The ~4-bytes-per-token conversion undercounts denser code; each matched file is credited once per call no matter how many symbols matched inside it; empty and negative results credit zero (the counter clamps at zero rather than booking a phantom saving). Cache hits record the same savings as the miss that populated them — a repeat query avoids the same raw reads, and for a long time the meter didn't count that, which was a systematic *under*count, since fixed.
+
+Savings are stored as **tokens**, never as currency. Dollar valuations are applied at display time at current published input-token rates, so the stored record never bakes in a price that later changes, and figures update automatically when vendors adjust pricing.
+
+### The lifetime meter and the `receipt` CLI
+
+`~/.code-index/_savings.json` holds the lifetime total plus per-day buckets, survives client reinstalls, and is multi-process safe. The `jcodemunch-mcp receipt` CLI reports it alongside windowed figures computed from your own local transcripts (`--since` / `--until` / `--by-day`; `--model` picks the valuation rate, `--rates` lists the price table). `receipt --export json` includes a `savings_provenance` block chaining the figures to the committed, CI-re-run measurement artifacts in `benchmarks/provenance/` — the report carries its own receipts. Full design: [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) Chapter 4.
+
 ---
 
 ## Per-Tool Latency + Drift Tracking (v1.74.0+)

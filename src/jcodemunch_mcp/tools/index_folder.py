@@ -81,6 +81,48 @@ def _attach_cap_report(result: dict, cap: Optional[dict]) -> None:
         f"JCODEMUNCH_MAX_FOLDER_FILES) and re-index, or narrow the path."
     )
 
+def _coverage_report(
+    skip_counts: dict, files_indexed: int, no_symbols_count: int,
+) -> dict:
+    """Coverage contract for absence claims, recorded per full discovery walk.
+
+    Persisted to the index meta table so query-time verdicts can disclose what
+    the corpus EXCLUDED (unsupported extensions, oversize, binary, secret,
+    cap-dropped files) and how many files parsed to zero symbols — a scan
+    count alone can't back an ``absent`` verdict when whole files never
+    entered the corpus. ``skip_dir`` counts directories, not files, so no
+    files_discovered total is derived here (each reason stands on its own).
+    """
+    from datetime import datetime, timezone
+
+    skips = {
+        k: int(v) for k, v in (skip_counts or {}).items() if int(v or 0) > 0
+    }
+    return {
+        "walk": "full",
+        "files_indexed": int(files_indexed),
+        "skip_counts": skips,
+        "no_symbols_count": int(no_symbols_count),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _record_coverage(
+    store, owner: str, repo_name: str,
+    skip_counts: dict, files_indexed: int, no_symbols_count: int,
+) -> None:
+    """Persist the coverage contract after a save (best-effort, never raises)."""
+    try:
+        store._sqlite.set_coverage(
+            owner, repo_name,
+            _coverage_report(skip_counts, files_indexed, no_symbols_count),
+        )
+    except Exception:
+        logger.debug(
+            "Failed to record coverage for %s/%s", owner, repo_name, exc_info=True
+        )
+
+
 def _build_skip_dirs_regex() -> re.Pattern:
     """Build regex from config-filtered skip directories (called per-index)."""
     dirs = get_skip_directories()
@@ -2060,6 +2102,14 @@ def index_folder(
                     file_cap_status=_cap_status,
                 )
 
+            # This path did a full discovery walk (paths=None), so the skip
+            # counts describe the whole corpus — refresh the coverage contract.
+            if paths is None:
+                _record_coverage(
+                    store, owner, repo_name,
+                    skip_counts, len(source_files), len(incremental_no_symbols),
+                )
+
             result = {
                 "success": True,
                 "repo": f"{owner}/{repo_name}",
@@ -2377,6 +2427,14 @@ def index_folder(
                 git_root=_git_root,
                 source_roots=_save_source_roots,
                 file_cap_status=_cap_status,
+            )
+
+        # Full-save paths above all followed a full discovery walk (paths=None);
+        # record the coverage contract the verdicts disclose at query time.
+        if paths is None:
+            _record_coverage(
+                store, owner, repo_name,
+                skip_counts, len(source_file_list), len(no_symbols_files),
             )
 
         # Identify languages that were indexed (symbols found) but have no import extractor

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jcodemunch.com/schemas/ranked-context-response.schema.json",
+  "title": "jCodeMunch get_ranked_context response",
+  "description": "JSON response contract for get_ranked_context (the tool's JSON surface; the MUNCH compact encoding is a lossless-scalar/lossy-detail projection of this shape). The _meta.verdict block additionally conforms to retrieval-verdict.schema.json.",
+  "type": "object",
+  "required": ["context_items", "total_tokens", "budget_tokens", "items_included", "items_considered", "_meta"],
+  "properties": {
+    "context_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol_id", "relevance_score", "centrality_score", "combined_score", "tokens", "source"],
+        "properties": {
+          "symbol_id": {"type": "string"},
+          "match_channel": {
+            "enum": ["exact_name"],
+            "description": "Present when the item was pinned by source-shaped exact seeding rather than ranked scoring."
+          },
+          "relevance_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "centrality_score": {"type": "number", "minimum": 0, "maximum": 1},
+          "combined_score": {"type": "number", "minimum": 0},
+          "tokens": {"type": "integer", "minimum": 0},
+          "source": {"type": "string"},
+          "id": {"type": ["string", "null"]},
+          "name": {"type": ["string", "null"]},
+          "kind": {"type": ["string", "null"]},
+          "file": {"type": ["string", "null"]},
+          "line": {"type": ["integer", "null"]},
+          "score": {"type": "number"},
+          "token_cost": {"type": "integer"},
+          "summary": {"type": "string"},
+          "source_pruned": {"type": "boolean"},
+          "source_kept_lines": {"type": "integer"},
+          "source_elided_lines": {"type": "integer"},
+          "source_total_lines": {"type": "integer"},
+          "source_is_pruned_view": {"type": "boolean"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "total_tokens": {"type": "integer", "minimum": 0},
+    "budget_tokens": {"type": "integer", "minimum": 1},
+    "items_included": {"type": "integer", "minimum": 0},
+    "items_considered": {"type": "integer", "minimum": 0},
+    "negative_evidence": {
+      "type": "object",
+      "required": ["verdict", "scanned_symbols", "scanned_files", "best_match_score"],
+      "properties": {
+        "verdict": {"enum": ["no_implementation_found", "low_confidence_matches"]},
+        "scanned_symbols": {"type": "integer", "minimum": 0},
+        "scanned_files": {"type": "integer", "minimum": 0},
+        "best_match_score": {"type": "number", "minimum": 0},
+        "related_existing": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "⚠ warning": {"type": "string"},
+    "_meta": {
+      "type": "object",
+      "required": ["timing_ms", "tokens_saved", "total_tokens_saved"],
+      "properties": {
+        "timing_ms": {"type": "number", "minimum": 0},
+        "tokens_saved": {"type": "integer", "minimum": 0},
+        "total_tokens_saved": {"type": "integer", "minimum": 0},
+        "verdict": {"type": "object", "description": "Conforms to retrieval-verdict.schema.json."},
+        "freshness": {"type": "object"},
+        "confidence": {},
+        "query_shape": {
+          "type": "object",
+          "required": ["source_shaped", "exact_seeded"],
+          "properties": {
+            "source_shaped": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "exact_seeded": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
