@@ -680,8 +680,12 @@ def search_symbols(
     query_terms = [t for t in query_terms if t]
     cache = index._bm25_cache
     if "idf" not in cache:
-        cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
-        cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
+        # Single-flight: concurrent cold searches must not each build the
+        # full-corpus BM25 state (#370)
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "idf" not in cache:
+                cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
+                cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
     idf = cache["idf"]
     avgdl = cache["avgdl"]
     centrality = cache["centrality"]
@@ -691,11 +695,13 @@ def search_symbols(
     pagerank: dict = {}
     if sort_by in ("centrality", "combined"):
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     has_filters = bool(kind or file_pattern or language or decorator)
@@ -1471,12 +1477,14 @@ def _search_symbols_fusion(
     if not pagerank:
         cache = index._bm25_cache
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map,
-                psr4_map=getattr(index, "psr4_map", None),
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map,
+                        psr4_map=getattr(index, "psr4_map", None),
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     if pagerank:

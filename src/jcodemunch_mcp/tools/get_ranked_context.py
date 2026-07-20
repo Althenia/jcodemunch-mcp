@@ -1,5 +1,6 @@
 """Standalone token-budgeted context assembler: best-K-tokens for a query."""
 
+import threading
 import time
 from fnmatch import fnmatch
 from typing import Optional
@@ -157,10 +158,12 @@ def _name_map(index) -> dict:
     """name → [symbol dict] lookup, cached beside the BM25 corpus."""
     cache = index._bm25_cache
     if "name_map" not in cache:
-        m: dict[str, list] = {}
-        for sym in index.symbols:
-            m.setdefault(sym.get("name", ""), []).append(sym)
-        cache["name_map"] = m
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "name_map" not in cache:
+                m: dict[str, list] = {}
+                for sym in index.symbols:
+                    m.setdefault(sym.get("name", ""), []).append(sym)
+                cache["name_map"] = m
     return cache["name_map"]
 
 
@@ -290,9 +293,13 @@ def get_ranked_context(
     query_terms = [t for t in query_terms if t]
     cache = index._bm25_cache
     if "idf" not in cache:
-        from .search_symbols import _compute_centrality  # noqa: PLC0415
-        cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
-        cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
+        # Single-flight: concurrent cold callers must not each build the
+        # full-corpus BM25 state (#370)
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "idf" not in cache:
+                from .search_symbols import _compute_centrality  # noqa: PLC0415
+                cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
+                cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
     idf = cache["idf"]
     avgdl = cache["avgdl"]
     inverted = cache["inverted"]
@@ -301,11 +308,13 @@ def get_ranked_context(
     pagerank: dict = {}
     if strategy in ("centrality", "combined"):
         if "pagerank" not in cache:
-            from .pagerank import compute_pagerank  # noqa: PLC0415
-            pr_scores, _ = compute_pagerank(
-                index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
-            )
-            cache["pagerank"] = pr_scores
+            with getattr(index, "_bm25_lock", None) or threading.Lock():
+                if "pagerank" not in cache:
+                    from .pagerank import compute_pagerank  # noqa: PLC0415
+                    pr_scores, _ = compute_pagerank(
+                        index.imports or {}, index.source_files, index.alias_map, psr4_map=getattr(index, "psr4_map", None)
+                    )
+                    cache["pagerank"] = pr_scores
         pagerank = cache["pagerank"]
 
     # ── Fusion path ─────────────────────────────────────────────────────
@@ -625,10 +634,12 @@ def _get_ranked_context_fusion(
     # Centrality for BM25 tiebreaker
     cache = index._bm25_cache
     if "centrality" not in cache:
-        cache["centrality"] = _compute_centrality(
-            index.symbols, index.imports, index.alias_map,
-            getattr(index, "psr4_map", None),
-        )
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "centrality" not in cache:
+                cache["centrality"] = _compute_centrality(
+                    index.symbols, index.imports, index.alias_map,
+                    getattr(index, "psr4_map", None),
+                )
     centrality = cache["centrality"]
 
     weights, smoothing = load_fusion_weights()

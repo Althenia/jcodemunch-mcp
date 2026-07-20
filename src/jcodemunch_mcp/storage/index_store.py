@@ -7,6 +7,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -195,6 +196,9 @@ class CodeIndex:
         self._source_file_set: set[str] = set(self.source_files)
         # Lazy BM25 cache — populated on first search, invalidated by new CodeIndex
         self._bm25_cache: dict = {}
+        # Guards check-then-build on _bm25_cache: concurrent cold searches must
+        # not each rebuild full-corpus BM25/PageRank state (#370)
+        self._bm25_lock = threading.Lock()
         # Lazy import-name inverted index — populated on first find_references call
         self._import_name_index: Optional[dict[str, list[tuple[str, dict]]]] = None
         # Lazy reverse lookup: built on first access via get_callers_by_name()

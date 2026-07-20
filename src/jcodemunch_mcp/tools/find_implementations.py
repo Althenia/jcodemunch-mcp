@@ -536,13 +536,18 @@ def find_implementations(
             pagerank = cache["pagerank"]
         else:
             try:
-                from .pagerank import compute_pagerank  # noqa: PLC0415
-                pr, _ = compute_pagerank(
-                    index.imports or {}, index.source_files, index.alias_map,
-                    psr4_map=getattr(index, "psr4_map", None),
-                )
-                cache["pagerank"] = pr
-                pagerank = pr
+                import threading  # noqa: PLC0415
+                with getattr(index, "_bm25_lock", None) or threading.Lock():
+                    if "pagerank" in cache:
+                        pagerank = cache["pagerank"]
+                    else:
+                        from .pagerank import compute_pagerank  # noqa: PLC0415
+                        pr, _ = compute_pagerank(
+                            index.imports or {}, index.source_files, index.alias_map,
+                            psr4_map=getattr(index, "psr4_map", None),
+                        )
+                        cache["pagerank"] = pr
+                        pagerank = pr
             except Exception as exc:  # noqa: BLE001
                 logger.debug("find_implementations: pagerank skipped: %s", exc, exc_info=True)
 

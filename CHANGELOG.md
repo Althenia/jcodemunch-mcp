@@ -2,6 +2,30 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.147] - 2026-07-19 - single-flight cold index loads and BM25 builds
+
+### Fixed
+- **Concurrent cold searches no longer repeat whole-index work (#370,
+  reported by @rknighton).** Two thundering-herd defects, both visible at
+  scale (a 665k-symbol, ~0.5 GB index took 7.5–11.4 minutes and ~16 GiB
+  when 13 cold searches landed at once):
+  - `load_index`'s cold path hydrated the same repository once per
+    concurrent caller — the cache *check* was locked but the hydration was
+    not. A per-repo single-flight lock now serializes cold hydration: one
+    caller reads the rows and builds the `CodeIndex`, the rest wake up and
+    take the freshly cached object. N simultaneous cold callers cost one
+    hydration's time and memory instead of N.
+  - The per-index `_bm25_cache` check-then-build was unsynchronized, so
+    every cold search independently built the full-corpus BM25/centrality/
+    PageRank state. `CodeIndex` now carries a `_bm25_lock`, used
+    double-checked at every build site (`search_symbols`,
+    `get_ranked_context`, `plan_turn`, `find_implementations`,
+    `get_repo_map`) and around `register_edit`'s cache clear.
+  Warm-path behavior, result shapes, and ranking are byte-identical; the
+  change only removes duplicated work. Known residual (documented, not
+  fixed here): cancelling a client request cannot stop in-flight
+  server-side work — tool bodies run to completion in a worker thread.
+
 ## [1.108.146] - 2026-07-19 - token yield + advisory session budgets
 
 ### Added

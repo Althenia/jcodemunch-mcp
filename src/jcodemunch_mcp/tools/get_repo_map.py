@@ -102,12 +102,20 @@ def get_repo_map(
     cache = getattr(index, "_bm25_cache", None)
     if cache is not None and "pagerank" in cache and scope is None:
         scores = cache["pagerank"]
+    elif cache is not None and scope is None:
+        import threading  # noqa: PLC0415
+        with getattr(index, "_bm25_lock", None) or threading.Lock():
+            if "pagerank" in cache:
+                scores = cache["pagerank"]
+            else:
+                scores, _iterations = compute_pagerank(
+                    index.imports or {}, source_files, index.alias_map, psr4_map=_psr4
+                )
+                cache["pagerank"] = scores
     else:
         scores, _iterations = compute_pagerank(
             index.imports or {}, source_files, index.alias_map, psr4_map=_psr4
         )
-        if cache is not None and scope is None:
-            cache["pagerank"] = scores
 
     in_deg, _out_deg = compute_in_out_degrees(
         index.imports or {}, source_files, index.alias_map, _psr4
