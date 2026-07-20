@@ -2,6 +2,37 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.150] - 2026-07-28 - stateless-MCP forward cover: principal session keying + SSE deprecation notice
+
+### Added
+- **Auth-principal fallback in session-state keying.** The MCP 2026-07-28 spec
+  removes protocol sessions (`Mcp-Session-Id`) from HTTP transports. Once
+  session ids stop being issued, every request would look like a fresh session
+  and per-session state (tool-tier overrides, advisory budgets, session stats,
+  verdict calibration) would silently reset per request. `_session_key()` now
+  resolves: transport `session_id` → hashed auth principal → per-session
+  weakref UUID → default sentinel. The principal is a SHA-256 digest of the
+  `Authorization` header (never the raw credential), captured by the
+  streamable-http handler at session creation so the session task's context
+  inherits it. Today's sessionful transport is byte-identical (`session_id`
+  always wins); under a stateless transport, authenticated callers keep
+  durable state keyed to their credential. Deliberately NOT set for SSE:
+  concurrent SSE clients share the single `JCODEMUNCH_HTTP_TOKEN`, and
+  principal keying would merge their state.
+- **No-principal demand signal.** When an HTTP session is created with no
+  `Authorization` header, one INFO line per process notes that per-session
+  state won't survive protocol statelessness for unauthenticated callers —
+  the demand signal for a future explicit session-handle contract.
+
+### Changed
+- **SSE deprecation notice.** `serve --transport sse` now prints a startup
+  NOTICE that the MCP 2026-07-28 spec deprecates SSE and recommends
+  `--transport streamable-http`. SSE keeps working for hosts that haven't
+  migrated (e.g. Odysseus); README "Works with" and the Odysseus section
+  updated accordingly.
+
+No tool-count, schema, wire-shape, or INDEX_VERSION change.
+
 ## [1.108.149] - 2026-07-20 - deterministic emission + cache-stability baseline
 
 ### Changed

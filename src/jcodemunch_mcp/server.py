@@ -337,6 +337,8 @@ def _catalog_names() -> set:
 
 
 # --- Runtime session tier state -------------------------------------------- #
+import contextvars
+import hashlib
 import threading
 import uuid
 import weakref
@@ -358,6 +360,44 @@ _SESSION_TIER_DEFAULT_KEY: Hashable = "__default__"
 _session_tier_overrides: dict[Hashable, str] = {}
 _session_tier_lock = threading.Lock()
 
+# Auth-principal fallback for stateless HTTP (MCP spec 2026-07-28 removes
+# protocol sessions). Set ONLY by the streamable-http handler at session
+# creation, before the session task is spawned — asyncio.create_task copies the
+# request's context, so every handler in that session sees the value. Never set
+# for SSE: concurrent SSE clients share the single JCODEMUNCH_HTTP_TOKEN, and
+# keying them by principal would merge their per-session state.
+_HTTP_PRINCIPAL: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "jcodemunch_http_principal", default=None
+)
+
+
+def _principal_from_authorization(auth_header: Optional[str]) -> Optional[str]:
+    """Derive a stable, non-reversible state key from an Authorization header.
+
+    Never stores or logs the raw credential. None when no header was sent.
+    """
+    if not auth_header:
+        return None
+    digest = hashlib.sha256(auth_header.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"principal-{digest[:16]}"
+
+
+_no_principal_logged = False
+
+
+def _note_no_principal_session() -> None:
+    # Demand signal for a session-handle contract under stateless MCP; once per
+    # process so a chatty client can't spam the log.
+    global _no_principal_logged
+    if _no_principal_logged:
+        return
+    _no_principal_logged = True
+    logger.info(
+        "HTTP session created with no Authorization header; once MCP transports "
+        "go stateless, per-session state (tool tiers, budgets, session stats) "
+        "will not persist for unauthenticated callers."
+    )
+
 # Maps a live session object → a stable uuid used as the dict key above.
 # WeakKeyDictionary drops entries automatically when the session is freed,
 # and the matching override entry is purged lazily via the finalizer below.
@@ -369,18 +409,24 @@ def _session_key() -> Hashable:
 
     Priority:
       1. `session.session_id` if the MCP library exposes one (HTTP transport).
-      2. A per-process UUID tracked in a WeakKeyDictionary keyed by the
+      2. The hashed auth principal captured by the streamable-http handler —
+         fires only when the transport issues no session id (stateless MCP,
+         spec 2026-07-28), so authed callers keep durable state there.
+      3. A per-process UUID tracked in a WeakKeyDictionary keyed by the
          session object. Survives for the lifetime of the session and
          disappears with it — no id() reuse after GC (F2), no LRU eviction
          required (F3).
-      3. The default sentinel when there is no active session (stdio/tests).
+      4. The default sentinel when there is no active session (stdio/tests).
     """
     session = _get_mcp_session()
-    if session is None:
-        return _SESSION_TIER_DEFAULT_KEY
-    sid = getattr(session, "session_id", None)
+    sid = getattr(session, "session_id", None) if session is not None else None
     if isinstance(sid, str) and sid:
         return sid
+    principal = _HTTP_PRINCIPAL.get()
+    if principal is not None:
+        return principal
+    if session is None:
+        return _SESSION_TIER_DEFAULT_KEY
     try:
         existing = _session_uuid.get(session)
         if existing is not None:
@@ -6313,6 +6359,12 @@ async def run_sse_server(host: str, port: int):
         f"jcodemunch-mcp {__version__} by jgravelle · SSE server at http://{host}:{port}/sse",
         file=sys.stderr,
     )
+    print(
+        "NOTICE: the SSE transport is deprecated by the MCP 2026-07-28 spec and will "
+        "eventually leave MCP SDKs. Prefer `serve --transport streamable-http` when "
+        "your MCP client supports it; SSE keeps working here until hosts migrate.",
+        file=sys.stderr,
+    )
     if not os.environ.get("JCODEMUNCH_HTTP_TOKEN") and host not in ("127.0.0.1", "localhost", "::1"):
         print(
             f"WARNING: SSE bound to non-loopback host {host!r} without "
@@ -6425,8 +6477,17 @@ async def run_streamable_http_server(host: str, port: int):
                 headers={"Retry-After": "30"},
             )
 
-        # New session — generate a unique ID so the transport enforces it on
-        # all subsequent requests, preventing cross-session pollution.
+        # New session — capture the caller's auth principal into this request's
+        # context BEFORE spawning the session task: create_task copies the
+        # context, so every handler in the session inherits it. Today the
+        # transport session_id above always wins in _session_key(); the
+        # principal takes over only when session ids stop being issued.
+        _HTTP_PRINCIPAL.set(_principal_from_authorization(request.headers.get("authorization")))
+        if _HTTP_PRINCIPAL.get() is None:
+            _note_no_principal_session()
+
+        # Generate a unique ID so the transport enforces it on all subsequent
+        # requests, preventing cross-session pollution.
         new_id = uuid.uuid4().hex
         transport = StreamableHTTPServerTransport(mcp_session_id=new_id)
         _sessions[new_id] = transport

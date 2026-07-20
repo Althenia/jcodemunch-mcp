@@ -902,7 +902,7 @@ Tested configurations:
 | **Goose (Block)** | `goose configure` → Add Extension → command `uvx jcodemunch-mcp` |
 | **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** | Add to `~/.hermes/config.yaml` — see [skill](https://github.com/NousResearch/hermes-agent/pull/10413) |
 | **Paperclip** | `.mcp.json` at workspace root (auto-detected) |
-| **Any other MCP client** | stdio: `jcodemunch-mcp`, HTTP: `jcodemunch-mcp serve --transport sse` |
+| **Any other MCP client** | stdio: `jcodemunch-mcp`, HTTP: `jcodemunch-mcp serve --transport streamable-http` (SSE still available but deprecated by the MCP 2026-07-28 spec) |
 | **VS Code (any MCP client)** | Install the [jCodeMunch VS Code extension](https://marketplace.visualstudio.com/items?itemName=jgravelle.jcodemunch-mcp-vscode) for on-save auto-reindex under Copilot Chat / Continue / Cline — closes the staleness gap when the host doesn't fire PostToolUse hooks |
 | **GitHub Copilot CLI / cloud agent** | `jcodemunch-mcp init --copilot-hooks` writes `.github/hooks/hooks.json` with a postToolUse rule for auto-reindex |
 | **[Odysseus](https://github.com/pewdiepie-archdaemon/odysseus)** (self-hosted AI workspace) | SSE transport: run `jcodemunch-mcp serve --transport sse` on the host (token **unset**), register the URL in the MCP Registry (see below) — *community-tested* |
@@ -999,6 +999,12 @@ indexes nothing itself; jCodeMunch indexes your code on the **host**. Run
 jCodeMunch as an **SSE** server on the host and register its URL in Odysseus.
 Its SSE client connects by URL only (no auth header), so leave the token unset
 and secure the endpoint by network binding instead.
+
+> **SSE deprecation note:** the MCP 2026-07-28 spec deprecates the SSE
+> transport. jCodeMunch keeps serving SSE for hosts like Odysseus that don't
+> offer streamable-http yet; once Odysseus adds a streamable-http registry
+> option, switch to `serve --transport streamable-http` and URL
+> `http://host.docker.internal:8848/mcp`.
 
 **1. Start jCodeMunch on the host (no token):**
 
