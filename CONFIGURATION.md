@@ -265,7 +265,7 @@ Controls the session-aware routing features (plan_turn, session journal, turn bu
 | `session_journal` | bool | `true` | Enable session journal (tracks reads, searches, edits, tool calls). |
 | `turn_budget_tokens` | int | `20000` | Token budget per turn. Injects `budget_warning` when exceeded. `0` = disabled. |
 | `turn_gap_seconds` | float | `30.0` | Seconds of inactivity before starting a new turn budget cycle. |
-| `session_token_budget` | int | `0` | Advisory session budget over response tokens served. When set, responses carry `_meta.budget` at >=80% (`approaching`) and >=100% (`over`) and `get_session_stats` reports the block. Never blocks or truncates. `0` = disabled. |
+| `session_token_budget` | int | `0` | Advisory session budget over response tokens served. When set, responses carry `_meta.budget` at >=80% (`approaching`) and >=100% (`over`) and `get_session_stats` reports the block. Never blocks or truncates. `0` = disabled. After 3+ `plan_turn` calls the block also carries `actual_vs_estimated` (median estimate-calibration ratio). |
 | `negative_evidence_threshold` | float | `0.5` | BM25 score threshold below which results are flagged as negative evidence. |
 | `search_result_cache_max` | int | `128` | Max entries in the LRU search result cache. |
 | `plan_turn_high_threshold` | float | `2.0` | BM25 score threshold for "high" confidence in `plan_turn`. |

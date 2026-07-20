@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.148](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.148)** (2026-07-20) — estimate-vs-actual consumption receipts
 - **[v1.108.147](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.147)** (2026-07-19) — single-flight cold index loads and BM25 builds
 - **[v1.108.146](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.146)** (2026-07-19) — token yield + advisory session budgets
-- **[v1.108.145](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.145)** (2026-07-19) — coverage contract for absence claims + scorer-pinned calibration
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -332,6 +332,7 @@ The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine
 
 - **`yield`** — of the context served this session, how much showed downstream follow-through: served search results later fetched via `get_symbol_source`/`get_context_bundle`, or whose file was subsequently edited (`register_edit`/`index_file`). Reports `rate` with its components (`served_results`, `followed_through`) plus `repeated_identical_calls` per tool — the agent's redundant context spend, distinct from cache hits (those measure the server's cost; repeats cost the agent's context window even on a hit). One honest caveat: a search whose result lines answered the question outright has yield the call sequence can't see, which is why `rate` ships with its components and never as a lone grade.
 - **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
+- **`estimate_calibration`** — agents systematically underestimate what a plan will cost to execute. Every `plan_turn` call now prices its recommended route (`consumption_estimate = {estimated_tokens, expected_calls, basis}`) and the next `plan_turn` reconciles that estimate against the response tokens actually served in between. After 3 closed samples, the median `actual_vs_estimated` ratio appears in session stats, on the budget block, and back on `plan_turn` itself as `calibrated_tokens` — so "you're at 85% of budget" comes with "and your estimates run 2.4x hot", a calibration receipt instead of a bare forecast.
 
 Both are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
 

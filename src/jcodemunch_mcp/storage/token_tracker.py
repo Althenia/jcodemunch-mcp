@@ -60,6 +60,9 @@ _RESULT_CACHE_MAXSIZE = 256  # max tool-result cache entries per session
 _YIELD_SERVED_MAXSIZE = 5000  # max served-symbol-id entries tracked per session
 _CALL_SIG_MAXSIZE = 2000  # max distinct (tool, args_hash) signatures tracked
 _BUDGET_APPROACHING_PCT = 0.8  # _meta.budget appears at >=80% of the limit
+_ESTIMATE_RATIO_MAXSIZE = 50  # closed estimate-vs-actual samples kept per session
+_CALIBRATION_MIN_SAMPLES = 3  # calibration reported only at/after this floor
+_DEFAULT_TOKENS_PER_CALL = 700  # cold-start per-call estimate before session data
 _LATENCY_RING_DEFAULT = 512  # per-tool latency ring size
 _PERF_DB_MAX_ROWS_DEFAULT = 100_000  # rolling cap on persisted perf rows
 
@@ -117,6 +120,12 @@ class _State:
         # accumulate into _repeat_calls[tool]
         self._call_signatures: OrderedDict = OrderedDict()
         self._repeat_calls: dict[str, int] = {}
+        # Estimate-vs-actual calibration (v1.108.148; process lifetime only).
+        # plan_turn opens an estimate; the next plan_turn closes it against
+        # the response tokens actually served in between.
+        self._response_events: int = 0
+        self._open_estimate: Optional[dict] = None
+        self._estimate_ratios: deque = deque(maxlen=_ESTIMATE_RATIO_MAXSIZE)
         # Perf SQLite sink (opt-in via config "perf_telemetry_enabled")
         self._perf_db_path_cached: Optional[Path] = None
         self._perf_db_failed: bool = False
@@ -230,6 +239,7 @@ class _State:
         """Add served response tokens to the session counter. Thread-safe."""
         with self._lock:
             self._session_response_tokens += max(0, int(tokens))
+            self._response_events += 1
             return self._session_response_tokens
 
     def _budget_locked(self) -> Optional[dict]:
@@ -247,12 +257,55 @@ class _State:
             state = "approaching"
         else:
             state = "ok"
-        return {"limit": limit, "spent": spent, "state": state}
+        block = {"limit": limit, "spent": spent, "state": state}
+        cal = self._calibration_locked()
+        if cal is not None:
+            block["actual_vs_estimated"] = cal["actual_vs_estimated"]
+        return block
 
     def budget_status(self) -> Optional[dict]:
         """Public budget snapshot ({limit, spent, state}) or None. Thread-safe."""
         with self._lock:
             return self._budget_locked()
+
+    def _calibration_locked(self) -> Optional[dict]:
+        """Calibration block, or None below the sample floor. Lock held."""
+        n = len(self._estimate_ratios)
+        if n < _CALIBRATION_MIN_SAMPLES:
+            return None
+        ratios = sorted(self._estimate_ratios)
+        mid = n // 2
+        # Median, not mean — per-turn consumption varies wildly and a single
+        # runaway turn must not swamp the calibration signal.
+        median = ratios[mid] if n % 2 else (ratios[mid - 1] + ratios[mid]) / 2
+        return {"samples": n, "actual_vs_estimated": round(median, 2)}
+
+    def record_turn_estimate(self, estimated_tokens: int) -> Optional[dict]:
+        """Open a consumption estimate, closing any prior open one against
+        the response tokens actually served since it opened.
+
+        Returns the current calibration block, or None below the sample
+        floor. Thread-safe.
+        """
+        with self._lock:
+            spent = self._session_response_tokens
+            prior = self._open_estimate
+            if prior is not None and prior["estimated"] > 0:
+                actual = spent - prior["start_spent"]
+                if actual > 0:
+                    self._estimate_ratios.append(actual / prior["estimated"])
+            self._open_estimate = {
+                "estimated": max(0, int(estimated_tokens)),
+                "start_spent": spent,
+            }
+            return self._calibration_locked()
+
+    def avg_response_tokens_per_call(self) -> int:
+        """Mean served response tokens per tool call this session (0 = no data)."""
+        with self._lock:
+            if self._response_events == 0:
+                return 0
+            return self._session_response_tokens // self._response_events
 
     def note_served(self, symbol_ids) -> None:
         """Record symbol ids served by a ranking/search tool. Thread-safe."""
@@ -339,6 +392,9 @@ class _State:
         yield_block = self._yield_locked()
         if yield_block is not None:
             stats["yield"] = yield_block
+        calibration = self._calibration_locked()
+        if calibration is not None:
+            stats["estimate_calibration"] = calibration
         return stats
 
     # ---------------------------------------------------------------------
@@ -1048,6 +1104,16 @@ def record_response_text(text: str) -> int:
 def budget_status() -> Optional[dict]:
     """Session budget snapshot ({limit, spent, state}) or None when unset."""
     return _state.budget_status()
+
+
+def record_turn_estimate(estimated_tokens: int) -> Optional[dict]:
+    """Open a plan_turn consumption estimate; returns calibration or None."""
+    return _state.record_turn_estimate(estimated_tokens)
+
+
+def avg_response_tokens_per_call() -> int:
+    """Mean served response tokens per tool call this session (0 = no data)."""
+    return _state.avg_response_tokens_per_call()
 
 
 def note_served(symbol_ids) -> None:

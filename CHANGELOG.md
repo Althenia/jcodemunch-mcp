@@ -2,6 +2,35 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.148] - 2026-07-20 - estimate-vs-actual consumption receipts
+
+### Added
+- **`plan_turn` prices its recommended route and the session grades the
+  estimate.** Research on agent token spend keeps finding the same two
+  facts: per-run consumption varies wildly, and agents systematically
+  underestimate what a plan will cost to execute. jCodeMunch already held
+  both halves of the answer — `plan_turn` forecasts the work (recommended
+  symbols + `max_supplementary_reads`) and the advisory budget (v1.108.146)
+  counts response tokens actually served — they just never met.
+  - `plan_turn` now returns `consumption_estimate = {estimated_tokens,
+    expected_calls, basis}`. `basis` is `session_avg` (observed mean served
+    tokens per call this session) once data exists, else a `default`
+    per-call constant for cold starts.
+  - Each `plan_turn` opens an estimate; the **next** `plan_turn` closes it
+    against tokens actually served in between. Closed samples feed a
+    median `actual_vs_estimated` ratio (median, not mean — one runaway
+    turn must not swamp the signal; capped ring of 50 samples).
+  - After 3 closed samples the ratio surfaces on every consumer:
+    `get_session_stats` gains `estimate_calibration = {samples,
+    actual_vs_estimated}`; the advisory `_meta.budget` block carries
+    `actual_vs_estimated` beside `{limit, spent, state}`; and
+    `plan_turn`'s own estimate gains `calibrated_tokens` — the forecast
+    corrected by the session's measured bias.
+  - Advisory-only, inline compute, process-lifetime state, nothing
+    persisted, no new config keys or tools. Zero-estimate and zero-actual
+    windows never produce samples. All blocks omitted until they have
+    something honest to say.
+
 ## [1.108.147] - 2026-07-19 - single-flight cold index loads and BM25 builds
 
 ### Fixed
