@@ -2,6 +2,19 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.154] - 2026-07-21 - `surface` CLI subcommand
+
+### Added
+- **`jcodemunch-mcp surface [--json]`** — prints the tool-surface schema
+  receipt (the same block `get_session_stats` reports as `tool_surface`):
+  active surface/profile, visible vs catalog tool counts, estimated schema
+  tokens for each, `schema_tokens_avoided`, and the heaviest tool schemas.
+  Exists so consumers with no MCP session — the jMunch Console in
+  particular — can shell the receipt. Loads config before computing
+  (`tool_surface` / `tool_profile` / `compact_schemas` / `disabled_tools`
+  all shape it); registered in `known_commands` so the prepend-serve guard
+  routes it. Read-only, instant, scans nothing.
+
 ## [1.108.153] - 2026-07-21 - tool-surface schema receipt in session stats
 
 ### Added
