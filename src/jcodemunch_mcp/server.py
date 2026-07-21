@@ -338,6 +338,45 @@ def _catalog_names() -> set:
     return {t.name for t in _raw_catalog_tools() if t.name not in _COUNTER_FRONT_DOOR}
 
 
+def _tool_surface_stats(top_n: int = 15) -> dict:
+    """Schema token weight of the currently visible tool surface vs the raw catalog.
+
+    Estimator matches the meter's scale (bytes/4) over the same serialization
+    the schema-budget baseline uses ({name, description, inputSchema}, compact
+    separators). Advisory receipt only — never blocks, nothing persisted.
+    """
+    import json as _json
+
+    def _weight(tool) -> int:
+        payload = _json.dumps(
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "inputSchema": tool.inputSchema or {},
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+        return max(1, len(payload.encode("utf-8")) // 4)
+
+    visible = {t.name: _weight(t) for t in _build_tools_list()}
+    catalog = {t.name: _weight(t) for t in _raw_catalog_tools()}
+    visible_total = sum(visible.values())
+    catalog_total = sum(catalog.values())
+    heaviest = dict(sorted(visible.items(), key=lambda kv: -kv[1])[:top_n])
+    return {
+        "surface": _effective_surface(),
+        "profile": _effective_profile(),
+        "visible_tools": len(visible),
+        "catalog_tools": len(catalog),
+        "schema_tokens_visible": visible_total,
+        "schema_tokens_catalog": catalog_total,
+        "schema_tokens_avoided": max(0, catalog_total - visible_total),
+        "heaviest_tools": heaviest,
+        "estimator": "bytes/4",
+    }
+
+
 # --- Runtime session tier state -------------------------------------------- #
 import contextvars
 import hashlib
@@ -5045,6 +5084,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     storage_path=storage_path,
                 )
             )
+            # Tool-surface schema receipt (v1.108.153). Advisory only — a
+            # failure here must never break the stats tool.
+            try:
+                result["tool_surface"] = _tool_surface_stats()
+            except Exception:
+                logger.debug("tool_surface stats failed", exc_info=True)
         elif name == "analyze_perf":
             from .tools.analyze_perf import analyze_perf
             result = await asyncio.to_thread(

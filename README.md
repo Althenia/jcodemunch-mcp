@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.153](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.153)** (2026-07-21) — tool-surface schema receipt in session stats
 - **[v1.108.152](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.152)** (2026-07-21) — runtime identity resource (#371)
 - **[v1.108.151](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.151)** (2026-07-21) — nested-worktree exclusion + per-worktree identity (#372)
-- **[v1.108.150](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.150)** (2026-07-28) — stateless-MCP forward cover: principal session keying + SSE deprecation notice
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -334,7 +334,9 @@ The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine
 - **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
 - **`estimate_calibration`** — agents systematically underestimate what a plan will cost to execute. Every `plan_turn` call now prices its recommended route (`consumption_estimate = {estimated_tokens, expected_calls, basis}`) and the next `plan_turn` reconciles that estimate against the response tokens actually served in between. After 3 closed samples, the median `actual_vs_estimated` ratio appears in session stats, on the budget block, and back on `plan_turn` itself as `calibrated_tokens` — so "you're at 85% of budget" comes with "and your estimates run 2.4x hot", a calibration receipt instead of a bare forecast.
 
-Both are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
+- **`tool_surface`** — what the tool surface itself costs: visible-vs-catalog tool counts, estimated schema tokens for each, `schema_tokens_avoided` by the active surface/tier (the Counter or a narrow profile), and the top-15 heaviest schemas. Counted at the same bytes/4 scale and serialization as the CI schema-budget guardrail, so the runtime receipt and the regression gate agree by construction.
+
+All of these are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
 
 ### Confidence provenance — every number states its basis
 

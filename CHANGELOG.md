@@ -2,6 +2,22 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.153] - 2026-07-21 - tool-surface schema receipt in session stats
+
+### Added
+- **`tool_surface` block in `get_session_stats`** — an advisory receipt for
+  what the tool surface itself costs: `visible_tools` / `catalog_tools`
+  counts, `schema_tokens_visible` / `schema_tokens_catalog` /
+  `schema_tokens_avoided` (what the active surface + tier saves vs
+  advertising the full catalog), the `heaviest_tools` top-15 by schema
+  weight, and the active `surface` / `profile`. Estimated at the meter's
+  bytes/4 scale over the same `{name, description, inputSchema}`
+  serialization the schema-budget baseline uses, so the runtime receipt and
+  the CI guardrail count the same thing. Read-only, computed inline on the
+  stats call only, nothing persisted; a probe failure degrades to the block
+  being omitted, never a failed call. No new tool, no schema change, no
+  INDEX_VERSION change.
+
 ## [1.108.152] - 2026-07-21 - runtime identity resource (#371)
 
 ### Added
