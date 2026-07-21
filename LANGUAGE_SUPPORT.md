@@ -70,6 +70,14 @@
 | Nim               | `.nim`, `.nims`, `.nimble`                      | tree-sitter-nim                 | function (proc/func/template/macro/method/iterator), type, constant (var/let/const)        | —              | `#` comments                  | Signature includes keyword (proc/func/template/macro); exported `*` suffix stripped        |
 | Tcl               | `.tcl`, `.tk`, `.itcl`                          | tree-sitter-tcl                 | function (proc), class (namespace eval)                                                    | —              | `#` comments                  | Namespace nesting with `::` separator; nested procs inside namespace bodies                |
 | D                 | `.d`, `.di`                                     | tree-sitter-d                   | function, class (class/struct/interface), type (enum), function (template)                  | —              | `//` and `/* */` comments     | Nested method extraction inside class/struct bodies; qualified names via scope              |
+| Razor / Blazor    | `.cshtml`, `.razor`                             | regex + C#/HTML delegation      | class, function, method, constant                                                          | `[Attribute]`  | `///` and `//` in code blocks | `@functions`/`@code` blocks re-parsed as C#; `@page`/`@inject`/`@model`/`@using` → constants; HTML `id=` attributes captured |
+| Astro             | `.astro`                                        | frontmatter + `<script>` delegation | class, function, type, constant                                                       | varies         | varies                        | TS/JS frontmatter (`---` fences) + inline `<script>` re-parsed as TS/JS; template `id=` → constants; frontmatter + PascalCase component-usage import edges |
+| Arduino           | `.ino`, `.pde`                                  | tree-sitter-arduino             | function, class, type (struct/enum/union), constant                                        | —              | `/* */` and `//` comments     | C++ superset grammar; `.ino`/`.pde` sketches; `#define` macros as constants                 |
+| VHDL              | `.vhd`, `.vhdl`, `.vho`, `.vhs`                 | regex-based                     | class (architecture), type (entity/package), function (process/function/procedure), constant (signal) | — | `--` preceding comments       | No tree-sitter grammar; regex extraction; qualified `entity.architecture` names             |
+| Verilog / SystemVerilog | `.v`, `.vh`, `.sv`, `.svh`                | regex-based                     | class (module/class), type (interface), function (function/task), constant                 | —              | `//` and `/* */` comments     | No tree-sitter grammar; regex extraction; module/class/interface/package/function/task constructs |
+| Haskell           | `.hs`, `.lhs`                                   | tree-sitter-haskell             | function, type (data/newtype/type synonym/class)                                           | —              | `--` and `{- -}` comments     | Minimal extraction (names via generic walk); full custom parser deferred                    |
+| Julia             | `.jl`                                           | regex/custom                    | function (function/macro), class (module), type (struct/abstract)                          | —              | `#` and `"""` docstrings      | Names nested in signature nodes; custom `_parse_julia_symbols`; module-qualified names       |
+| Luau              | `.luau`                                         | tree-sitter-luau                | function, type                                                                             | —              | `--` and `--[[` comments      | Roblox Luau (typed Lua variant); `.lua` uses tree-sitter-lua separately                     |
 
 \* `.h` uses C++ parsing first, then falls back to C when no C++ symbols are extracted.
 \*\* `.m` defaults to Objective-C unless the file path contains MATLAB indicators (`matlab/`, `toolbox/`, `simulink/`).
@@ -81,6 +89,9 @@ These languages are fully indexed and searchable via `search_text`. Symbol extra
 | Language | Extensions     | Notes                                                              |
 | -------- | -------------- | ------------------------------------------------------------------ |
 | TOML     | `.toml`        | Tables indexed; key-as-symbol extractor planned                    |
+| R        | `.r`           | Functions are name-bound values (`f <- function(){}`); custom extractor planned |
+| LESS     | `.less`        | No tree-sitter-less grammar in language-pack; indexed for text search |
+| Stylus   | `.styl`        | No tree-sitter-stylus grammar in language-pack; indexed for text search |
 
 ### Templating engines (over an underlying language)
 
@@ -212,6 +223,6 @@ JCODEMUNCH_EXTRA_EXTENSIONS=".cgi:perl,.psgi:perl,.jsm:javascript"
 - Comma-separated `.ext:lang` pairs
 - Overrides built-in mappings on collision
 - Unknown languages and malformed entries are skipped with a warning
-- Valid language names: `ada`, `al`, `ansible`, `apex`, `arduino`, `asm`, `autohotkey`, `bash`, `blade`, `c`, `clojure`, `cobol`, `commonlisp`, `cpp`, `csharp`, `css`, `dart`, `dlang`, `ejs`, `elisp`, `elixir`, `erlang`, `fortran`, `fsharp`, `gdscript`, `gleam`, `go`, `graphql`, `groovy`, `haskell`, `hcl`, `java`, `javascript`, `json`, `julia`, `kotlin`, `less`, `lua`, `luau`, `matlab`, `nim`, `nix`, `objc`, `ocaml`, `openapi`, `pascal`, `perl`, `php`, `powershell`, `proto`, `python`, `r`, `razor`, `ruby`, `rust`, `sass`, `scala`, `scss`, `solidity`, `sql`, `styl`, `svelte`, `swift`, `tcl`, `toml`, `tsx`, `typescript`, `verilog`, `verse`, `vhdl`, `vue`, `xml`, `yaml`, `zig`
+- Valid language names: `ada`, `al`, `ansible`, `apex`, `arduino`, `asm`, `astro`, `autohotkey`, `bash`, `blade`, `c`, `clojure`, `cobol`, `commonlisp`, `cpp`, `csharp`, `css`, `dart`, `dlang`, `ejs`, `elisp`, `elixir`, `erlang`, `fortran`, `fsharp`, `gdscript`, `gleam`, `go`, `graphql`, `groovy`, `haskell`, `hcl`, `java`, `javascript`, `json`, `julia`, `kotlin`, `less`, `lua`, `luau`, `matlab`, `nim`, `nix`, `objc`, `ocaml`, `openapi`, `pascal`, `perl`, `php`, `powershell`, `proto`, `python`, `r`, `razor`, `ruby`, `rust`, `sass`, `scala`, `scss`, `solidity`, `sql`, `styl`, `svelte`, `swift`, `tcl`, `toml`, `tsx`, `typescript`, `verilog`, `verse`, `vhdl`, `vue`, `xml`, `yaml`, `zig`
 
 Set via `.mcp.json` `env` block or any environment mechanism supported by your MCP client.

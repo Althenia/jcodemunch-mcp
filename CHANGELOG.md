@@ -2,6 +2,22 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.155] - 2026-07-21 - LANGUAGE_SUPPORT.md currency sweep (docs only)
+
+### Changed
+- **`LANGUAGE_SUPPORT.md` caught up with `LANGUAGE_REGISTRY`.** The doc had
+  drifted 11 languages behind the live registry. Added full-symbol-extraction
+  rows for **Razor/Blazor** (`.cshtml`/`.razor`), **Astro** (`.astro`, shipped
+  v1.108.23 but never documented), **Arduino** (`.ino`/`.pde`), **VHDL**
+  (`.vhd`/`.vhdl`/`.vho`/`.vhs`), **Verilog/SystemVerilog**
+  (`.v`/`.vh`/`.sv`/`.svh`), **Haskell** (`.hs`/`.lhs`), **Julia** (`.jl`), and
+  **Luau** (`.luau`); added text-search-only rows for **R** (`.r`), **LESS**
+  (`.less`), and **Stylus** (`.styl`). Every column (extensions, parser, symbol
+  kinds) is sourced from `parser/languages.py` + the custom parsers in
+  `parser/extractor.py`, not inferred. Also added the missing `astro` entry to
+  the `JCODEMUNCH_EXTRA_EXTENSIONS` valid-language-names list. No code, schema,
+  tool-count, or INDEX_VERSION change.
+
 ## [1.108.154] - 2026-07-21 - `surface` CLI subcommand
 
 ### Added
