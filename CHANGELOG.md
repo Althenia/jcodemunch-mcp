@@ -2,6 +2,44 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.151] - 2026-07-21 - nested-worktree exclusion + per-worktree identity (#372)
+
+### Fixed
+- **Indexer no longer descends into nested linked worktrees** (#372, reported
+  by @bitfliq). Claude Code creates git worktrees inside the repo at
+  `<repo>/.claude/worktrees/<name>`; each is a near-duplicate checkout, so the
+  discovery walk pulled every worktree's files into the parent index —
+  inflating per-language counts by roughly `(worktrees + 1)` and silently
+  burning the `max_folder_files` cap on duplicates. The walk (all three
+  `os.walk` sites in `index_folder.py`) now prunes any subdirectory that is a
+  linked worktree — a `.git` FILE whose `gitdir:` target lives under
+  `.git/worktrees/<name>`. This is the general fix: it catches worktrees
+  wherever they live, not just under `.claude/worktrees/`. Submodules (`.git`
+  file pointing at `.git/modules/<name>`) deliberately do NOT match, so their
+  indexing behavior is unchanged. New `nested_worktree` skip reason flows into
+  the persisted coverage contract.
+- **Watcher fast path refuses worktree files.** `_should_index_file` gains the
+  same boundary check (mirrors the #306 both-paths invariant), so a watchfiles
+  event for a file inside a nested worktree never lands in the parent index.
+- **Worktrees get their own index identity — `watch-claude` and `watch-all`
+  coexist.** Under `git_root_identity` a linked worktree resolved through its
+  shared `origin` to the parent repo's `owner/name` slot, and
+  `_existing_git_identity` matched worktree paths into the parent by raw path
+  containment — so whichever watcher indexed first owned the slot and the
+  other was refused (`Index '<owner>/<repo>' already exists at
+  '.../.claude/worktrees/...'`), at one point dropping the index to 0 symbols.
+  Now `detect_git_root` keys a linked worktree by its own path
+  (`local/<name>-<hash>`, the same formula as local identity) instead of
+  claiming the origin-derived identity, and `_existing_git_identity` refuses
+  containment matches that cross a linked-worktree boundary. New
+  `storage/git_root.is_linked_worktree()` helper backs all three sites.
+
+### Notes
+- Existing polluted parent indexes self-heal on the next full re-index (the
+  walk simply stops seeing the worktree files, so they diff out as deleted).
+- The `extra_ignore_patterns: [".claude/worktrees/"]` workaround from #372
+  remains valid but is no longer needed.
+
 ## [1.108.150] - 2026-07-28 - stateless-MCP forward cover: principal session keying + SSE deprecation notice
 
 ### Added
