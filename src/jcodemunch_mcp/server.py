@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import IO, Any, Optional
 
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.types import Tool, ToolAnnotations, TextContent, Resource, Prompt, PromptMessage, GetPromptResult, CallToolResult
 
 from . import __version__
 from . import config as config_module
+from . import runtime_identity
 # Tool modules are imported lazily inside each call_tool() dispatch branch.
 # This defers loading heavy dependencies (tree-sitter, httpx, pathspec) until
 # the first actual call to a tool that needs them, reducing cold-start latency
@@ -4165,9 +4167,34 @@ def _apply_description_overrides(tools: list) -> None:
 
 @server.list_resources()
 async def list_resources() -> list[Resource]:
-    """Return empty resource list for client compatibility (e.g. Windsurf)."""
+    """Advertise the runtime identity resource (munch.runtime.identity/v1, #371)."""
     _signal_handshake()
-    return []
+    return [
+        Resource(
+            uri=runtime_identity.IDENTITY_URI,
+            name="runtime-identity",
+            description=(
+                "Process provenance for this server instance "
+                f"({runtime_identity.IDENTITY_SCHEMA}): product, version, "
+                "transport, pid, OS-derived process_start, per-process "
+                "instance_id, optional launch_id echo. Read-only, no side effects."
+            ),
+            mimeType="application/json",
+        )
+    ]
+
+
+@server.read_resource()
+async def read_resource(uri) -> "list[ReadResourceContents]":
+    _signal_handshake()
+    if str(uri) == runtime_identity.IDENTITY_URI:
+        return [
+            ReadResourceContents(
+                content=runtime_identity.identity_json(),
+                mime_type="application/json",
+            )
+        ]
+    raise ValueError(f"Unknown resource: {uri}")
 
 
 _WORKFLOW_PROMPT_TEXT = """\
@@ -9138,6 +9165,7 @@ def main(argv: Optional[list[str]] = None):
         # config.jsonc keys are honored at serve time (V11). Applies to both the
         # watcher and non-watcher dispatch branches below.
         args.transport, args.host, args.port = _resolve_serve_endpoint(args)
+        runtime_identity.set_transport(args.transport)
         watcher_enabled = _get_watcher_enabled(args)
         watcher_from_cli = getattr(args, "watcher", None) is not None
 

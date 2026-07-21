@@ -1,6 +1,12 @@
 {
-  "current": "1.108.151",
+  "current": "1.108.152",
   "entries": [
+    {
+      "version": "1.108.152",
+      "date": "2026-07-21",
+      "title": "runtime identity resource (#371)",
+      "summary": "- **`munch://runtime/identity` MCP resource** (#371, requested by @rknighton) \u2014 a read-only `munch.runtime.identity/v1` document giving multi-agent harnesses process provenance for this server instance: `schema`, `product`, `version`, `transport`, `pid`, `process_start {value, source}`, `instance_id`, and an"
+    },
     {
       "version": "1.108.151",
       "date": "2026-07-21",
@@ -12,12 +18,6 @@
       "date": "2026-07-28",
       "title": "stateless-MCP forward cover: principal session keying + SSE deprecation notice",
       "summary": "- **Auth-principal fallback in session-state keying.** The MCP 2026-07-28 spec removes protocol sessions (`Mcp-Session-Id`) from HTTP transports. Once session ids stop being issued, every request would look like a fresh session and per-session state (tool-tier overrides, advisory budgets, session stats,"
-    },
-    {
-      "version": "1.108.149",
-      "date": "2026-07-20",
-      "title": "deterministic emission + cache-stability baseline",
-      "summary": "- **Context-serving sorts carry total-order tiebreaks.** Six float-keyed sort sites (`get_ranked_context` exact-seed and scoring paths, `get_repo_map` file ranking, `signal_fusion.fuse`, `assemble_task_context` anchor and plate picks) resolved ties by list insertion order \u2014 which traces back to"
     }
   ]
 }

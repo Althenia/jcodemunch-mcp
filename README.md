@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.152](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.152)** (2026-07-21) — runtime identity resource (#371)
 - **[v1.108.151](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.151)** (2026-07-21) — nested-worktree exclusion + per-worktree identity (#372)
 - **[v1.108.150](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.150)** (2026-07-28) — stateless-MCP forward cover: principal session keying + SSE deprecation notice
-- **[v1.108.149](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.149)** (2026-07-20) — deterministic emission + cache-stability baseline
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -382,6 +382,12 @@ Everything jCodeMunch does beyond answering a tool call is listed here. All of i
   - **Embedding-model download.** `download-model` — and the first semantic encode when the `[local-embed]` extra is installed — downloads the ONNX model (`all-MiniLM-L6-v2`, ~23 MB, one time) from `huggingface.co`; after that, semantic search needs no network.
 
 Beyond the user-invoked calls listed above, the base package makes no other network calls and leaves no other persistent processes. AI-summary extras call their configured provider's API only when you enable them — see the extras matrix under [Start fast](#start-fast).
+
+---
+
+## Runtime identity resource
+
+The server exposes one MCP resource, `munch://runtime/identity` — a read-only `munch.runtime.identity/v1` JSON document identifying this exact server process (`product`, `version`, `transport`, `pid`, OS-derived `process_start`, per-process-lifetime `instance_id`, optional `launch_id` echo of `JCODEMUNCH_LAUNCH_ID` / `MUNCH_LAUNCH_ID`). Multi-agent harnesses use it to tell command-line-identical servers apart and detect restarts. Computed on demand with no disk reads, writes, or network; when the OS process-start probe is unavailable the timestamp is disclosed as `source: "self_recorded"`, never fabricated. Command lines, env, cwd, hostnames, and repo paths are deliberately excluded. Same contract in jdocmunch-mcp and jdatamunch-mcp. Full field reference in [USER_GUIDE.md](USER_GUIDE.md#runtime-identity-resource).
 
 ---
 

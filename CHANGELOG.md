@@ -2,6 +2,26 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.152] - 2026-07-21 - runtime identity resource (#371)
+
+### Added
+- **`munch://runtime/identity` MCP resource** (#371, requested by @rknighton) —
+  a read-only `munch.runtime.identity/v1` document giving multi-agent harnesses
+  process provenance for this server instance: `schema`, `product`, `version`,
+  `transport`, `pid`, `process_start {value, source}`, `instance_id`, and an
+  optional `launch_id` echo. `process_start` is OS-derived when obtainable
+  (Windows `GetProcessTimes`; Linux `/proc/self/stat` starttime + btime) with
+  `source: "os"`; when the OS probe is unavailable the value is the module's
+  own first-read clock, disclosed as `source: "self_recorded"` — never
+  presented as OS evidence. `instance_id` is a uuid4 minted once per process
+  lifetime, so a restart (even with a reused PID) yields a new identity.
+  `launch_id` echoes `JCODEMUNCH_LAUNCH_ID` (fallback `MUNCH_LAUNCH_ID`) and
+  is omitted when unset. Deliberately excluded: command lines, env, cwd,
+  hostnames, repo paths, task data. Delivered as a *resource*, not a tool —
+  zero schema-budget/tool-count impact and zero cost when unused. On-demand
+  read only; no background or network behavior. Suite-wide contract: shipping
+  in jdocmunch-mcp and jdatamunch-mcp in the same pass.
+
 ## [1.108.151] - 2026-07-21 - nested-worktree exclusion + per-worktree identity (#372)
 
 ### Fixed
