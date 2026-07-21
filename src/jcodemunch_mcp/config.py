@@ -2379,7 +2379,9 @@ def generate_template() -> str:
   //   Advisory session budget over response tokens served. When set (> 0),
   //   responses carry _meta.budget at >=80% (approaching) and >=100% (over),
   //   and get_session_stats always reports the budget block. Never blocks
-  //   or truncates — awareness only. 0 = disabled.
+  //   or truncates — awareness only. 0 = disabled. Once plan_turn has run
+  //   3+ times, the block also carries actual_vs_estimated — how hot or
+  //   cold plan_turn's consumption estimates run this session.
   // "session_resume": false,
   //   Persist and restore session state (journal, cache) across restarts.
   //   Writes only on clean shutdown (NVME-friendly). State validated

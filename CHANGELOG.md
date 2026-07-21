@@ -2,6 +2,196 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.155] - 2026-07-21 - LANGUAGE_SUPPORT.md currency sweep (docs only)
+
+### Changed
+- **`LANGUAGE_SUPPORT.md` caught up with `LANGUAGE_REGISTRY`.** The doc had
+  drifted 11 languages behind the live registry. Added full-symbol-extraction
+  rows for **Razor/Blazor** (`.cshtml`/`.razor`), **Astro** (`.astro`, shipped
+  v1.108.23 but never documented), **Arduino** (`.ino`/`.pde`), **VHDL**
+  (`.vhd`/`.vhdl`/`.vho`/`.vhs`), **Verilog/SystemVerilog**
+  (`.v`/`.vh`/`.sv`/`.svh`), **Haskell** (`.hs`/`.lhs`), **Julia** (`.jl`), and
+  **Luau** (`.luau`); added text-search-only rows for **R** (`.r`), **LESS**
+  (`.less`), and **Stylus** (`.styl`). Every column (extensions, parser, symbol
+  kinds) is sourced from `parser/languages.py` + the custom parsers in
+  `parser/extractor.py`, not inferred. Also added the missing `astro` entry to
+  the `JCODEMUNCH_EXTRA_EXTENSIONS` valid-language-names list. No code, schema,
+  tool-count, or INDEX_VERSION change.
+
+## [1.108.154] - 2026-07-21 - `surface` CLI subcommand
+
+### Added
+- **`jcodemunch-mcp surface [--json]`** — prints the tool-surface schema
+  receipt (the same block `get_session_stats` reports as `tool_surface`):
+  active surface/profile, visible vs catalog tool counts, estimated schema
+  tokens for each, `schema_tokens_avoided`, and the heaviest tool schemas.
+  Exists so consumers with no MCP session — the jMunch Console in
+  particular — can shell the receipt. Loads config before computing
+  (`tool_surface` / `tool_profile` / `compact_schemas` / `disabled_tools`
+  all shape it); registered in `known_commands` so the prepend-serve guard
+  routes it. Read-only, instant, scans nothing.
+
+## [1.108.153] - 2026-07-21 - tool-surface schema receipt in session stats
+
+### Added
+- **`tool_surface` block in `get_session_stats`** — an advisory receipt for
+  what the tool surface itself costs: `visible_tools` / `catalog_tools`
+  counts, `schema_tokens_visible` / `schema_tokens_catalog` /
+  `schema_tokens_avoided` (what the active surface + tier saves vs
+  advertising the full catalog), the `heaviest_tools` top-15 by schema
+  weight, and the active `surface` / `profile`. Estimated at the meter's
+  bytes/4 scale over the same `{name, description, inputSchema}`
+  serialization the schema-budget baseline uses, so the runtime receipt and
+  the CI guardrail count the same thing. Read-only, computed inline on the
+  stats call only, nothing persisted; a probe failure degrades to the block
+  being omitted, never a failed call. No new tool, no schema change, no
+  INDEX_VERSION change.
+
+## [1.108.152] - 2026-07-21 - runtime identity resource (#371)
+
+### Added
+- **`munch://runtime/identity` MCP resource** (#371, requested by @rknighton) —
+  a read-only `munch.runtime.identity/v1` document giving multi-agent harnesses
+  process provenance for this server instance: `schema`, `product`, `version`,
+  `transport`, `pid`, `process_start {value, source}`, `instance_id`, and an
+  optional `launch_id` echo. `process_start` is OS-derived when obtainable
+  (Windows `GetProcessTimes`; Linux `/proc/self/stat` starttime + btime) with
+  `source: "os"`; when the OS probe is unavailable the value is the module's
+  own first-read clock, disclosed as `source: "self_recorded"` — never
+  presented as OS evidence. `instance_id` is a uuid4 minted once per process
+  lifetime, so a restart (even with a reused PID) yields a new identity.
+  `launch_id` echoes `JCODEMUNCH_LAUNCH_ID` (fallback `MUNCH_LAUNCH_ID`) and
+  is omitted when unset. Deliberately excluded: command lines, env, cwd,
+  hostnames, repo paths, task data. Delivered as a *resource*, not a tool —
+  zero schema-budget/tool-count impact and zero cost when unused. On-demand
+  read only; no background or network behavior. Suite-wide contract: shipping
+  in jdocmunch-mcp and jdatamunch-mcp in the same pass.
+
+## [1.108.151] - 2026-07-21 - nested-worktree exclusion + per-worktree identity (#372)
+
+### Fixed
+- **Indexer no longer descends into nested linked worktrees** (#372, reported
+  by @bitfliq). Claude Code creates git worktrees inside the repo at
+  `<repo>/.claude/worktrees/<name>`; each is a near-duplicate checkout, so the
+  discovery walk pulled every worktree's files into the parent index —
+  inflating per-language counts by roughly `(worktrees + 1)` and silently
+  burning the `max_folder_files` cap on duplicates. The walk (all three
+  `os.walk` sites in `index_folder.py`) now prunes any subdirectory that is a
+  linked worktree — a `.git` FILE whose `gitdir:` target lives under
+  `.git/worktrees/<name>`. This is the general fix: it catches worktrees
+  wherever they live, not just under `.claude/worktrees/`. Submodules (`.git`
+  file pointing at `.git/modules/<name>`) deliberately do NOT match, so their
+  indexing behavior is unchanged. New `nested_worktree` skip reason flows into
+  the persisted coverage contract.
+- **Watcher fast path refuses worktree files.** `_should_index_file` gains the
+  same boundary check (mirrors the #306 both-paths invariant), so a watchfiles
+  event for a file inside a nested worktree never lands in the parent index.
+- **Worktrees get their own index identity — `watch-claude` and `watch-all`
+  coexist.** Under `git_root_identity` a linked worktree resolved through its
+  shared `origin` to the parent repo's `owner/name` slot, and
+  `_existing_git_identity` matched worktree paths into the parent by raw path
+  containment — so whichever watcher indexed first owned the slot and the
+  other was refused (`Index '<owner>/<repo>' already exists at
+  '.../.claude/worktrees/...'`), at one point dropping the index to 0 symbols.
+  Now `detect_git_root` keys a linked worktree by its own path
+  (`local/<name>-<hash>`, the same formula as local identity) instead of
+  claiming the origin-derived identity, and `_existing_git_identity` refuses
+  containment matches that cross a linked-worktree boundary. New
+  `storage/git_root.is_linked_worktree()` helper backs all three sites.
+
+### Notes
+- Existing polluted parent indexes self-heal on the next full re-index (the
+  walk simply stops seeing the worktree files, so they diff out as deleted).
+- The `extra_ignore_patterns: [".claude/worktrees/"]` workaround from #372
+  remains valid but is no longer needed.
+
+## [1.108.150] - 2026-07-28 - stateless-MCP forward cover: principal session keying + SSE deprecation notice
+
+### Added
+- **Auth-principal fallback in session-state keying.** The MCP 2026-07-28 spec
+  removes protocol sessions (`Mcp-Session-Id`) from HTTP transports. Once
+  session ids stop being issued, every request would look like a fresh session
+  and per-session state (tool-tier overrides, advisory budgets, session stats,
+  verdict calibration) would silently reset per request. `_session_key()` now
+  resolves: transport `session_id` → hashed auth principal → per-session
+  weakref UUID → default sentinel. The principal is a SHA-256 digest of the
+  `Authorization` header (never the raw credential), captured by the
+  streamable-http handler at session creation so the session task's context
+  inherits it. Today's sessionful transport is byte-identical (`session_id`
+  always wins); under a stateless transport, authenticated callers keep
+  durable state keyed to their credential. Deliberately NOT set for SSE:
+  concurrent SSE clients share the single `JCODEMUNCH_HTTP_TOKEN`, and
+  principal keying would merge their state.
+- **No-principal demand signal.** When an HTTP session is created with no
+  `Authorization` header, one INFO line per process notes that per-session
+  state won't survive protocol statelessness for unauthenticated callers —
+  the demand signal for a future explicit session-handle contract.
+
+### Changed
+- **SSE deprecation notice.** `serve --transport sse` now prints a startup
+  NOTICE that the MCP 2026-07-28 spec deprecates SSE and recommends
+  `--transport streamable-http`. SSE keeps working for hosts that haven't
+  migrated (e.g. Odysseus); README "Works with" and the Odysseus section
+  updated accordingly.
+
+No tool-count, schema, wire-shape, or INDEX_VERSION change.
+
+## [1.108.149] - 2026-07-20 - deterministic emission + cache-stability baseline
+
+### Changed
+- **Context-serving sorts carry total-order tiebreaks.** Six float-keyed sort
+  sites (`get_ranked_context` exact-seed and scoring paths, `get_repo_map`
+  file ranking, `signal_fusion.fuse`, `assemble_task_context` anchor and
+  plate picks) resolved ties by list insertion order — which traces back to
+  index storage order and can shuffle across rebuilds of an unchanged tree.
+  Ties now break on symbol id / file path, making result ordering a function
+  of content and scores alone: two indexes built from the same tree in
+  different discovery orders serve identical rankings. Positions driven by
+  real score differences are unchanged. Foundation for any future
+  cache-stable emission work, and removes a latent flake source for replay
+  baselines and cross-process result caching.
+
+### Added
+- **`benchmarks/cache_stability/` measurement harness.** Quantifies, against
+  a pinned self-index snapshot, how much of what `get_ranked_context` serves
+  across realistic drill-down query sequences is repeated symbols in a
+  different order — the waste a byte-stable emission mode would target.
+  Measured baseline (committed in `results.json`): 15.8% of served bytes are
+  repeats, 13.9% re-shuffled, byte-prefix overlap ~0. That lands **below**
+  the pre-registered 30% go/no-go threshold, so the stable/delta partition
+  and pinnable-prelude phases of the cache-stability PRD are deliberately
+  **on hold** — the measurement is the deliverable, and it says the bigger
+  win isn't there yet at current usage shapes.
+
+## [1.108.148] - 2026-07-20 - estimate-vs-actual consumption receipts
+
+### Added
+- **`plan_turn` prices its recommended route and the session grades the
+  estimate.** Research on agent token spend keeps finding the same two
+  facts: per-run consumption varies wildly, and agents systematically
+  underestimate what a plan will cost to execute. jCodeMunch already held
+  both halves of the answer — `plan_turn` forecasts the work (recommended
+  symbols + `max_supplementary_reads`) and the advisory budget (v1.108.146)
+  counts response tokens actually served — they just never met.
+  - `plan_turn` now returns `consumption_estimate = {estimated_tokens,
+    expected_calls, basis}`. `basis` is `session_avg` (observed mean served
+    tokens per call this session) once data exists, else a `default`
+    per-call constant for cold starts.
+  - Each `plan_turn` opens an estimate; the **next** `plan_turn` closes it
+    against tokens actually served in between. Closed samples feed a
+    median `actual_vs_estimated` ratio (median, not mean — one runaway
+    turn must not swamp the signal; capped ring of 50 samples).
+  - After 3 closed samples the ratio surfaces on every consumer:
+    `get_session_stats` gains `estimate_calibration = {samples,
+    actual_vs_estimated}`; the advisory `_meta.budget` block carries
+    `actual_vs_estimated` beside `{limit, spent, state}`; and
+    `plan_turn`'s own estimate gains `calibrated_tokens` — the forecast
+    corrected by the session's measured bias.
+  - Advisory-only, inline compute, process-lifetime state, nothing
+    persisted, no new config keys or tools. Zero-estimate and zero-actual
+    windows never produce samples. All blocks omitted until they have
+    something honest to say.
+
 ## [1.108.147] - 2026-07-19 - single-flight cold index loads and BM25 builds
 
 ### Fixed

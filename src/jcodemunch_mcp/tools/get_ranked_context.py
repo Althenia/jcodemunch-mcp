@@ -207,7 +207,9 @@ def _exact_seed_symbols(
             ]
             if narrowed:
                 cands = narrowed
-        cands.sort(key=lambda s: pagerank.get(s.get("file", ""), 0.0), reverse=True)
+        # Total-order tiebreak on symbol id: tied PageRank must not fall back
+        # to index storage order, which can shuffle across rebuilds.
+        cands.sort(key=lambda s: (-pagerank.get(s.get("file", ""), 0.0), s.get("id", "")))
         for s in cands[:_SEED_MAX_PER_TOKEN]:
             if s["id"] not in seen_ids:
                 seen_ids.add(s["id"])
@@ -429,7 +431,9 @@ def get_ranked_context(
             combined = 0.5 * bm25_norm + 0.5 * pr_norm
         scored.append((combined, bm25_norm, pr_norm, sym))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # Total-order tiebreak on symbol id: tied scores must not fall back to
+    # index storage order, which can shuffle across rebuilds.
+    scored.sort(key=lambda x: (-x[0], x[3].get("id", "")))
 
     if seeded:
         # Pin exact matches ahead of the ranked tail: drop any ranked

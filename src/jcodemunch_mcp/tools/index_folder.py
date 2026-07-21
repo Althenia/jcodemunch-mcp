@@ -34,7 +34,12 @@ from ..security import (
     SKIP_FILES
 )
 from ..storage import IndexStore
-from ..storage.git_root import IdentityModeAmbiguous, IdentityModeConflict, resolve_index_identity
+from ..storage.git_root import (
+    IdentityModeAmbiguous,
+    IdentityModeConflict,
+    is_linked_worktree,
+    resolve_index_identity,
+)
 from ..storage.index_store import _file_hash, _file_hash_bytes, _get_git_head, _get_git_branch
 from ..summarizer import summarize_symbols
 from ..reindex_state import WatcherChange
@@ -149,9 +154,15 @@ def get_filtered_files(path: str) -> Generator[str, None, None]:
     # Use os.walk with followlinks=False to avoid infinite loops caused by
     # NTFS junctions or symlinks pointing back to ancestor directories.
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-        # Don't walk directories that should be skipped
-        dirnames[:] = [dir for dir in dirnames if not skip_dirs_regex.match(dir)]
         dpath = Path(dirpath)
+        # Don't walk directories that should be skipped. Nested linked
+        # worktrees (`.git` FILE pointing at `.git/worktrees/<name>`) are
+        # separate working trees, not part of this index (#372).
+        dirnames[:] = [
+            dir for dir in dirnames
+            if not skip_dirs_regex.match(dir)
+            and not is_linked_worktree(dpath / dir)
+        ]
         for file in filenames:
             if not SKIP_FILES_REGEX.search(file):
                 yield dpath / file
@@ -180,6 +191,10 @@ def _load_all_gitignores(root: Path) -> dict[Path, pathspec.PathSpec]:
     """
     specs: dict[Path, pathspec.PathSpec] = {}
     for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        # Nested linked worktrees are separate working trees (#372); their
+        # .gitignore files belong to their own index, not this one.
+        _dpath = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if not is_linked_worktree(_dpath / d)]
         if ".gitignore" in filenames:
             gitignore_path = Path(dirpath) / ".gitignore"
             try:
@@ -358,8 +373,9 @@ def _should_index_file(
       - ``ok=False``: caller must skip. ``reason`` is one of the
         ``skip_counts`` keys (``skip_file``, ``symlink``,
         ``symlink_escape``, ``path_traversal``, ``skip_dir``,
-        ``gitignore``, ``extra_ignore``, ``secret``, ``wrong_extension``,
-        ``too_large``, ``unreadable``, ``binary``). ``rel_path`` may
+        ``nested_worktree``, ``gitignore``, ``extra_ignore``, ``secret``,
+        ``wrong_extension``, ``too_large``, ``unreadable``, ``binary``).
+        ``rel_path`` may
         be empty if rejection happened before path resolution.
         ``warning`` is a user-facing one-liner the caller should
         append to its warnings list for the user-visible rejections
@@ -419,9 +435,16 @@ def _should_index_file(
     # this check because watchfiles can emit events for files under
     # build / cache directories.
     if cfg.skip_dirs_regex is not None:
+        ancestor = cfg.root
         for part in rel_path.split("/")[:-1]:  # exclude the filename itself
             if cfg.skip_dirs_regex.match(part):
                 return False, "skip_dir", rel_path, None
+            # Mirror the full walk's nested-worktree pruning (#372) so a
+            # watchfiles event for a file inside `.claude/worktrees/<x>`
+            # never lands in the parent index via the fast path.
+            ancestor = ancestor / part
+            if is_linked_worktree(ancestor):
+                return False, "nested_worktree", rel_path, None
 
     # 8. Gitignore (string-prefix specs, walk-order)
     if gitignore_specs and _is_gitignored_fast(resolved_str, gitignore_specs):
@@ -925,6 +948,7 @@ def discover_local_files(
 
     skip_counts: dict[str, int] = {
         "skip_dir": 0,
+        "nested_worktree": 0,
         "skip_file": 0,
         "symlink": 0,
         "symlink_escape": 0,
@@ -985,21 +1009,33 @@ def discover_local_files(
 
     skip_dirs_regex = _build_skip_dirs_regex()
     for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
+        dpath = Path(dirpath)
         # Prune directories that should always be skipped before descending.
+        # Nested linked worktrees (`.git` FILE → `.git/worktrees/<name>`,
+        # e.g. Claude Code's `<repo>/.claude/worktrees/`) are separate
+        # working trees whose near-duplicate checkouts would pollute this
+        # index and burn the max_folder_files cap (#372).
         pruned = []
+        worktrees = []
         kept = []
         for d in dirnames:
             if skip_dirs_regex.match(d):
                 pruned.append(d)
+            elif is_linked_worktree(dpath / d):
+                worktrees.append(d)
             else:
                 kept.append(d)
-        if pruned:
+        if pruned or worktrees:
             rel_dir = os.path.relpath(dirpath, root_str)
             for d in pruned:
                 skip_counts["skip_dir"] += 1
                 logger.debug("SKIP skip_dir: %s", os.path.join(rel_dir, d))
+            for d in worktrees:
+                skip_counts["nested_worktree"] += 1
+                logger.debug(
+                    "SKIP nested_worktree: %s", os.path.join(rel_dir, d)
+                )
         dirnames[:] = kept
-        dpath = Path(dirpath)
 
         # Load .gitignore for this directory BEFORE filtering its files so
         # that patterns defined here apply to siblings in the same directory.

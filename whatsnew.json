@@ -1,23 +1,23 @@
 {
-  "current": "1.108.147",
+  "current": "1.108.154",
   "entries": [
     {
-      "version": "1.108.147",
-      "date": "2026-07-19",
-      "title": "single-flight cold index loads and BM25 builds",
-      "summary": "- **Concurrent cold searches no longer repeat whole-index work (#370, reported by @rknighton).** Two thundering-herd defects, both visible at scale (a 665k-symbol, ~0.5 GB index took 7.5\u201311.4 minutes and ~16 GiB when 13 cold searches landed at once):"
+      "version": "1.108.154",
+      "date": "2026-07-21",
+      "title": "`surface` CLI subcommand",
+      "summary": "- **`jcodemunch-mcp surface [--json]`** \u2014 prints the tool-surface schema receipt (the same block `get_session_stats` reports as `tool_surface`): active surface/profile, visible vs catalog tool counts, estimated schema tokens for each, `schema_tokens_avoided`, and the heaviest tool schemas."
     },
     {
-      "version": "1.108.146",
-      "date": "2026-07-19",
-      "title": "token yield + advisory session budgets",
-      "summary": "- **Advisory session token budget (`session_token_budget` config).** An advisory ceiling over response tokens served \u2014 the context this server injects into the agent, counted at the response chokepoint with the same ~4-bytes-per-token estimate the savings meter uses. When configured,"
+      "version": "1.108.153",
+      "date": "2026-07-21",
+      "title": "tool-surface schema receipt in session stats",
+      "summary": "- **`tool_surface` block in `get_session_stats`** \u2014 an advisory receipt for what the tool surface itself costs: `visible_tools` / `catalog_tools` counts, `schema_tokens_visible` / `schema_tokens_catalog` / `schema_tokens_avoided` (what the active surface + tier saves vs"
     },
     {
-      "version": "1.108.145",
-      "date": "2026-07-19",
-      "title": "coverage contract for absence claims + scorer-pinned calibration",
-      "summary": "- **Coverage contract on `absent`/`degraded` verdicts.** A scan count alone can't back an absence claim when files never entered the corpus. Every full discovery walk now persists a coverage block into the index meta (`files_indexed`, nonzero skip counts by reason \u2014 wrong_extension,"
+      "version": "1.108.152",
+      "date": "2026-07-21",
+      "title": "runtime identity resource (#371)",
+      "summary": "- **`munch://runtime/identity` MCP resource** (#371, requested by @rknighton) \u2014 a read-only `munch.runtime.identity/v1` document giving multi-agent harnesses process provenance for this server instance: `schema`, `product`, `version`, `transport`, `pid`, `process_start {value, source}`, `instance_id`, and an"
     }
   ]
 }

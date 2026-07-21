@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import IO, Any, Optional
 
 from mcp.server import Server
+from mcp.server.lowlevel.helper_types import ReadResourceContents
 from mcp.types import Tool, ToolAnnotations, TextContent, Resource, Prompt, PromptMessage, GetPromptResult, CallToolResult
 
 from . import __version__
 from . import config as config_module
+from . import runtime_identity
 # Tool modules are imported lazily inside each call_tool() dispatch branch.
 # This defers loading heavy dependencies (tree-sitter, httpx, pathspec) until
 # the first actual call to a tool that needs them, reducing cold-start latency
@@ -336,7 +338,48 @@ def _catalog_names() -> set:
     return {t.name for t in _raw_catalog_tools() if t.name not in _COUNTER_FRONT_DOOR}
 
 
+def _tool_surface_stats(top_n: int = 15) -> dict:
+    """Schema token weight of the currently visible tool surface vs the raw catalog.
+
+    Estimator matches the meter's scale (bytes/4) over the same serialization
+    the schema-budget baseline uses ({name, description, inputSchema}, compact
+    separators). Advisory receipt only — never blocks, nothing persisted.
+    """
+    import json as _json
+
+    def _weight(tool) -> int:
+        payload = _json.dumps(
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "inputSchema": tool.inputSchema or {},
+            },
+            separators=(",", ":"),
+            default=str,
+        )
+        return max(1, len(payload.encode("utf-8")) // 4)
+
+    visible = {t.name: _weight(t) for t in _build_tools_list()}
+    catalog = {t.name: _weight(t) for t in _raw_catalog_tools()}
+    visible_total = sum(visible.values())
+    catalog_total = sum(catalog.values())
+    heaviest = dict(sorted(visible.items(), key=lambda kv: -kv[1])[:top_n])
+    return {
+        "surface": _effective_surface(),
+        "profile": _effective_profile(),
+        "visible_tools": len(visible),
+        "catalog_tools": len(catalog),
+        "schema_tokens_visible": visible_total,
+        "schema_tokens_catalog": catalog_total,
+        "schema_tokens_avoided": max(0, catalog_total - visible_total),
+        "heaviest_tools": heaviest,
+        "estimator": "bytes/4",
+    }
+
+
 # --- Runtime session tier state -------------------------------------------- #
+import contextvars
+import hashlib
 import threading
 import uuid
 import weakref
@@ -358,6 +401,44 @@ _SESSION_TIER_DEFAULT_KEY: Hashable = "__default__"
 _session_tier_overrides: dict[Hashable, str] = {}
 _session_tier_lock = threading.Lock()
 
+# Auth-principal fallback for stateless HTTP (MCP spec 2026-07-28 removes
+# protocol sessions). Set ONLY by the streamable-http handler at session
+# creation, before the session task is spawned — asyncio.create_task copies the
+# request's context, so every handler in that session sees the value. Never set
+# for SSE: concurrent SSE clients share the single JCODEMUNCH_HTTP_TOKEN, and
+# keying them by principal would merge their per-session state.
+_HTTP_PRINCIPAL: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "jcodemunch_http_principal", default=None
+)
+
+
+def _principal_from_authorization(auth_header: Optional[str]) -> Optional[str]:
+    """Derive a stable, non-reversible state key from an Authorization header.
+
+    Never stores or logs the raw credential. None when no header was sent.
+    """
+    if not auth_header:
+        return None
+    digest = hashlib.sha256(auth_header.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"principal-{digest[:16]}"
+
+
+_no_principal_logged = False
+
+
+def _note_no_principal_session() -> None:
+    # Demand signal for a session-handle contract under stateless MCP; once per
+    # process so a chatty client can't spam the log.
+    global _no_principal_logged
+    if _no_principal_logged:
+        return
+    _no_principal_logged = True
+    logger.info(
+        "HTTP session created with no Authorization header; once MCP transports "
+        "go stateless, per-session state (tool tiers, budgets, session stats) "
+        "will not persist for unauthenticated callers."
+    )
+
 # Maps a live session object → a stable uuid used as the dict key above.
 # WeakKeyDictionary drops entries automatically when the session is freed,
 # and the matching override entry is purged lazily via the finalizer below.
@@ -369,18 +450,24 @@ def _session_key() -> Hashable:
 
     Priority:
       1. `session.session_id` if the MCP library exposes one (HTTP transport).
-      2. A per-process UUID tracked in a WeakKeyDictionary keyed by the
+      2. The hashed auth principal captured by the streamable-http handler —
+         fires only when the transport issues no session id (stateless MCP,
+         spec 2026-07-28), so authed callers keep durable state there.
+      3. A per-process UUID tracked in a WeakKeyDictionary keyed by the
          session object. Survives for the lifetime of the session and
          disappears with it — no id() reuse after GC (F2), no LRU eviction
          required (F3).
-      3. The default sentinel when there is no active session (stdio/tests).
+      4. The default sentinel when there is no active session (stdio/tests).
     """
     session = _get_mcp_session()
-    if session is None:
-        return _SESSION_TIER_DEFAULT_KEY
-    sid = getattr(session, "session_id", None)
+    sid = getattr(session, "session_id", None) if session is not None else None
     if isinstance(sid, str) and sid:
         return sid
+    principal = _HTTP_PRINCIPAL.get()
+    if principal is not None:
+        return principal
+    if session is None:
+        return _SESSION_TIER_DEFAULT_KEY
     try:
         existing = _session_uuid.get(session)
         if existing is not None:
@@ -4119,9 +4206,34 @@ def _apply_description_overrides(tools: list) -> None:
 
 @server.list_resources()
 async def list_resources() -> list[Resource]:
-    """Return empty resource list for client compatibility (e.g. Windsurf)."""
+    """Advertise the runtime identity resource (munch.runtime.identity/v1, #371)."""
     _signal_handshake()
-    return []
+    return [
+        Resource(
+            uri=runtime_identity.IDENTITY_URI,
+            name="runtime-identity",
+            description=(
+                "Process provenance for this server instance "
+                f"({runtime_identity.IDENTITY_SCHEMA}): product, version, "
+                "transport, pid, OS-derived process_start, per-process "
+                "instance_id, optional launch_id echo. Read-only, no side effects."
+            ),
+            mimeType="application/json",
+        )
+    ]
+
+
+@server.read_resource()
+async def read_resource(uri) -> "list[ReadResourceContents]":
+    _signal_handshake()
+    if str(uri) == runtime_identity.IDENTITY_URI:
+        return [
+            ReadResourceContents(
+                content=runtime_identity.identity_json(),
+                mime_type="application/json",
+            )
+        ]
+    raise ValueError(f"Unknown resource: {uri}")
 
 
 _WORKFLOW_PROMPT_TEXT = """\
@@ -4972,6 +5084,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     storage_path=storage_path,
                 )
             )
+            # Tool-surface schema receipt (v1.108.153). Advisory only — a
+            # failure here must never break the stats tool.
+            try:
+                result["tool_surface"] = _tool_surface_stats()
+            except Exception:
+                logger.debug("tool_surface stats failed", exc_info=True)
         elif name == "analyze_perf":
             from .tools.analyze_perf import analyze_perf
             result = await asyncio.to_thread(
@@ -6313,6 +6431,12 @@ async def run_sse_server(host: str, port: int):
         f"jcodemunch-mcp {__version__} by jgravelle · SSE server at http://{host}:{port}/sse",
         file=sys.stderr,
     )
+    print(
+        "NOTICE: the SSE transport is deprecated by the MCP 2026-07-28 spec and will "
+        "eventually leave MCP SDKs. Prefer `serve --transport streamable-http` when "
+        "your MCP client supports it; SSE keeps working here until hosts migrate.",
+        file=sys.stderr,
+    )
     if not os.environ.get("JCODEMUNCH_HTTP_TOKEN") and host not in ("127.0.0.1", "localhost", "::1"):
         print(
             f"WARNING: SSE bound to non-loopback host {host!r} without "
@@ -6425,8 +6549,17 @@ async def run_streamable_http_server(host: str, port: int):
                 headers={"Retry-After": "30"},
             )
 
-        # New session — generate a unique ID so the transport enforces it on
-        # all subsequent requests, preventing cross-session pollution.
+        # New session — capture the caller's auth principal into this request's
+        # context BEFORE spawning the session task: create_task copies the
+        # context, so every handler in the session inherits it. Today the
+        # transport session_id above always wins in _session_key(); the
+        # principal takes over only when session ids stop being issued.
+        _HTTP_PRINCIPAL.set(_principal_from_authorization(request.headers.get("authorization")))
+        if _HTTP_PRINCIPAL.get() is None:
+            _note_no_principal_session()
+
+        # Generate a unique ID so the transport enforces it on all subsequent
+        # requests, preventing cross-session pollution.
         new_id = uuid.uuid4().hex
         transport = StreamableHTTPServerTransport(mcp_session_id=new_id)
         _sessions[new_id] = transport
@@ -7505,6 +7638,17 @@ def main(argv: Optional[list[str]] = None):
         help="Emit structured JSON (repo_id/counts/languages/indexed_at/freshness/watcher_state/lock_holder)",
     )
 
+    # --- surface (tool-surface schema receipt) ---
+    surface_parser = subparsers.add_parser(
+        "surface",
+        help="Print the tool-surface schema receipt: visible vs catalog tool counts, schema token weight, tokens avoided by the active surface/tier",
+    )
+    surface_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the raw tool_surface block as JSON (same shape get_session_stats reports)",
+    )
+
     # --- delete-index (CLI alias for the invalidate_cache tool) ---
     delete_index_parser = subparsers.add_parser(
         "delete-index",
@@ -8305,7 +8449,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "health", "file-risk", "observatory", "keyring", "auth"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "health", "file-risk", "observatory", "keyring", "auth", "surface"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -8490,6 +8634,26 @@ def main(argv: Optional[list[str]] = None):
                     f"watcher={r['watcher_state']}"
                     + (f"  [{langs}]" if langs else "")
                 )
+        return
+
+    if args.command == "surface":
+        # Sits above the shared load_config() call in main(), so load config
+        # here — tool_surface / tool_profile / compact_schemas / disabled_tools
+        # all shape the receipt (the v1.108.121 license-CLI lesson).
+        config_module.load_config()
+        stats = _tool_surface_stats()
+        if getattr(args, "json", False):
+            print(json.dumps(stats, indent=2))
+        else:
+            print(f"Surface: {stats['surface']}  Profile: {stats['profile']}")
+            print(
+                f"Visible tools: {stats['visible_tools']} of {stats['catalog_tools']} "
+                f"({stats['schema_tokens_visible']:,} of {stats['schema_tokens_catalog']:,} schema tokens)"
+            )
+            print(f"Schema tokens avoided: {stats['schema_tokens_avoided']:,} (estimator: {stats['estimator']})")
+            print("Heaviest tool schemas:")
+            for name, weight in stats["heaviest_tools"].items():
+                print(f"  {name:<28} {weight:>5}")
         return
 
     if args.command == "delete-index":
@@ -9105,6 +9269,7 @@ def main(argv: Optional[list[str]] = None):
         # config.jsonc keys are honored at serve time (V11). Applies to both the
         # watcher and non-watcher dispatch branches below.
         args.transport, args.host, args.port = _resolve_serve_endpoint(args)
+        runtime_identity.set_transport(args.transport)
         watcher_enabled = _get_watcher_enabled(args)
         watcher_from_cli = getattr(args, "watcher", None) is not None
 

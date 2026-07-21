@@ -1,0 +1,40 @@
+{
+  "generator": "benchmarks/cache_stability/measure.py",
+  "corpus": "self (src/jcodemunch_mcp snapshot)",
+  "tool": "get_ranked_context (default params)",
+  "sequences": {
+    "budget_drilldown": {
+      "set_jaccard": 0.269,
+      "repeat_byte_share": 0.384,
+      "reshuffled_share": 0.384,
+      "prefix_ratio": 0.002
+    },
+    "search_ranking": {
+      "set_jaccard": 0.115,
+      "repeat_byte_share": 0.126,
+      "reshuffled_share": 0.119,
+      "prefix_ratio": 0.003
+    },
+    "watcher_reindex": {
+      "set_jaccard": 0.077,
+      "repeat_byte_share": 0.078,
+      "reshuffled_share": 0.053,
+      "prefix_ratio": 0.003
+    },
+    "secret_redaction": {
+      "set_jaccard": 0.015,
+      "repeat_byte_share": 0.042,
+      "reshuffled_share": 0.0,
+      "prefix_ratio": 0.002
+    }
+  },
+  "aggregate": {
+    "set_jaccard": 0.119,
+    "repeat_byte_share": 0.158,
+    "reshuffled_share": 0.139,
+    "prefix_ratio": 0.003
+  },
+  "pair_count": 12,
+  "kill_threshold_reshuffled_share": 0.3,
+  "verdict_p3": "hold"
+}

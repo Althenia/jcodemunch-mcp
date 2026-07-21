@@ -74,6 +74,11 @@ def _existing_git_identity(path: Path, store) -> Optional[IdentityDecision]:
         entries = store.list_repos()
     except Exception:
         return None
+    # Nearest enclosing working tree of the queried path. Used to refuse
+    # containment matches that cross a worktree boundary (#372): a path
+    # inside `<repo>/.claude/worktrees/<name>` is path-contained in the
+    # parent's git_root but belongs to the worktree's own index.
+    nearest_root = _find_git_root(path)
     for entry in entries:
         repo_id = entry.get("repo", "")
         if "/" not in repo_id:
@@ -88,6 +93,12 @@ def _existing_git_identity(path: Path, store) -> Optional[IdentityDecision]:
                 index = None
             git_root = getattr(index, "git_root", "") if index is not None else ""
         if _contains_path(git_root, path):
+            if (
+                nearest_root is not None
+                and nearest_root != Path(git_root).expanduser().resolve()
+                and is_linked_worktree(nearest_root)
+            ):
+                continue
             return IdentityDecision(
                 mode="git",
                 owner=owner,
@@ -212,6 +223,30 @@ _REMOTE_OWNER_REPO = re.compile(
 )
 
 
+def is_linked_worktree(path: Path) -> bool:
+    """True when `path` is the top of a linked `git worktree` checkout.
+
+    A linked worktree marks its root with a `.git` FILE whose `gitdir:`
+    target lives under the main checkout's `.git/worktrees/<name>`.
+    Submodules also use a `.git` file but point at `.git/modules/<name>`,
+    so they deliberately do NOT match (#372 — worktree exclusion must not
+    change submodule indexing behavior).
+    """
+    dotgit = path / ".git"
+    try:
+        if not dotgit.is_file():
+            return False
+        text = dotgit.read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return False
+    if not text.startswith("gitdir:"):
+        return False
+    target = Path(text[len("gitdir:"):].strip())
+    if not target.is_absolute():
+        target = path / target
+    return target.parent.name == "worktrees"
+
+
 def _find_git_root(start: Path) -> Optional[Path]:
     """Walk up from `start` looking for a `.git` directory or file.
 
@@ -310,6 +345,15 @@ def detect_git_root(path: str) -> Optional[GitRootIdentity]:
     root = _find_git_root(Path(path).expanduser())
     if root is None:
         return None
+
+    if is_linked_worktree(root):
+        # A linked worktree shares `origin` with its main checkout, so the
+        # origin-derived identity would claim the parent repo's index slot
+        # and the two would collide (#372: watch-claude vs watch-all).
+        # Key each worktree by its own path instead.
+        return GitRootIdentity(
+            git_root=str(root), owner="local", name=_local_repo_name(root)
+        )
 
     url = _read_origin_url(root)
     if url:

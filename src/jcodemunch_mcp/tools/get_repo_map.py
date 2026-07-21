@@ -152,7 +152,9 @@ def get_repo_map(
         )
         ranked.append((score, f, syms[:max_per_file]))
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
+    # Total-order tiebreak on file path: tied scores must not fall back to
+    # per_file insertion order, which can shuffle across index rebuilds.
+    ranked.sort(key=lambda x: (-x[0], x[1]))
 
     # Greedy pack under token budget; signatures only.
     files_out: list[dict] = []

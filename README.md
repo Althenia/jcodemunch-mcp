@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.147](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.147)** (2026-07-19) — single-flight cold index loads and BM25 builds
-- **[v1.108.146](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.146)** (2026-07-19) — token yield + advisory session budgets
-- **[v1.108.145](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.145)** (2026-07-19) — coverage contract for absence claims + scorer-pinned calibration
+- **[v1.108.154](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.154)** (2026-07-21) — `surface` CLI subcommand
+- **[v1.108.153](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.153)** (2026-07-21) — tool-surface schema receipt in session stats
+- **[v1.108.152](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.152)** (2026-07-21) — runtime identity resource (#371)
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -332,8 +332,11 @@ The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine
 
 - **`yield`** — of the context served this session, how much showed downstream follow-through: served search results later fetched via `get_symbol_source`/`get_context_bundle`, or whose file was subsequently edited (`register_edit`/`index_file`). Reports `rate` with its components (`served_results`, `followed_through`) plus `repeated_identical_calls` per tool — the agent's redundant context spend, distinct from cache hits (those measure the server's cost; repeats cost the agent's context window even on a hit). One honest caveat: a search whose result lines answered the question outright has yield the call sequence can't see, which is why `rate` ships with its components and never as a lone grade.
 - **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
+- **`estimate_calibration`** — agents systematically underestimate what a plan will cost to execute. Every `plan_turn` call now prices its recommended route (`consumption_estimate = {estimated_tokens, expected_calls, basis}`) and the next `plan_turn` reconciles that estimate against the response tokens actually served in between. After 3 closed samples, the median `actual_vs_estimated` ratio appears in session stats, on the budget block, and back on `plan_turn` itself as `calibrated_tokens` — so "you're at 85% of budget" comes with "and your estimates run 2.4x hot", a calibration receipt instead of a bare forecast.
 
-Both are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
+- **`tool_surface`** — what the tool surface itself costs: visible-vs-catalog tool counts, estimated schema tokens for each, `schema_tokens_avoided` by the active surface/tier (the Counter or a narrow profile), and the top-15 heaviest schemas. Counted at the same bytes/4 scale and serialization as the CI schema-budget guardrail, so the runtime receipt and the regression gate agree by construction. Also available with no MCP session as the `jcodemunch-mcp surface [--json]` CLI.
+
+All of these are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
 
 ### Confidence provenance — every number states its basis
 
@@ -381,6 +384,12 @@ Everything jCodeMunch does beyond answering a tool call is listed here. All of i
   - **Embedding-model download.** `download-model` — and the first semantic encode when the `[local-embed]` extra is installed — downloads the ONNX model (`all-MiniLM-L6-v2`, ~23 MB, one time) from `huggingface.co`; after that, semantic search needs no network.
 
 Beyond the user-invoked calls listed above, the base package makes no other network calls and leaves no other persistent processes. AI-summary extras call their configured provider's API only when you enable them — see the extras matrix under [Start fast](#start-fast).
+
+---
+
+## Runtime identity resource
+
+The server exposes one MCP resource, `munch://runtime/identity` — a read-only `munch.runtime.identity/v1` JSON document identifying this exact server process (`product`, `version`, `transport`, `pid`, OS-derived `process_start`, per-process-lifetime `instance_id`, optional `launch_id` echo of `JCODEMUNCH_LAUNCH_ID` / `MUNCH_LAUNCH_ID`). Multi-agent harnesses use it to tell command-line-identical servers apart and detect restarts. Computed on demand with no disk reads, writes, or network; when the OS process-start probe is unavailable the timestamp is disclosed as `source: "self_recorded"`, never fabricated. Command lines, env, cwd, hostnames, and repo paths are deliberately excluded. Same contract in jdocmunch-mcp and jdatamunch-mcp. Full field reference in [USER_GUIDE.md](USER_GUIDE.md#runtime-identity-resource).
 
 ---
 
@@ -904,7 +913,7 @@ Tested configurations:
 | **Goose (Block)** | `goose configure` → Add Extension → command `uvx jcodemunch-mcp` |
 | **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** | Add to `~/.hermes/config.yaml` — see [skill](https://github.com/NousResearch/hermes-agent/pull/10413) |
 | **Paperclip** | `.mcp.json` at workspace root (auto-detected) |
-| **Any other MCP client** | stdio: `jcodemunch-mcp`, HTTP: `jcodemunch-mcp serve --transport sse` |
+| **Any other MCP client** | stdio: `jcodemunch-mcp`, HTTP: `jcodemunch-mcp serve --transport streamable-http` (SSE still available but deprecated by the MCP 2026-07-28 spec) |
 | **VS Code (any MCP client)** | Install the [jCodeMunch VS Code extension](https://marketplace.visualstudio.com/items?itemName=jgravelle.jcodemunch-mcp-vscode) for on-save auto-reindex under Copilot Chat / Continue / Cline — closes the staleness gap when the host doesn't fire PostToolUse hooks |
 | **GitHub Copilot CLI / cloud agent** | `jcodemunch-mcp init --copilot-hooks` writes `.github/hooks/hooks.json` with a postToolUse rule for auto-reindex |
 | **[Odysseus](https://github.com/pewdiepie-archdaemon/odysseus)** (self-hosted AI workspace) | SSE transport: run `jcodemunch-mcp serve --transport sse` on the host (token **unset**), register the URL in the MCP Registry (see below) — *community-tested* |
@@ -1001,6 +1010,12 @@ indexes nothing itself; jCodeMunch indexes your code on the **host**. Run
 jCodeMunch as an **SSE** server on the host and register its URL in Odysseus.
 Its SSE client connects by URL only (no auth header), so leave the token unset
 and secure the endpoint by network binding instead.
+
+> **SSE deprecation note:** the MCP 2026-07-28 spec deprecates the SSE
+> transport. jCodeMunch keeps serving SSE for hosts like Odysseus that don't
+> offer streamable-http yet; once Odysseus adds a streamable-http registry
+> option, switch to `serve --transport streamable-http` and URL
+> `http://host.docker.internal:8848/mcp`.
 
 **1. Start jCodeMunch on the host (no token):**
 
