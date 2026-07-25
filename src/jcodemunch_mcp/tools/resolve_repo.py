@@ -156,6 +156,19 @@ def _build_indexed_response(
         **status.as_fields(),
         "_meta": {"timing_ms": round(elapsed, 1), "match_path": match_path},
     }
+    if status.loadable:
+        # Turn-economy steering (v1.108.158): resolve_repo is the universal
+        # session opener — name the one-call exploration path up front.
+        # v1.108.159: response-size guidance — turn cuts alone don't move heavy
+        # repos when each capsule is fat; compress=True packs more symbols into
+        # the same budget.
+        result["_meta"]["opening_move"] = (
+            "Exploration question ('how does X work')? get_ranked_context(repo, "
+            "query, token_budget) answers in one call — prefer it over chained "
+            "search_symbols/get_file_outline/get_symbol_source hops. Keep "
+            "token_budget modest (4000 default) and pass compress=True to fit "
+            "more symbols in the same budget."
+        )
     metadata = {
         "source_root": entry.get("source_root") or status.source_root,
         "display_name": entry.get("display_name") or status.display_name,
@@ -310,6 +323,11 @@ def _resolve_repo_impl(path: str, storage_path: Optional[str] = None) -> dict:
             match_path="computed_repo_id",
         )
         if built is not None:
+            # A git-identity match that the source_root fast paths missed can
+            # be a SEPARATE checkout of the same project (same origin, different
+            # working tree) — flag it so callers don't treat the sibling's
+            # source_root as this path's index (v1.108.160, bench-observed).
+            _attach_working_tree_mismatch(built, p_resolved)
             return built
 
     # Not indexed and no canonical match — use cheap local/path-hash identity
@@ -325,6 +343,35 @@ def _resolve_repo_impl(path: str, storage_path: Optional[str] = None) -> dict:
         "repo": repo_id,
         "hint": "call index_folder to index this path",
         "_meta": {"timing_ms": round(elapsed, 1), "match_path": "not_indexed"},
+    }
+
+
+def _attach_working_tree_mismatch(result: dict, p_resolved: Path) -> None:
+    """Flag an indexed response whose source_root does not contain the queried
+    path — a separate working tree (second clone/checkout) of an already-indexed
+    project. Previously served silently as `indexed: true` with the OTHER
+    checkout's source_root; agents then dead-ended in index_file and recovered
+    by re-indexing thousands of files in-run (measured 2026-07-22 bench)."""
+    sr = result.get("source_root") or ""
+    if not sr:
+        return
+    try:
+        sr_path = Path(sr).expanduser().resolve()
+        if p_resolved == sr_path or p_resolved.is_relative_to(sr_path):
+            return
+    except (OSError, ValueError):
+        return
+    result["working_tree_mismatch"] = True
+    result["warning"] = (
+        f"Different working tree detected: this path is a separate checkout of "
+        f"{result.get('repo')}; the index was built from {sr}. Read-only lookups "
+        "against this repo id reflect THAT checkout. To index THIS checkout as "
+        "its own repo, call index_folder(path=<this checkout root>, "
+        "identity_mode='local')."
+    )
+    result.setdefault("_meta", {})["working_tree"] = {
+        "queried_path": str(p_resolved),
+        "indexed_root": sr,
     }
 
 

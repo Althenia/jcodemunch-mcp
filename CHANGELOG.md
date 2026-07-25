@@ -2,6 +2,543 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.170] - 2026-07-25 - the file and symbol tools can see a rebuild too
+
+### Fixed
+
+- **`get_file_content`, `get_file_outline` and `get_symbol_source` could mint
+  absence evidence over an index being rewritten.** v1.108.168 added the 5th
+  refusal rule to `build_verdict`, and v1.108.169 wired the last search tool
+  into it — but the file and symbol tools do not use `build_verdict`. They go
+  through `symbol_verdict_for_index` / `file_verdict_for_index`, which accept a
+  live index and then delegate to `build_symbol_verdict` / `build_file_verdict`,
+  neither of which had an `index_changed` parameter at all.
+
+  Both reach `state: "absent"` (a missing symbol, a missing path), and the
+  absence chokepoint in `server.py` is generic — it fires on any
+  `_meta.verdict` dict — so both were minting citable `absent:<sha>` refs with
+  the rebuilding rule structurally unable to fire. A rebuild deletes and
+  reinserts rows, so a genuinely-present file reads as missing for the
+  duration; this is the likeliest way to observe a false absence, not the
+  rarest.
+
+  Both builders now take `index_changed` and downgrade an absence to
+  `degraded` + `channels.index: "rebuilding"`, and both wrappers pass
+  `index_changed_since_load(index)`. `did_you_mean` is suppressed on the
+  degraded path — suggesting near-miss names for a scan that could not see the
+  index is worse than saying nothing.
+
+  The `empty_symbols` case is degraded too: its note tells the agent that
+  "re-requesting the outline will not change this", which is actively wrong
+  mid-rewrite.
+
+### Notes
+
+- New `tests/test_absence_wiring_guard.py` (7) encodes the invariant rather
+  than the instances: every `build_verdict` call in `tools/` must pass
+  `index_changed=`, the scan is alias-aware (each tool imports it renamed) and
+  fails if it ever finds no calls, and the index-aware wrappers are held in a
+  ratchet that fails when a listed wrapper turns out to be wired. That set is
+  now empty and kept as the declaration point for any future gap.
+- No schema, tool-count, or INDEX_VERSION change. `"rebuilding"` was already
+  published in `schemas/retrieval-verdict.schema.json` by v1.108.168.
+
+## [1.108.169] - 2026-07-25 - the retrieval verdict survives compaction
+
+### Fixed
+
+- **Every compact encoder silently dropped `_meta.verdict`.** `schema_driven.encode`
+  filters `_meta` through a strict allowlist (`for k in meta_keys: if k in meta`),
+  and `verdict` appeared in **none of the 15** schema files. Under MUNCH encoding
+  the whole retrieval-verdict contract was invisible: `state`, `channels`,
+  `coverage`, `scorer`, and the `did_you_mean` near-misses never reached the
+  caller. Tools *without* a custom encoder (`get_file_content`) kept their
+  verdict, so the signal was present exactly where it was least needed and
+  absent on `search_symbols` / `search_text` / `get_ranked_context` — the three
+  tools the absence contract is built on.
+
+  **The sharpest consequence was on absence evidence.** `server.py`'s chokepoint
+  mints the citable `absent:<sha>` ref onto `_meta.verdict.evidence_ref`, and in
+  compact mode the caller never received it — so a proof the server had already
+  recorded could not be cited, and the in-band `absence_citable:false` /
+  `absence_blocked_by` refusal reason was discarded with it. The token-saving
+  layer was eating the safety layer.
+
+  Fix: new `meta_json_blobs` parameter on `schema_driven.encode`/`decode`,
+  mirroring the existing `json_blobs` mechanism. A structured `_meta` value rides
+  as `__json._meta.<key>` and round-trips as a real dict. **`meta_keys` could not
+  be reused** — that path flattens to a scalar, which would have stringified the
+  verdict into a Python repr. All 15 schemas now declare `_META_JSON = ("verdict",)`.
+
+- **`search_text` was never wired for the v1.108.168 rebuilding rule.** That
+  release added `index_changed=index_changed_since_load(index)` to
+  `search_symbols` and `get_ranked_context` only. The absence chokepoint is
+  **generic** — it fires on any `_meta.verdict` dict — so `search_text` could
+  reach `absent` and mint a citable ref while structurally unable to detect a
+  rewrite underneath its own scan. Same hole as the one .168 closed, left open in
+  the third tool. Now passes `index_changed=`.
+
+### Notes
+
+- **Honest cost:** carrying the verdict adds ~58 tokens to a 20-result encoded
+  search (+18.6%) and ~89 tokens to a zero-result response. The zero-result case
+  is where the value is — that is precisely the response an agent would otherwise
+  read as proven absence. The verdict is carried at **full fidelity**: trimming it
+  inside the encoder would make compact and JSON disagree, which is the exact
+  class of bug being fixed here. If the `ok` verdict is too chatty (`note`
+  duplicates `state` in prose), that is a verdict-construction change for its own
+  release, not something the compaction layer gets to decide.
+- No new tool, no schema/tool-count/INDEX_VERSION change. New
+  `tests/test_v1_108_169.py` (10), including a guard that every schema declaring
+  `_META` also declares `verdict` in `_META_JSON`, so a future encoder cannot
+  reintroduce the drop.
+
+## [1.108.168] - 2026-07-24 - a rebuild underneath a scan cannot prove absence (5th refusal rule)
+
+### Fixed
+
+- **Absence evidence could be minted over an index that was being rewritten.**
+  v1.108.166 shipped four refusal rules for absence proofs — only `absent`
+  proves absence; `low_confidence`/`degraded` do not; a stale index does not; a
+  truncated index does not. None of them covered an index being **rewritten
+  while the scan reads it**.
+
+  The hole was structural: `channels.index` is fed by a git-SHA freshness probe
+  (stored HEAD vs live HEAD), which is blind to a reindex of an **unchanged**
+  tree — a watcher rebuild after an uncommitted edit, or a silent/stalled index
+  run. Such a scan reported `index: "fresh"`, reached state `absent`, and
+  `note_absence` handed back a citable `absent:<sha>` ref. In other words, the
+  contract whose entire purpose is to make "we looked and it is not there"
+  auditable could attest that claim over a half-written index.
+
+  Zero results plus a detected rewrite now yields `degraded` instead of
+  `absent`. Because `degraded` already cannot prove absence, the fifth rule
+  falls out of the existing "only `absent` proves absence" check — there is no
+  new rule to keep in sync. `absence_refusal` names the real cause rather than
+  the generic state so an operator is not left guessing.
+
+- **`channels.index` gains `"rebuilding"`**, disclosed on **every** state, not
+  just the refused one: a caller reading an `ok` result still deserves to know
+  the index moved under it. Only the absence *claim* is refused — a scan that
+  returned results still returns them, because those symbols really were in the
+  index. Published in `schemas/retrieval-verdict.schema.json` (the `channels`
+  object is `additionalProperties: false` with an enumerated `index`, so an
+  unpublished value would fail validation against our own contract).
+
+### Notes
+
+- **Detection is a filesystem signal, deliberately not `reindex_state`.** That
+  module is in-memory and per-process, so a server answering a search cannot
+  see a reindex driven by a separate `watch-all` login service — the common
+  deployment, and the shape behind
+  [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375). Routing the
+  guard through it would have produced a safety rule that reads as enforced and
+  silently isn't. Instead `load_index` stamps each index with its `.db` path and
+  mtime (`_stamp_load_provenance`), and `retrieval.verdict.index_changed_since_load`
+  re-stats it. The `.db`/`.db-wal` mtime crosses process boundaries; the helper
+  (`_db_mtime_ns`) already existed for LRU cache invalidation.
+- **Unknown is not changed.** An index with no stamped provenance (a test
+  double, a hand-built `CodeIndex`) reports unchanged rather than degrading
+  every verdict.
+- **Cost is confined to correctness, not throughput**: the state downgrade is
+  scoped to the zero-result path, and the check is two `stat` calls.
+- Byte-identical for existing callers when nothing is rebuilding; the legacy
+  `negative_evidence` trigger and shape are untouched. NO new tool, NO
+  tool-count or `INDEX_VERSION` change. New `tests/test_v1_108_168.py` (18).
+- ⚠ **Suite parity owed**: jdoc and jdata ship the same absence contract and the
+  same four rules. Their fifth rule is not yet written.
+
+## [1.108.167] - 2026-07-24 - cue-anchored delivery ledger: measure what we hand over twice
+
+### Added
+
+- **The session now measures how often it re-delivers a symbol it already
+  bought.** jcm counted byte-identical repeat calls (`note_call_signature` →
+  `yield.repeated_identical_calls`) and did nothing with the count, and that
+  counter could not see the shape that actually costs: the **same symbol
+  re-delivered under a different query**. `search_symbols("auth handler")` and
+  `get_ranked_context("who validates the token")` can return the same three
+  bodies at full byte cost with two different `args_hash` values — invisible.
+  New delivery ledger in `storage/token_tracker.py` (`_delivered`, capped at
+  `_DELIVERED_MAXSIZE = 5000`, insertion-ordered, process lifetime only, never
+  on disk) records `{count, tokens, full_source}` per symbol id.
+- **`yield` block gains `redelivered_symbols` / `redelivery_rate` /
+  `redelivered_tokens_est`** in `get_session_stats`. This is the P0
+  measurement, and it is the gate: a **pre-registered, binding** decision rule
+  (`docs/prd-cue-anchored-delivery.md` §3) says suppression only ships if the
+  measured rate clears 10%. Threshold set before the number exists, honored
+  after — the v1.108.149 cache-stability precedent, where the measurement was
+  the deliverable and the pre-registered threshold told us to hold.
+- **Advisory `_meta.already_delivered`** `{count, symbols[]}` when a response
+  carries symbols the session already received. **Annotation only — no response
+  body changes and nothing is suppressed.** Telling an agent "you already have
+  this" may fix most of it, and costs nothing to find out first. List capped at
+  `_DELIVERY_ANNOTATE_MAX = 20` (count stays exact) so a broad re-search can't
+  flood the envelope.
+- Recorded at the existing `call_tool` chokepoint via new
+  `server._delivery_entries`, covering `search_symbols`, `get_ranked_context`,
+  `get_symbol_source` and `get_context_bundle` (both the flat and batch shapes
+  of the shape-follows-input pair).
+
+### Notes
+
+- **`note_served` is deliberately untouched.** Its record is what the handoff
+  contract ([#374](https://github.com/jgravelle/jcodemunch-mcp/issues/374) /
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377)) attests
+  `evidence_refs` against; broadening it to the source-dump tools would silently
+  change what a handoff can cite. The delivery ledger is a **parallel** record.
+  Likewise `_yield_served`'s value type is a followed-through bool the yield
+  block sums over, so the ledger sits beside it rather than extending it.
+- **Only full-source deliveries are priced.** A repeat of a signature/summary
+  row is reported but never accrues `redelivered_tokens_est` — re-showing a
+  signature is cheap. A symbol first seen as a search row and later fetched in
+  full is **new bytes, not a redelivery**.
+- **Edit-eviction is the invalidation that ships.** `note_edited_files` now also
+  drops ledger entries for touched files (Windows-separator and suffix-tolerant,
+  reusing the existing path matcher), so stale bytes are never annotated as
+  "you already have this". `content_hash` invalidation is a stated
+  **prerequisite for suppression**, not needed for annotation.
+- **Byte-identical for existing callers**: the `yield` block keeps its exact
+  prior shape when nothing was delivered, and no response body changed. NO new
+  tool, NO schema/tool-count/`INDEX_VERSION` change.
+- Origin: Token Cost Radar 2026-07-24 research watch (arXiv 2607.20972,
+  cue-anchored working memory). Clean-room; the paper's 39% intra-session reread
+  figure is **theirs over their harness** and is deliberately not claimed here —
+  we publish our own number or none. PRD:
+  `docs/prd-cue-anchored-delivery.md`. New `tests/test_v1_108_167.py` (33).
+
+## [1.108.166] - 2026-07-24 - absence evidence: cite a zero-result scan as proof (handoff/v2 phase 3, #377)
+
+### Added
+
+- **A zero-result search can now be cited as evidence in a handoff.** Under v1
+  and v2 it could not: nothing was served, so there was no id to reference. But
+  "we searched the complete, fresh, non-truncated index and it is not there" is
+  exactly the claim an audit most needs attested, and the one agents most often
+  assert with no proof at all. Phase 3 of
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377), proposed by
+  @mightydanp.
+
+  No new retrieval machinery was needed. `retrieval/verdict.build_verdict`
+  already reports a state (`ok` / `low_confidence` / `absent` / `degraded`), the
+  scan counts backing it, per-channel status, index coverage, and a scorer pin.
+  This records those verdicts under a deterministic ref and lets a claim cite
+  the scan itself.
+
+  The flow mirrors how symbol evidence already works: the server hands you the
+  token, you cite it back. A search whose verdict is `absent` now carries
+  `_meta.verdict.evidence_ref`; passing that ref to `finalize_handoff` attests
+  the absence.
+
+  **The refusal rules are the feature, and they are strict.** Only `absent`
+  proves absence. `low_confidence` and `degraded` do not, because a weak or
+  partial scan is not evidence of nothing. A stale index does not, because it
+  describes an older tree than the one being audited. A truncated index does
+  not, because the target may sit in the files the walk dropped. These are
+  @mightydanp's rules, adopted as written.
+
+  A refused scan is still recorded, so citing one returns the reason rather
+  than a bare unknown-ref error: `refused_absence` (or
+  `refused_absence_claims`, naming the claim) carries a sentence explaining
+  what disqualified it. When a search is `absent` but not citable, the live
+  response says so in-band via `absence_citable: false` and
+  `absence_blocked_by`, instead of offering a token that would fail later.
+
+  **The rendered proof is the auditable part.** A bare token proves nothing to
+  a human reader, so the body carries the scan: the tool and query, the scope
+  it was not found in, how many symbols and files were actually scanned, the
+  per-channel status, the index coverage with its exclusion counts and
+  generation SHA, and the scorer version. Unknown coverage renders as
+  "not recorded for this index (scope unknown)" and is never presented as a
+  complete scope. The detail renders once, under its claim when it has one.
+
+  Refs are content-addressed over `(tool, repo, query, scope)`, so the same
+  scan in the same scope is the same proof, and a narrowed scope is a different
+  one. Session-scoped and in-memory, like the handoff store itself; the record
+  is capped and never written to disk.
+
+  New `tests/test_v1_108_166.py` (23), one per refusal rule. Receipt gains
+  `absence_attested` when an absence ref is cited, omitted otherwise. No new
+  tool, no schema or tool-count change, `core_compact` unchanged at 3996, no
+  `INDEX_VERSION` bump. Suite 5618.
+
+  #377 stays open: phase 2 (evidence receipts) and phase 4 (caller-declared
+  requirement matching) remain deferred.
+
+## [1.108.165] - 2026-07-23 - claim-scoped evidence in the handoff contract (handoff/v2 phase 1, #377)
+
+### Added
+
+- **A handoff section may now carry caller-authored `claims`, each with its own
+  `evidence_refs`.** v1 proved every cited ref was retrieved this session, but
+  it could not say WHICH retrieval backs which sentence: refs landed in one
+  global block at the end of the body. Phase 1 of the `handoff/v2` design
+  proposed by @mightydanp in [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377)
+  closes that gap.
+
+  Each claim is `{id, statement, evidence_refs, classification?}`. New
+  `_validate_claims` requires ids unique across the WHOLE handoff, not per
+  section, since the id is the machine-readable anchor a caller cites and two
+  sections owning the same id would make that citation ambiguous. Statements
+  and classifications are preserved verbatim; the server never rewrites one.
+  Each claim's refs are attested separately through the existing
+  `_validate_evidence`, so an unknown ref returns `invalid_claims:
+  [{claim_id, unknown_refs}]` and names the claim that cited it instead of
+  vanishing into one global failure list. `render_handoff` prints the claim as
+  a `###` heading with its evidence indented beneath it.
+
+  Three decisions the proposal left open:
+
+  - **The input picks the contract.** No claims anywhere means the schema
+    string stays `jcodemunch.handoff/v1` and the body is byte-identical to
+    what v1 rendered; `claims_attested` is omitted from the receipt entirely
+    rather than reported as `0`. Any claim promotes the handoff to
+    `jcodemunch.handoff/v2`.
+  - **Claims can satisfy `evidence_refs`.** A caller who scoped everything to
+    claims should not have to restate it globally, so the top-level list may be
+    empty when claims carry refs. Strictly more permissive; no existing call
+    changes.
+  - **Claim refs join the canonical evidence index**, caller order first, so a
+    v1 consumer reading a v2 handoff still sees every reference in the place it
+    expects.
+
+  Section `content` becomes optional only for a section that carries claims.
+  `finalize_handoff` is standard tier, so `core_compact` is unchanged at 3996.
+  New `tests/test_v1_108_165.py` (18, incl. the byte-identical v1 guard). No
+  `INDEX_VERSION` or tool-count change.
+
+  Known limit, disclosed on #377 before anyone builds against it: phase 1 does
+  not narrow what counts as a match. `_validate_evidence` still attests a ref
+  against the file component of a served id, so citing a whole file attests
+  even when one unrelated symbol from it was served. Narrowing that is phase 2
+  (evidence receipts), which is deferred.
+
+  Suite parity same day: jdocmunch-mcp v1.116.0 + jdatamunch-mcp v1.25.0.
+
+## [1.108.164] - 2026-07-23 - A path-shaped `repo` arg returns a routed error, not a raw storage crash (#376)
+
+### Fixed
+
+- **`resolve_repo` no longer hands the store an owner/name pair it must reject.**
+  An agent without a repo id at hand guesses a path. `tools/_utils.resolve_repo`
+  split any `repo` containing `/` on the FIRST separator and returned the halves
+  unvalidated, so `repo="src/auth/service.ts"` became
+  `owner="src"`, `name="auth/service.ts"`. Callers catch `ValueError` from the
+  resolver, but that pair then reached `store.load_index(owner, name)` and raised
+  `ValueError: Path separator in name` from `_safe_repo_component`, outside every
+  handler. An `owner/name` id can never legitimately carry a second separator
+  (the store rejects one at write time), so every such argument was guaranteed to
+  crash rather than route.
+
+  A post-split name that still contains a separator is now treated as a path.
+  It first tries the existing path-resolution route, which picks up bare relative
+  multi-segment paths (`apps/web/src`) that `_looks_like_path` is deliberately too
+  conservative to match, and otherwise raises an actionable error the callers
+  already surface in band. New `_path_shaped_repo_error` names `resolve_repo` and
+  `index_folder`, and — when the argument looks like a file — names `file_pattern=`,
+  which is what an agent passing `repo=<file>` usually meant. The unindexed-path
+  error in `_resolve_path_repo` routes through the same helper so both paths give
+  one message. Single-separator ids and every real `owner/name` are untouched.
+
+  Reported from a daily Ubuntu install; split out of #375. New
+  `tests/test_v1_108_164.py` (8). NO schema/tool-count/`INDEX_VERSION` change.
+
+## [1.108.163] - 2026-07-23 - License-key transport hardening: key never rides the URL (audit WS-8)
+
+### Security
+- **License validation POSTs the key in the request body** (`org/license.py`).
+  The key previously traveled as a GET query parameter to the validation
+  endpoint, where it could land in server/proxy/CDN access logs. The check now
+  sends a form-encoded POST; a one-shot legacy GET fallback fires only on the
+  exact missing-parameter signature an older backend produces, so a deploy-order
+  gap can't lock out a paying customer (a genuine key rejection never retries).
+- **Starter-pack downloads carry the key in the `X-JCM-License` header**
+  (`cli/install_pack.py`) instead of `&license=` in the URL, with the same
+  narrowly-keyed one-shot legacy fallback.
+
+### Fixed
+- `install-pack` no longer reports every license/pack error as "Could not reach
+  the starter packs server": the API returns those as 4xx + JSON, and the old
+  `raise_for_status()` converted them into a bogus network error before the
+  real message could be shown. Transport failures still report as unreachable.
+
+### Benchmarks (audit WS-7 — benchmark integrity)
+- Regenerated `benchmarks/results.md` at v1.108.163 against same-day re-indexes
+  of the three canonical repos (express 172 / fastapi 1,000 / gin 109 files):
+  **99.6% aggregate reduction** (5,799,695 baseline tokens → 25,220), per-query
+  range 99.1–99.9%. The hand-written A/B test sections are preserved verbatim.
+- Reconciled the README headline to the single current figure: the stale
+  "95% average" table (from an old 34-file capped express index) is replaced by
+  the regenerated full-index numbers, so README, `benchmarks/results.md`,
+  `benchmarks/METHODOLOGY.md`, and `benchmarks/provenance/measured.json` now
+  all quote the same 99.6% aggregate. "95%+" floor phrasing elsewhere is
+  unchanged (conservative floor, still true).
+- Fixed the benchmark harness's dead baseline fallback: `measure_baseline`
+  called nonexistent `store.get_file_content_text(...)`; it now uses the real
+  `store.get_file_content(...)` reader.
+- Captured `benchmarks/token_baselines/v1.108.163.json` so
+  `analyze_perf(compare_release="1.108.163")` resolves a real comparison
+  instead of a baseline-missing error.
+
+## [1.108.162] - 2026-07-23 - Canonical handoff contract: finalize_handoff + munch://handoff/<id> (#374)
+
+### Added
+- **New tool `finalize_handoff`** (`jcodemunch.handoff/v1`, requested by
+  @mightydanp in #374). Ends a multi-step repository audit with one
+  authoritative, server-owned Markdown handoff — no client-specific Stop hook
+  required. The assistant authors the analysis; the server owns everything
+  downstream: deterministic assembly of caller-supplied `sections` (+ optional
+  named `appendices`, each included exactly once, duplicates rejected),
+  session-scoped persistence, identity, SHA-256 hashing, and immutable
+  serving. Same inputs produce a byte-identical body, the same `handoff_id`,
+  and the same hash. No character limit; never writes to the repository.
+- **Evidence attestation — the part a Stop hook can't do.** `evidence_refs`
+  are validated against the session's actual retrieval record (the yield
+  tracker's served-symbol ids from `search_symbols` / `get_ranked_context`;
+  a ref may be a served symbol id or its file path). A finalized handoff
+  therefore attests that every reference it cites corresponds to something
+  this server really served this session. Unknown or contradicted refs fail
+  closed with `CallToolResult(isError=True)` and an `unknown_refs` list.
+- **New resource `munch://handoff/<id>`** serves the exact canonical body
+  (`text/markdown`); repeated reads are byte-identical, unknown ids error.
+  Finalized handoffs are advertised via `list_resources()` alongside the
+  #371 runtime-identity resource.
+- The success receipt (`{schema, handoff_id, resource_uri, sha256, length,
+  canonical: true, evidence_count, appendices}`) carries `canonical: true`
+  as advisory metadata only — supporting clients can render the resource
+  directly; nothing is forced on hosts without that capability.
+- Counter coverage: `finalize_handoff` joins `STATE_CHANGING_ACTIONS` (order
+  requires `allow_state_change=true`; annotated `readOnlyHint: false`) and
+  gets a curated `EXAMPLES` entry for `menu` / `route` discovery.
+- Standard tier — `core_compact` schema budget unchanged. Tool count 90 → 91
+  (full surface). Tests `tests/test_v1_108_162.py` (22).
+
+## [1.108.161] - 2026-07-23 - BM25 tokenizer: Unicode word splitting + CJK character bigrams
+
+### Fixed
+- **The BM25 tokenizer no longer discards non-ASCII text.** `_TOKEN_RE` was
+  `[a-zA-Z0-9]{2,}`, so every non-ASCII character acted as a separator: CJK
+  symbol names, summaries, and docstrings produced zero BM25 tokens (the
+  lexical channel contributed nothing for those corpora) and accented Latin
+  identifiers were mangled (`café` → `caf`). The tokenizer now splits on
+  Unicode word boundaries and expands CJK runs (Hangul, Hiragana/Katakana,
+  Han) into overlapping character bigrams — applied identically at index and
+  query time, so bigram overlap is the match signal. Mixed-script tokens
+  split cleanly; camelCase/snake_case splitting, stemming, abbreviation
+  expansion, and pure-ASCII tokenization are unchanged. Suite parity with
+  jdocmunch-mcp v1.114.1 (#91 there) and jdatamunch-mcp v1.23.1. No reindex
+  needed — BM25 tokenizes stored index fields at scoring time.
+
+## [1.108.160] - 2026-07-23 - Multi-checkout "different working tree" responses
+
+### Changed
+- **A second working tree of an already-indexed repo now gets a named,
+  actionable response instead of a dead end.** Measured failure (2026-07-22
+  benchmark runs): a separate checkout of the same origin resolved — via git
+  identity — to the sibling checkout's index, `resolve_repo` reported
+  `indexed: true` with the OTHER checkout's `source_root`, and `index_file`'s
+  generic "run index_folder on the parent" remedy led the agent to re-index
+  ~3,000 files in-run. Now:
+  - `resolve_repo` flags a git-identity match whose `source_root` does not
+    contain the queried path: `working_tree_mismatch: true`, a `warning`
+    naming both checkouts and the remedies, and `_meta.working_tree`
+    ({queried_path, indexed_root}).
+  - `index_file` on a file in a sibling checkout returns "Different working
+    tree detected" with the cheap remedy first (query the existing repo id
+    for read-only lookups) and the correct indexing remedy
+    (`index_folder(path=<this checkout>, identity_mode='local')`) — explicitly
+    warning against re-indexing under the existing identity.
+  Same-checkout and ordinary not-indexed paths are byte-identical. No
+  schema, tool-count, or INDEX_VERSION change.
+
+## [1.108.159] - 2026-07-23 - Response-size steering + path-shaped repo acceptance
+
+### Added
+- **Path-shaped `repo` arguments now resolve.** The shared repo resolver
+  (`tools/_utils.resolve_repo`, used by `get_ranked_context` and most other
+  tools) accepts a filesystem path — `repo="."`, `./sub`, or an absolute
+  path — and maps it to the indexed repo for that checkout, via the same
+  identity probe `resolve_repo`/`index_folder` use, with a source-root match
+  fallback. This was an observed agent retry shape (measured 2026-07-22
+  benchmark runs) that previously dead-ended in "Repository not found: .".
+  An unindexed path fails with an actionable remedy (`resolve_repo` /
+  `index_folder`). Bare names and `owner/name` ids are untouched.
+
+### Changed
+- **All three v1.108.158 steering surfaces gain response-size guidance.**
+  The measured follow-up to turn-economy steering: turn counts fell but
+  heavy-repo session cost stayed flat because payload weight per turn rose
+  (large ranked-context capsules). The Counter `order` description, the
+  `resolve_repo` `_meta.opening_move`, and the once-per-session escalation
+  hint now recommend `compress=True` (keystone-protected structural
+  compression, shipped v1.108.129) and a modest `token_budget`, and the
+  escalation hint notes that `repo` accepts `'.'` or a path. Advisory text
+  only — no dispatch, schema, tool-count, or INDEX_VERSION change.
+
+## [1.108.158] - 2026-07-22 - Turn-economy steering toward the one-call context openers
+
+### Added
+- **Advisory steering toward `get_ranked_context` for exploration sessions.**
+  Measured driver (2026-07-22 benchmark-harness runs): exploration sessions
+  hop search → outline → source 2-3x more than a raw-read baseline — each MCP
+  round trip re-drags the cached context — while the one-call openers
+  (`get_ranked_context` / `assemble_task_context`) went unused. Three
+  advisory layers, all terse and bounded, none alter dispatch:
+  1. The Counter's `order` description names the one-call exploration path
+     (`order('get_ranked_context', {repo, query, token_budget})`).
+  2. `resolve_repo` — the universal session opener — attaches
+     `_meta.opening_move` naming the same path (loadable indexes only).
+  3. A once-per-session escalation hint: after 3 hop-tool calls
+     (`search_symbols`/`search_text`/`get_file_outline`/`get_symbol_source`)
+     with zero bundle-tool calls, the next search response carries
+     `_meta.hint` suggesting `get_ranked_context`; that single response is
+     forced to JSON so a lossy compact encoding can't drop the hint.
+- **Informed retry on missing `repo`.** Agents ordering without resident
+  schemas omit the required `repo` arg; the missing-argument error now names
+  the repo ids this session has already resolved, so the retry doesn't need a
+  discovery round trip.
+
+  No schema, tool-count, or INDEX_VERSION change (front-door description text
+  only; the gated tier profiles are untouched). New
+  `tests/test_v1_108_158.py` (12).
+
+## [1.108.157] - 2026-07-22 - order() moves a multi-item list on a singular prop to its plural
+
+### Fixed
+- **`order()` normalization now also handles a multi-item list handed to a
+  singular prop.** The post-fix benchmark rerun surfaced the sibling failure
+  the v1.108.156 rules missed: `order("get_symbol_source", {"symbol_id": [a,
+  b, c]})` — `symbol_id` IS a declared property, so the near-miss key mapping
+  skipped it, and the downstream tool raised `TypeError: unhashable type:
+  'list'` (observed in every gin rep). A multi-item list on a singular
+  string-typed prop whose `<key>s` plural sibling is a declared array (and not
+  already provided) now moves to the plural. Single-item lists keep the
+  existing unwrap; an explicitly-provided plural is never clobbered. +2 tests
+  in `tests/test_v1_108_156.py`.
+
+## [1.108.156] - 2026-07-22 - Counter order() maps near-miss arg names onto the schema
+
+### Fixed
+- **`order(action, args)` normalizes guessed arg names before dispatch.**
+  Agents ordering through the Counter work without resident schemas (that is
+  the Counter's design), so they guess arg names — `order("get_file_outline",
+  {"path": ...})` — and the downstream tool raised an internal `ValueError:
+  Provide exactly one of 'file_path' or 'file_paths'` instead of mapping or
+  hinting. Measured cost: one wasted error-turn per session, every session,
+  in a benchmark-harness run of the counter surface (2026-07-22). New
+  `_normalize_order_args` in `server.py` maps a provided key that is NOT a
+  declared property of the action's schema via, in order: a tight alias table
+  (`path`→`file_path`, `symbol`→`symbol_id`, `ids`→`symbol_ids`, ...),
+  pluralization, singularization, and a unique `_<key>` suffix match — then
+  coerces scalar↔single-item-list to the declared type. Guard: when the
+  intended arg is already explicitly provided, the stray alias key passes
+  through untouched (never hands a tool both `file_path` and `file_paths`).
+  Unmappable keys pass through unchanged, so permissive tools stay
+  permissive. Schemas come from the unfiltered catalog
+  (`_raw_catalog_tools`), not `list_tools()` — under `tool_surface=counter`
+  the latter only carries the front door. No schema, tool-count, or
+  INDEX_VERSION change. New `tests/test_v1_108_156.py` (11).
+
 ## [1.108.155] - 2026-07-21 - LANGUAGE_SUPPORT.md currency sweep (docs only)
 
 ### Changed

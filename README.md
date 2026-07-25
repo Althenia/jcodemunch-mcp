@@ -4,7 +4,7 @@
 
 > **Real results, live from production**
 > **335B+ tokens saved** · **48,000+ developers** · **$1.69M+ in AI spend avoided** · **40,000+ kg CO₂ prevented**
-> Live telemetry at **[jcodemunch.com](https://jcodemunch.com/)** — benchmark: **95% average token reduction** (15 tasks / 3 repos, 99.8% peak).
+> Live telemetry at **[jcodemunch.com](https://jcodemunch.com/)** — benchmark: **99.6% average token reduction** (15 tasks / 3 repos, 99.9% peak; run 2026-07-23).
 
 Works with **Autohand Code**, **Claude Code**, **Cursor**, **VS Code**, **Codex CLI**, **Continue**, **Windsurf**, and any MCP-compatible client.
 
@@ -129,9 +129,9 @@ is a byte the agent doesn't pay to read.
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.154](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.154)** (2026-07-21) — `surface` CLI subcommand
-- **[v1.108.153](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.153)** (2026-07-21) — tool-surface schema receipt in session stats
-- **[v1.108.152](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.152)** (2026-07-21) — runtime identity resource (#371)
+- **[v1.108.170](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.170)** (2026-07-25) — the file and symbol tools can see a rebuild too
+- **[v1.108.169](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.169)** (2026-07-25) — the retrieval verdict survives compaction
+- **[v1.108.168](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.168)** (2026-07-24) — a rebuild underneath a scan cannot prove absence (5th refusal rule)
 <!-- WHATSNEW:END -->
 
 ![License](https://img.shields.io/badge/license-dual--use-blue)
@@ -203,12 +203,12 @@ Measured with `tiktoken cl100k_base` across three public repos. Workflow: `searc
 
 | Repository | Files | Symbols | Baseline tokens | jCodeMunch tokens | Reduction |
 |------------|------:|--------:|----------------:|------------------:|----------:|
-| expressjs/express | 34 | 117 | 73,838 | ~1,300 avg | **98.4%** |
-| fastapi/fastapi | 156 | 1,359 | 214,312 | ~15,600 avg | **92.7%** |
-| gin-gonic/gin | 40 | 805 | 84,892 | ~1,730 avg | **98.0%** |
-| **Grand total (15 task-runs)** | | | **1,865,210** | **92,515** | **95.0%** |
+| expressjs/express | 172 | 182 | 143,355 | ~1,040 avg | **99.3%** |
+| fastapi/fastapi | 1,000 | 6,722 | 823,784 | ~2,490 avg | **99.7%** |
+| gin-gonic/gin | 109 | 1,502 | 192,800 | ~1,510 avg | **99.2%** |
+| **Grand total (15 task-runs)** | | | **5,799,695** | **25,220** | **99.6%** |
 
-Per-query results range from 79.7% (dense FastAPI router query) to 99.8% (sparse context-bind query on Express). The 95% figure is the aggregate. Run `python benchmarks/harness/run_benchmark.py` to reproduce.
+Per-query results range from 99.1% to 99.9%. The 99.6% figure is the aggregate (run 2026-07-23, v1.108.163, full un-capped indexes). Run `python benchmarks/harness/run_benchmark.py` to reproduce.
 
 ### A/B test on production codebase
 
@@ -334,6 +334,8 @@ The `suggest_corrections` tool (and the `reflect` CLI) close the loop: they mine
 - **`budget`** — set `session_token_budget` (config) to an advisory ceiling over **response tokens served** (the context this server injects into the agent). Once the session crosses 80% of the limit, every response carries `_meta.budget = {limit, spent, state}` in-band — exactly where runaway agent loops live — and `get_session_stats` always reports the block. It never blocks, throttles, or truncates: jCodeMunch is the instrument; hard caps belong to your gateway. `tool_breakdown` sits beside it for per-tool attribution.
 - **`estimate_calibration`** — agents systematically underestimate what a plan will cost to execute. Every `plan_turn` call now prices its recommended route (`consumption_estimate = {estimated_tokens, expected_calls, basis}`) and the next `plan_turn` reconciles that estimate against the response tokens actually served in between. After 3 closed samples, the median `actual_vs_estimated` ratio appears in session stats, on the budget block, and back on `plan_turn` itself as `calibrated_tokens` — so "you're at 85% of budget" comes with "and your estimates run 2.4x hot", a calibration receipt instead of a bare forecast.
 
+- **`redelivery_rate`** — how often the session hands over a symbol it already bought. `repeated_identical_calls` only catches byte-identical repeat calls; it cannot see the shape that actually costs, which is the *same symbol* returned under a *different query* (two queries, two argument hashes, one set of bytes paid for twice). A session-scoped delivery ledger reports `redelivered_symbols`, `redelivery_rate`, and `redelivered_tokens_est` beside the yield block, and any response carrying already-delivered symbols gets an advisory `_meta.already_delivered = {count, symbols}`. **Advisory only — nothing is withheld and no response body changes**; you are told you're holding the bytes again, never quietly denied them. Re-showing a signature row is reported but never priced (cheap by construction), and an edit to a file evicts its ledger entries so stale bytes are never announced as already-delivered.
+
 - **`tool_surface`** — what the tool surface itself costs: visible-vs-catalog tool counts, estimated schema tokens for each, `schema_tokens_avoided` by the active surface/tier (the Counter or a narrow profile), and the top-15 heaviest schemas. Counted at the same bytes/4 scale and serialization as the CI schema-budget guardrail, so the runtime receipt and the regression gate agree by construction. Also available with no MCP session as the `jcodemunch-mcp surface [--json]` CLI.
 
 All of these are computed inline from session state — no new background behavior, no network calls, nothing persisted beyond the existing `session_stats.json`.
@@ -341,6 +343,10 @@ All of these are computed inline from session state — no new background behavi
 ### Confidence provenance — every number states its basis
 
 Every confidence constant the suite emits traces to a stated basis: **`measured`** (backed by a committed, reproducible benchmark artifact — `benchmarks/provenance/measured.json`, drift-guarded in CI so the constants and the artifact can never silently diverge) or **`declared`** (an engineering prior, honestly labeled as exactly that). `find_implementations` responses carry the per-channel basis in `_meta.confidence_provenance`, and the response contracts themselves are published as JSON Schemas in [`schemas/`](schemas/) (`retrieval-verdict`, `confidence-provenance`, `ranked-context-response`) so CI pipelines and agents can validate responses mechanically. A prior is never presented as a measurement: a `declared` value graduates to `measured` only when a gold-labeled corpus backs it, and a build that claims otherwise fails.
+
+An absence claim is also refused when the ground moved under it. A zero-result scan proves nothing if the index was **being rewritten while the scan read it** — the target may sit in rows written after the scan passed them — so that case reports `degraded` and `channels.index: "rebuilding"` instead of `absent`. This is caught by re-checking the index file itself rather than in-process reindex state, because the rebuild is usually driven by a *separate* watcher process that in-process state cannot see. The rebuild is disclosed on every verdict, not only the refused one: a caller reading a successful result still deserves to know the index moved under it, and only the absence *claim* is withheld.
+
+The verdict survives compaction. jCodeMunch's compact wire format encodes `_meta` through a strict allowlist, and the verdict is carried through it deliberately rather than trimmed for bytes — a safety signal the token-saving layer deletes is no safety signal, and a dropped verdict turns "the scan was degraded" into a confident-looking empty result. That applies to the absence `evidence_ref` too: a proof the server has already recorded stays citable in every response format.
 
 Absence claims carry their own receipts: an `absent` or `degraded` verdict discloses a **coverage contract** — what the corpus *excluded* at index time (unsupported extensions, oversize/binary/secret skips, cap-dropped files, zero-symbol files) plus the index generation it was scanned against — so "scanned N symbols, found nothing" can't lie by omission. An index that predates the contract omits the block: coverage unknown is never presented as "nothing was excluded". Every verdict is also pinned to a `scorer` version, and `benchmarks/calibration/planted_queries.json` records planted positive/negative query rates re-measured live in CI — a scorer change without a re-measured artifact fails the build.
 
@@ -379,7 +385,7 @@ Everything jCodeMunch does beyond answering a tool call is listed here. All of i
 - **Local index storage.** Indexes live at `~/.code-index/` (override with `CODE_INDEX_PATH`). Delete the directory and every trace of indexing is gone.
 - **Live session journal.** While the server runs, it periodically writes a small `_session_live.json` in `~/.code-index/` recording the files and searches the agent touched this session (paths and query strings only, no file contents). It exists so the out-of-process PreCompact hook can restore session orientation after context compaction. Throttled, atomically written, overwritten in place; disable with `JCODEMUNCH_LIVE_JOURNAL=0`.
 - **User-invoked network calls.** A few commands you run explicitly reach the network. None run in the background or fire on a plain import; each happens only when you invoke the command:
-  - **License validation.** `license`, `org-rollup`, and `install-pack --license` send your license key to `validate.php` on `j.gravelle.us` to confirm it. This gates only the team `org-rollup` feature; the individual tools never call it.
+  - **License validation.** `license`, `org-rollup`, and `install-pack --license` send your license key to `validate.php` on `j.gravelle.us` to confirm it. The key travels in the request body / a header, never the URL, so it can't land in intermediary access logs. This gates only the team `org-rollup` feature; the individual tools never call it.
   - **Starter-pack download.** `install-pack` fetches the pack catalog and any pre-built index pack you request from `j.gravelle.us` (a premium pack also sends your license key).
   - **Embedding-model download.** `download-model` — and the first semantic encode when the `[local-embed]` extra is installed — downloads the ONNX model (`all-MiniLM-L6-v2`, ~23 MB, one time) from `huggingface.co`; after that, semantic search needs no network.
 
@@ -390,6 +396,12 @@ Beyond the user-invoked calls listed above, the base package makes no other netw
 ## Runtime identity resource
 
 The server exposes one MCP resource, `munch://runtime/identity` — a read-only `munch.runtime.identity/v1` JSON document identifying this exact server process (`product`, `version`, `transport`, `pid`, OS-derived `process_start`, per-process-lifetime `instance_id`, optional `launch_id` echo of `JCODEMUNCH_LAUNCH_ID` / `MUNCH_LAUNCH_ID`). Multi-agent harnesses use it to tell command-line-identical servers apart and detect restarts. Computed on demand with no disk reads, writes, or network; when the OS process-start probe is unavailable the timestamp is disclosed as `source: "self_recorded"`, never fabricated. Command lines, env, cwd, hostnames, and repo paths are deliberately excluded. Same contract in jdocmunch-mcp and jdatamunch-mcp. Full field reference in [USER_GUIDE.md](USER_GUIDE.md#runtime-identity-resource).
+
+---
+
+## Canonical handoff (`finalize_handoff` + `munch://handoff/<id>`)
+
+A multi-step repository audit can end with one authoritative, server-attested result instead of a client-specific Stop hook. The assistant authors the analysis; `finalize_handoff` takes those sections plus `evidence_refs`, validates every reference against what this session **actually retrieved** (symbol ids or file paths served by `search_symbols` / `get_ranked_context` — unknown refs fail closed with `isError`), deterministically assembles one canonical Markdown handoff (`jcodemunch.handoff/v1`), and returns a compact receipt: `{handoff_id, resource_uri, sha256, length, canonical: true}`. The immutable body is served by the `munch://handoff/<id>` resource — repeated reads are byte-identical. Session-scoped, in-memory, never writes to your repository; appendices appear exactly once; no character limit. `canonical: true` is advisory metadata for clients that support rendering an authoritative MCP resource directly. The server assembles and attests — it never authors conclusions.
 
 ---
 
@@ -1057,7 +1069,7 @@ suite stays usable in plan mode.
 **How much can I save on Claude / Opus tokens?**
 In retrieval-heavy workflows, code-reading tokens typically drop **95%+** because
 the agent fetches exact symbols instead of brute-reading whole files — benchmarked
-at a 95% average reduction across 15 tasks / 3 repositories, with peaks of 99.8%
+at a 99.6% average reduction across 15 tasks / 3 repositories, with peaks of 99.9%
 on large repos. Compact [MUNCH](SPEC_MUNCH.md) encoding then trims another ~45%
 off the wire. Full methodology and harness: [TOKEN_SAVINGS.md](TOKEN_SAVINGS.md)
 and [benchmarks/](benchmarks/).

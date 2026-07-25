@@ -83,6 +83,8 @@ _CANONICAL_TOOL_NAMES: tuple[str, ...] = (
     "get_session_stats", "get_session_context", "get_session_snapshot", "plan_turn", "register_edit", "invalidate_cache", "test_summarizer",
     "audit_agent_config", "get_watch_status", "analyze_perf", "tune_weights", "check_embedding_drift",
     "suggest_corrections",
+    # Canonical handoff (#374)
+    "finalize_handoff",
     # Agent stand-up briefing
     "digest",
     # Health-radar diff (PR-time diff-grade reports)
@@ -141,7 +143,7 @@ _SNIPPET_TOOL_CATEGORIES: list[tuple[str, list[str]]] = [
                             "get_untested_symbols", "search_ast",
                             "winnow_symbols"]),
     ("Diffs & Embeddings", ["get_symbol_diff", "embed_repo"]),
-    ("Session-Aware Routing", ["plan_turn", "get_session_context", "get_session_snapshot", "register_edit", "digest"]),
+    ("Session-Aware Routing", ["plan_turn", "get_session_context", "get_session_snapshot", "register_edit", "digest", "finalize_handoff"]),
     ("Utilities", ["get_session_stats", "analyze_perf", "tune_weights", "check_embedding_drift",
                     "invalidate_cache", "test_summarizer",
                     "audit_agent_config", "suggest_corrections", "get_watch_status"]),
@@ -201,6 +203,8 @@ _TOOL_TIER_STANDARD: frozenset[str] = _TOOL_TIER_CORE | frozenset({
     # Utilities
     "invalidate_cache", "get_watch_status", "analyze_perf", "tune_weights", "check_embedding_drift",
     "suggest_corrections",
+    # Canonical handoff (#374)
+    "finalize_handoff",
     # Agent stand-up briefing
     "digest",
     # Health-radar diff
@@ -262,6 +266,10 @@ def _counter_front_door_tools() -> list:
                 "single-verb front door to the full tool catalog. Read-only by "
                 "default — actions that change index/session state require "
                 "allow_state_change=true, and execution/file-write verbs are refused. "
+                "For exploration questions ('how does X work'), "
+                "order('get_ranked_context', {repo, query, token_budget}) answers in "
+                "ONE call — prefer it over chained search/outline/source hops; add "
+                "compress=true to fit more symbols in the same budget. "
                 "Call 'menu' to discover actions, or 'route' to pick one from a task."
             ),
             inputSchema={
@@ -2131,6 +2139,88 @@ def _build_tools_list() -> list[Tool]:
                     },
                 },
                 "required": ["baseline", "current"],
+            },
+        ),
+        Tool(
+            name="finalize_handoff",
+            description=(
+                "Finalize one canonical Markdown handoff for a completed repository "
+                "audit/analysis (jcodemunch.handoff/v1). The server assembles YOUR "
+                "sections deterministically, validates every evidence_refs entry "
+                "against what this session actually retrieved (symbol ids or file "
+                "paths served by search_symbols / get_ranked_context — unknown refs "
+                "fail closed), persists the result session-scoped, and returns a "
+                "compact receipt {handoff_id, resource_uri, sha256, length, "
+                "canonical:true}. Read the immutable body via the "
+                "munch://handoff/<id> resource; repeated reads are byte-identical. "
+                "Appendices are included exactly once; no character limit; never "
+                "writes to the repository."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Repository identifier the handoff is about.",
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "The task/question this handoff answers (becomes the title).",
+                    },
+                    "sections": {
+                        "type": "array",
+                        "description": "Ordered report sections, each {heading, content} (markdown). The caller authors these; the server only assembles. Optional per-section claims[] bind evidence to an individual claim instead of one global list (handoff/v2).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "heading": {"type": "string"},
+                                "content": {"type": "string"},
+                                "claims": {
+                                    "type": "array",
+                                    "description": "Optional caller-authored claims, each {id, statement, evidence_refs, classification?}. Ids must be unique across the handoff; each claim's refs are attested separately and rendered beside the claim.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "statement": {"type": "string"},
+                                            "evidence_refs": {
+                                                "type": "array",
+                                                "items": {"type": "string"},
+                                            },
+                                            "classification": {"type": "string"},
+                                        },
+                                        "required": ["id", "statement", "evidence_refs"],
+                                    },
+                                },
+                            },
+                            "required": ["heading"],
+                        },
+                    },
+                    "evidence_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Symbol ids or file paths retrieved this session; validated against the session retrieval record.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "default": "general",
+                        "description": "Handoff profile label (e.g. source_audit).",
+                    },
+                    "appendices": {
+                        "type": "array",
+                        "description": "Optional named appendices, each {name, content, content_type?}; names must be unique.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "content": {"type": "string"},
+                                "content_type": {"type": "string"},
+                            },
+                            "required": ["name", "content"],
+                        },
+                    },
+                },
+                "required": ["repo", "task", "sections", "evidence_refs"],
             },
         ),
         Tool(
@@ -4206,9 +4296,10 @@ def _apply_description_overrides(tools: list) -> None:
 
 @server.list_resources()
 async def list_resources() -> list[Resource]:
-    """Advertise the runtime identity resource (munch.runtime.identity/v1, #371)."""
+    """Advertise the runtime identity resource (munch.runtime.identity/v1, #371)
+    plus any session-finalized canonical handoffs (jcodemunch.handoff/v1, #374)."""
     _signal_handshake()
-    return [
+    resources = [
         Resource(
             uri=runtime_identity.IDENTITY_URI,
             name="runtime-identity",
@@ -4221,6 +4312,17 @@ async def list_resources() -> list[Resource]:
             mimeType="application/json",
         )
     ]
+    from . import handoff as _handoff
+    for row in _handoff.list_handoff_resources():
+        resources.append(
+            Resource(
+                uri=row["uri"],
+                name=row["name"],
+                description=row["description"],
+                mimeType=_handoff.HANDOFF_CONTENT_TYPE,
+            )
+        )
+    return resources
 
 
 @server.read_resource()
@@ -4231,6 +4333,15 @@ async def read_resource(uri) -> "list[ReadResourceContents]":
             ReadResourceContents(
                 content=runtime_identity.identity_json(),
                 mime_type="application/json",
+            )
+        ]
+    from . import handoff as _handoff
+    rec = _handoff.handoff_for_uri(str(uri))
+    if rec is not None:
+        return [
+            ReadResourceContents(
+                content=rec["body"],
+                mime_type=_handoff.HANDOFF_CONTENT_TYPE,
             )
         ]
     raise ValueError(f"Unknown resource: {uri}")
@@ -4475,6 +4586,101 @@ async def _auto_watch_if_needed(name: str, arguments: dict, storage_path: Option
         logger.debug("Auto-watch failed for %s", folder, exc_info=True)
 
 
+# --- Turn-economy steering (v1.108.158) --------------------------------------
+# Measured driver (2026-07-22 benchmark-harness run): exploration sessions hop
+# search -> outline -> source 2-3x more than a raw baseline, and each MCP round
+# trip re-drags the cached context. The one-call openers (get_ranked_context /
+# assemble_task_context) existed but no session used them. Steering is
+# ADVISORY only: terse, bounded to one nudge per session, never alters dispatch.
+_STEER_HOP_TOOLS = frozenset({
+    "search_symbols", "search_text", "get_file_outline", "get_symbol_source",
+})
+_STEER_BUNDLE_TOOLS = frozenset({
+    "get_ranked_context", "assemble_task_context", "get_context_bundle", "plan_turn",
+})
+_STEER_NUDGE_AT = 3
+_steer_state: dict = {"hops": 0, "bundles": 0, "nudged": False, "repos": []}
+
+
+def _steer_note_call(name: str, arguments: dict, result) -> None:
+    """Record hop/bundle traffic + resolved repo ids (process == session)."""
+    if name in _STEER_HOP_TOOLS:
+        _steer_state["hops"] += 1
+    elif name in _STEER_BUNDLE_TOOLS:
+        _steer_state["bundles"] += 1
+    repo = None
+    if name == "resolve_repo" and isinstance(result, dict):
+        repo = result.get("repo")
+    elif isinstance(arguments, dict):
+        repo = arguments.get("repo")
+    if isinstance(repo, str) and repo and repo not in _steer_state["repos"] and len(_steer_state["repos"]) < 5:
+        _steer_state["repos"].append(repo)
+
+
+def _steer_hint_due(name: str, result) -> bool:
+    """One-time advisory: ≥N hop calls, zero bundle calls, on a search response."""
+    return (
+        name in ("search_symbols", "search_text")
+        and isinstance(result, dict)
+        and "error" not in result
+        and not _steer_state["nudged"]
+        and _steer_state["bundles"] == 0
+        and _steer_state["hops"] >= _STEER_NUDGE_AT
+    )
+
+
+# Cap on ids listed in the _meta.already_delivered advisory (the count is exact;
+# the list is a sample so a broad re-search can't flood the envelope).
+_DELIVERY_ANNOTATE_MAX = 20
+
+
+def _delivery_est_tokens(source) -> int:
+    """Bytes/4 of a delivered body — the same scale as the savings meter."""
+    return len(source) // 4 if isinstance(source, str) else 0
+
+
+def _delivery_entries(name: str, result):
+    """Yield ``(symbol_id, est_tokens, full_source)`` for a tool response.
+
+    Full-source deliveries are where the bytes are; signature/summary rows are
+    recorded so a repeat is still reported, but never priced as redundant
+    (docs/prd-cue-anchored-delivery.md §7 Q3).
+
+    Deliberately separate from the ``note_served`` calls above: that record is
+    what the handoff contract (#374/#377) attests evidence_refs against, and
+    broadening it would change what a handoff can cite.
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return
+
+    def _entry(e: dict):
+        sid = e.get("symbol_id") or e.get("id")
+        if not sid:
+            return None
+        src = e.get("source")
+        return sid, _delivery_est_tokens(src), bool(src)
+
+    if name == "search_symbols":
+        rows = result.get("results", [])
+    elif name == "get_ranked_context":
+        rows = result.get("context_items", [])
+    elif name in ("get_symbol_source", "get_context_bundle"):
+        # Both are shape-follows-input: a single id returns a flat object, a
+        # batch returns {"symbols": [...]}.
+        flat = _entry(result)
+        if flat:
+            yield flat
+        rows = result.get("symbols", [])
+    else:
+        return
+
+    for row in rows:
+        if isinstance(row, dict):
+            got = _entry(row)
+            if got:
+                yield got
+
+
 async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent]:
     """Dispatch the Counter front door (order / menu / route)."""
     if name == "order":
@@ -4484,6 +4690,103 @@ async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "route":
         return await _handle_route(arguments)
     return [TextContent(type="text", text=json.dumps({"error": f"Unknown front-door tool '{name}'"}))]
+
+
+# Common arg-name aliases agents reach for when ordering an action without the
+# full schema in front of them (the Counter's whole point is that schemas are
+# not resident). Applied only when the alias key is NOT a declared property and
+# the target IS. Keep this table tight — confident mappings only.
+_ORDER_ARG_ALIASES: dict[str, tuple[str, ...]] = {
+    "path": ("file_path", "folder_path", "file_paths"),
+    "file": ("file_path", "file_paths"),
+    "files": ("file_paths",),
+    "folder": ("folder_path", "path"),
+    "pattern": ("file_pattern",),
+    "text": ("query",),
+    "search": ("query",),
+    "symbol": ("symbol_id",),
+    "symbols": ("symbol_ids",),
+    "id": ("symbol_id",),
+    "ids": ("symbol_ids",),
+}
+
+
+def _order_action_properties(action: str) -> dict:
+    """The action's declared inputSchema properties, from the UNFILTERED catalog
+    (under tool_surface=counter, list_tools only carries the front door)."""
+    for t in _raw_catalog_tools():
+        if t.name == action:
+            schema = t.inputSchema or {}
+            props = schema.get("properties")
+            return props if isinstance(props, dict) else {}
+    return {}
+
+
+def _normalize_order_args(action: str, args: dict) -> dict:
+    """Map near-miss arg names onto the action's declared schema.
+
+    Agents calling order() work without resident schemas, so they guess arg
+    names ('path' for 'file_path') and the downstream tool blows up with an
+    internal error — one wasted turn per session (measured in the codebench
+    arm run, 2026-07-22). Rules, applied only when the given key is absent
+    from the schema and the target is not already provided:
+      1. alias table  2. pluralize  3. singularize  4. unique '_<key>' suffix.
+    Then coerce scalar<->single-item-list to match the target's declared type.
+    Unmappable keys pass through untouched (permissive tools stay permissive).
+    """
+    props = _order_action_properties(action)
+    if not props:
+        return args
+    out = dict(args)
+    for key in list(out):
+        if key in props:
+            continue
+        target = None
+        satisfied = False
+        for cand in _ORDER_ARG_ALIASES.get(key, ()):
+            if cand not in props:
+                continue
+            if cand in out:
+                # The intended arg is already explicitly provided — mapping the
+                # alias to a LATER candidate would hand the tool both forms
+                # (e.g. file_path + file_paths). Leave the stray key untouched.
+                satisfied = True
+                break
+            target = cand
+            break
+        if satisfied:
+            continue
+        if target is None and key + "s" in props and key + "s" not in out:
+            target = key + "s"
+        if target is None and key.endswith("s") and key[:-1] in props and key[:-1] not in out:
+            target = key[:-1]
+        if target is None:
+            suffix_hits = [p for p in props if p.endswith("_" + key) and p not in out]
+            if len(suffix_hits) == 1:
+                target = suffix_hits[0]
+        if target is not None:
+            out[target] = out.pop(key)
+    for k, v in list(out.items()):
+        prop = props.get(k)
+        if not isinstance(prop, dict):
+            continue
+        if (
+            prop.get("type") == "string"
+            and isinstance(v, list)
+            and len(v) > 1
+            and isinstance(props.get(k + "s"), dict)
+            and props[k + "s"].get("type") == "array"
+            and k + "s" not in out
+        ):
+            # A multi-item list handed to a singular prop whose plural sibling
+            # exists — order("get_symbol_source", {"symbol_id": [a, b, c]}) —
+            # belongs on the plural (was: TypeError unhashable-list downstream).
+            out[k + "s"] = out.pop(k)
+        elif prop.get("type") == "array" and isinstance(v, str):
+            out[k] = [v]
+        elif prop.get("type") == "string" and isinstance(v, list) and len(v) == 1 and isinstance(v[0], str):
+            out[k] = v[0]
+    return out
 
 
 async def _handle_order(arguments: dict) -> list[TextContent] | CallToolResult:
@@ -4497,7 +4800,7 @@ async def _handle_order(arguments: dict) -> list[TextContent] | CallToolResult:
     err = _counter.order_gate(action, _catalog_names(), allow)
     if err is not None:
         return [TextContent(type="text", text=json.dumps({"error": err, "tool": "order"}, indent=2))]
-    return await call_tool(action, dict(args))
+    return await call_tool(action, _normalize_order_args(action, dict(args)))
 
 
 def _handle_menu(arguments: dict) -> list[TextContent]:
@@ -5167,6 +5470,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     baseline=arguments["baseline"],
                     current=arguments["current"],
                 )
+            )
+        elif name == "finalize_handoff":
+            from . import handoff as _handoff
+            from .storage import token_tracker as _handoff_tracker
+            result = _handoff.finalize_handoff(
+                repo=arguments["repo"],
+                task=arguments["task"],
+                sections=arguments["sections"],
+                evidence_refs=arguments["evidence_refs"],
+                profile=arguments.get("profile", "general"),
+                appendices=arguments.get("appendices"),
+                served_ids=_handoff_tracker.served_symbol_ids(),
             )
         elif name == "digest":
             from .tools.digest import compose_digest
@@ -6002,11 +6317,67 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                         e.get("symbol_id") or e.get("id")
                         for e in result.get("context_items", []) if isinstance(e, dict)
                     )
+                # Cue-anchored delivery ledger: tell the agent when it is being
+                # handed bytes it already bought this session. Advisory only —
+                # the response body is unchanged (P1 of
+                # docs/prd-cue-anchored-delivery.md).
+                _repeats = _budget_tracker.note_delivered(_delivery_entries(name, result))
+                if _repeats:
+                    result.setdefault("_meta", {})["already_delivered"] = {
+                        "count": len(_repeats),
+                        "symbols": _repeats[:_DELIVERY_ANNOTATE_MAX],
+                    }
                 _b = _budget_tracker.budget_status()
                 if _b is not None and _b["state"] in ("approaching", "over"):
                     result.setdefault("_meta", {})["budget"] = _b
         except Exception:
             logger.debug("Budget/yield attach failed", exc_info=True)
+
+        # Turn-economy steering (v1.108.158): count hop vs bundle traffic; after
+        # _STEER_NUDGE_AT hop calls with no bundle call, advise the one-call
+        # opener ONCE, on a search response (where the next-query decision is
+        # made). Forces JSON for that single response so the hint can't be
+        # dropped by a lossy compact encoding.
+        try:
+            _steer_note_call(name, arguments, result)
+            if _steer_hint_due(name, result):
+                _steer_state["nudged"] = True
+                result.setdefault("_meta", {})["hint"] = (
+                    "Several search/read hops and no bundle call yet this session. "
+                    "For exploration questions, get_ranked_context(repo, query, "
+                    "token_budget) returns ranked, budget-packed context in ONE call. "
+                    "Pass compress=True to fit more symbols in the same budget; "
+                    "repo also accepts '.' or a filesystem path."
+                )
+                _requested_format = "json"
+        except Exception:
+            logger.debug("Steering attach failed", exc_info=True)
+
+        # Absence evidence (#377 phase 3): record every absence-shaped verdict
+        # so a handoff claim can cite the SCAN when nothing was served, and
+        # hand the caller the citable ref in-band. A ref is only surfaced when
+        # the scan can actually prove absence; otherwise the verdict says so,
+        # rather than offering a token that would be refused at finalization.
+        try:
+            if isinstance(result, dict):
+                _v = (result.get("_meta") or {}).get("verdict")
+                if isinstance(_v, dict):
+                    from . import handoff as _handoff_abs
+                    _ref, _why = _handoff_abs.note_absence(
+                        name,
+                        repo_arg,
+                        arguments.get("query"),
+                        _v,
+                        arguments=arguments,
+                        truncated=bool((result.get("_meta") or {}).get("index_truncated")),
+                    )
+                    if _ref:
+                        _v["evidence_ref"] = _ref
+                    elif _why and _v.get("state") == "absent":
+                        _v["absence_citable"] = False
+                        _v["absence_blocked_by"] = _why
+        except Exception:
+            logger.debug("Absence-evidence record failed", exc_info=True)
 
         # Response-level secret redaction — scrub leaked credentials
         # before they reach the LLM context window. Skipped for tools that
@@ -6074,7 +6445,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 "summary": f"KeyError: {e}",
             }
             return _error_call_result(json.dumps(payload, separators=(',', ':')))
-        return _error_call_result(json.dumps({"error": f"Missing required argument: {e}. Check the tool schema for correct parameter names."}, separators=(',', ':')))
+        _missing_msg = f"Missing required argument: {e}. Check the tool schema for correct parameter names."
+        if str(e).strip("'\"") == "repo" and _steer_state["repos"]:
+            # Informed retry (v1.108.158): agents ordering without resident
+            # schemas omit repo — name what this session has already resolved.
+            _missing_msg += " This session has resolved: " + ", ".join(_steer_state["repos"]) + ". Pass repo=<one of these>."
+        return _error_call_result(json.dumps({"error": _missing_msg}, separators=(',', ':')))
     except Exception as exc:
         _call_ok = False
         logger.error("call_tool %s failed", name, exc_info=True)
