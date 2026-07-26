@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 from .. import config as _config
 from ..parser import cached_parse_file as parse_file, LANGUAGE_EXTENSIONS, get_language_for_path
 from ..parser.context import discover_providers, enrich_symbols, collect_metadata, collect_extra_imports
+from ..parser.context._route_utils import iter_source_files
 from ..parser.context.framework_profiles import detect_framework, profile_to_meta
 from ..parser.imports import extract_imports, _alias_map_cache as _imap_cache, _LANGUAGE_EXTRACTORS as _IMPORT_EXTRACTORS
 from ..security import (
@@ -88,6 +89,8 @@ def _attach_cap_report(result: dict, cap: Optional[dict]) -> None:
 
 def _coverage_report(
     skip_counts: dict, files_indexed: int, no_symbols_count: int,
+    files_accepted: Optional[int] = None,
+    post_discovery_drops: Optional[dict] = None,
 ) -> dict:
     """Coverage contract for absence claims, recorded per full discovery walk.
 
@@ -96,31 +99,74 @@ def _coverage_report(
     cap-dropped files) and how many files parsed to zero symbols — a scan
     count alone can't back an ``absent`` verdict when whole files never
     entered the corpus. ``skip_dir`` counts directories, not files, so no
-    files_discovered total is derived here (each reason stands on its own).
+    files_discovered total is derived from ``skip_counts`` (each reason stands
+    on its own).
+
+    v1.108.176 (#375 sub-problem C) adds the accounting that makes
+    INCOMPLETENESS detectable rather than merely describable. ``files_accepted``
+    is what the walk handed downstream; ``files_indexed`` is what survived to
+    the index. Anything between the two is a file the walk said belonged in the
+    corpus and that is not in it. Named drops are listed; ``unaccounted`` is the
+    remainder we cannot explain, and its presence is what flips ``complete`` to
+    False.
+
+    ``complete`` is deliberately conservative: it is only ever True when we hold
+    both counts AND they reconcile exactly. An older index without
+    ``files_accepted`` reports ``complete: None`` — unknown, never True. Absence
+    of evidence about coverage must not read as evidence of coverage.
     """
     from datetime import datetime, timezone
 
     skips = {
         k: int(v) for k, v in (skip_counts or {}).items() if int(v or 0) > 0
     }
-    return {
+    drops = {
+        k: int(v) for k, v in (post_discovery_drops or {}).items() if int(v or 0) > 0
+    }
+    report: dict = {
         "walk": "full",
         "files_indexed": int(files_indexed),
         "skip_counts": skips,
         "no_symbols_count": int(no_symbols_count),
         "recorded_at": datetime.now(timezone.utc).isoformat(),
     }
+    if files_accepted is None:
+        report["complete"] = None
+        return report
+
+    report["files_accepted"] = int(files_accepted)
+    if drops:
+        report["dropped_after_discovery"] = drops
+    if int(files_indexed) > int(files_accepted):
+        # The index legitimately holds MORE than this walk enumerated: v1.96
+        # subdir-merge and branch-delta modes walk a prefix while the index
+        # carries the rest. The reconciliation below does not describe that
+        # shape, so report unknown rather than a false incomplete.
+        report["complete"] = None
+        report["reconciliation"] = "partial_walk_over_wider_index"
+        return report
+    unaccounted = int(files_accepted) - int(files_indexed) - sum(drops.values())
+    if unaccounted > 0:
+        report["unaccounted"] = unaccounted
+    report["complete"] = (int(files_indexed) == int(files_accepted)) and not drops
+    return report
 
 
 def _record_coverage(
     store, owner: str, repo_name: str,
     skip_counts: dict, files_indexed: int, no_symbols_count: int,
+    files_accepted: Optional[int] = None,
+    post_discovery_drops: Optional[dict] = None,
 ) -> None:
     """Persist the coverage contract after a save (best-effort, never raises)."""
     try:
         store._sqlite.set_coverage(
             owner, repo_name,
-            _coverage_report(skip_counts, files_indexed, no_symbols_count),
+            _coverage_report(
+                skip_counts, files_indexed, no_symbols_count,
+                files_accepted=files_accepted,
+                post_discovery_drops=post_discovery_drops,
+            ),
         )
     except Exception:
         logger.debug(
@@ -646,16 +692,50 @@ from .package_registry import extract_package_names as _extract_package_names
 _PROVIDER_CACHE: dict[str, list] = {}
 
 
+# Providers skipped on the most recent discovery, per folder. Discovery happens
+# deep inside the index run, far from the response builder, and a provider that
+# blew its budget is a KNOWN gap in the context this index carries — reporting
+# it is the difference between "indexed" and "indexed, minus express".
+_PROVIDER_SKIPS: dict[str, list] = {}
+
+
 def _resolve_active_providers(folder_path: Path, context_providers: bool) -> list:
     """Discover the active, config-gated context providers for a folder."""
     enabled = context_providers and _config.get(
         "context_providers", True, repo=str(folder_path)
     )
-    active = discover_providers(folder_path) if enabled else []
+    skipped: list = []
+    active = discover_providers(folder_path, skipped=skipped) if enabled else []
+    _PROVIDER_SKIPS[str(folder_path)] = skipped
     # Gate the SQL-dependent dbt provider when SQL is disabled for this repo.
     if active and not _config.is_language_enabled("sql", repo=str(folder_path)):
         active = [p for p in active if p.name != "dbt"]
     return active
+
+
+def _attach_provider_skips(result: dict, folder_path: Path) -> None:
+    """Surface budget-skipped / failed context providers on an index result."""
+    skips = _PROVIDER_SKIPS.get(str(folder_path)) or []
+    if not isinstance(result, dict) or not skips:
+        return
+    result["providers_skipped"] = skips
+    for skip in skips:
+        if skip.get("reason") == "budget_exceeded":
+            result.setdefault("warnings", []).append(
+                f"Context provider '{skip['provider']}' exceeded its "
+                f"{skip.get('budget_seconds')}s budget after "
+                f"{skip.get('seconds')}s and was skipped. Symbols are indexed but "
+                f"carry no {skip['provider']} context, and its import edges "
+                f"(route mounts, template renders) are missing from the graph. "
+                f"Raise JCODEMUNCH_PROVIDER_BUDGET_SECONDS to let it finish, or "
+                f"set context_providers=false to stop paying for it."
+            )
+        else:
+            result.setdefault("warnings", []).append(
+                f"Context provider '{skip['provider']}' failed: "
+                f"{skip.get('error')}. Symbols are indexed but carry no "
+                f"{skip['provider']} context."
+            )
 
 
 def _cache_active_providers(folder_path: Path, providers: list) -> None:
@@ -686,9 +766,15 @@ def _scan_package_json_forced_paths(folder_path: Path) -> set[str]:
     import json as _json
     forced: set[str] = set()
     try:
-        for pkg in folder_path.rglob("package.json"):
-            # Skip nested node_modules — only honour first-party manifests.
-            if "node_modules" in pkg.parts:
+        # Pruned walk, not rglob: rglob descends into node_modules and can only
+        # discard it afterwards, so the "skip nested node_modules" filter this
+        # replaces still paid to enumerate the whole dependency tree.
+        # Skip set is exactly node_modules, matching the filter this replaces —
+        # a manifest under dist/ or build/ still counts, as it always has.
+        for pkg, _rel in iter_source_files(
+            folder_path, {".json"}, skip_dirs=frozenset({"node_modules"})
+        ):
+            if pkg.name != "package.json":
                 continue
             try:
                 content = pkg.read_text(encoding="utf-8", errors="replace")
@@ -1929,22 +2015,47 @@ def index_folder(
         # for large projects). Content is read on-demand later.
         file_mtimes: dict[str, int] = {}
         rel_path_map: dict[str, Path] = {}  # rel_path -> absolute Path
+        # Files discovery ACCEPTED that this pass still drops. Every `continue`
+        # below used to be silent, so the corpus could end up smaller than the
+        # walk reported with nothing anywhere recording the difference — the
+        # index then answered `fresh` while whole files were missing (#375
+        # sub-problem C: "learned 7,659 of 9,634 files, still reports itself up
+        # to date"). A drop we cannot name is the one that must be counted.
+        post_discovery_drops: dict[str, int] = {}
+
+        def _drop(reason: str) -> None:
+            post_discovery_drops[reason] = post_discovery_drops.get(reason, 0) + 1
+
         for file_path in source_files:
             if not validate_path(folder_path, file_path):
+                _drop("outside_root")
                 continue
             try:
                 rel_path = file_path.relative_to(folder_path).as_posix()
             except ValueError:
+                _drop("outside_root")
                 continue
             ext = file_path.suffix
             if ext not in LANGUAGE_EXTENSIONS and get_language_for_path(str(file_path)) is None:
+                # Discovery's `_should_index_file` applies CONFIG-driven language
+                # gating; this applies the LANGUAGE_EXTENSIONS registry. When the
+                # two disagree a file passes the walk and dies here, so the
+                # divergence has to be visible rather than inferred.
+                _drop("no_language")
                 continue
             try:
                 file_mtimes[rel_path] = os.stat(file_path).st_mtime_ns
             except OSError as e:
                 warnings.append(f"Failed to stat {file_path}: {e}")
+                _drop("stat_failed")
                 continue
             rel_path_map[rel_path] = file_path
+
+        if post_discovery_drops:
+            logger.info(
+                "Post-discovery drops (accepted by the walk, not indexed): %s",
+                post_discovery_drops,
+            )
 
         def _read_file(rel_path: str) -> str | None:
             """Re-read a file by its rel_path. Returns content or None on error."""
@@ -2033,6 +2144,7 @@ def index_folder(
                 # This ran a full discovery walk, so a still-truncated index
                 # stays loud even when nothing changed (#366).
                 _attach_cap_report(_no_change_result, _cap_status)
+                _attach_provider_skips(_no_change_result, folder_path)
                 return _no_change_result
 
             # Read changed + new files into memory
@@ -2143,7 +2255,15 @@ def index_folder(
             if paths is None:
                 _record_coverage(
                     store, owner, repo_name,
-                    skip_counts, len(source_files), len(incremental_no_symbols),
+                    skip_counts,
+                    # The COMPOSED file set (carried + changed + new - deleted),
+                    # not the walk's accepted list: on this path they are only
+                    # equal if nothing was dropped, which is the thing being
+                    # measured.
+                    len(updated_mtimes),
+                    len(incremental_no_symbols),
+                    files_accepted=len(source_files),
+                    post_discovery_drops=post_discovery_drops,
                 )
 
             result = {
@@ -2165,6 +2285,7 @@ def index_folder(
             if warnings:
                 result["warnings"] = warnings
             _attach_cap_report(result, _cap_status)
+            _attach_provider_skips(result, folder_path)
             _maybe_apply_adaptive(folder_path, result)
             return result
 
@@ -2471,6 +2592,8 @@ def index_folder(
             _record_coverage(
                 store, owner, repo_name,
                 skip_counts, len(source_file_list), len(no_symbols_files),
+                files_accepted=len(source_files),
+                post_discovery_drops=post_discovery_drops,
             )
 
         # Identify languages that were indexed (symbols found) but have no import extractor
@@ -2518,6 +2641,7 @@ def index_folder(
             result["warnings"] = warnings
 
         _attach_cap_report(result, _cap_status)
+        _attach_provider_skips(result, folder_path)
 
         _maybe_apply_adaptive(folder_path, result)
         return result

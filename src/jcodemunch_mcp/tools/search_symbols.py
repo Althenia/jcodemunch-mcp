@@ -2,11 +2,14 @@
 
 import heapq
 import json
+import logging
 import math
 import re
 import time
 from fnmatch import fnmatch
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ..parser.imports import resolve_specifier
@@ -68,8 +71,21 @@ _result_cache: OrderedDict = OrderedDict()
 _result_cache_lock = threading.Lock()
 
 
+def _result_cache_state(key: tuple) -> Optional[dict]:
+    """Subject state recorded when this entry was cached (#377 item 3)."""
+    with _result_cache_lock:
+        state = (_result_cache.get(key) or {}).get("_subject_state")
+        return dict(state) if isinstance(state, dict) else None
+
+
 def _result_cache_get(key: tuple) -> Optional[dict]:
-    """Return cached result for key, or None on miss. Returns a shallow copy."""
+    """Return cached result for key, or None on miss. Returns a copy.
+
+    The result is copied down to the verdict, not just to ``_meta``: the
+    dispatcher writes ``evidence_ref`` into ``_meta.verdict`` after the tool
+    returns, and with a shared nested dict that write landed in the cached
+    entry and was replayed to every later hit (#377 item 3).
+    """
     with _result_cache_lock:
         if key in _result_cache:
             _result_cache.move_to_end(key)  # LRU refresh
@@ -79,8 +95,12 @@ def _result_cache_get(key: tuple) -> Optional[dict]:
             # Shallow copy top-level + _meta to prevent caller mutations
             result = dict(cached)
             result.pop("_hit_count", None)  # don't leak internal field
+            result.pop("_subject_state", None)
             if "_meta" in result:
                 result["_meta"] = dict(result["_meta"])
+                _v = result["_meta"].get("verdict")
+                if isinstance(_v, dict):
+                    result["_meta"]["verdict"] = dict(_v)
             return result
     return None
 
@@ -107,8 +127,22 @@ def _get_cache_max() -> int:
         return _RESULT_CACHE_MAX
 
 
-def _result_cache_put(key: tuple, value: dict) -> None:
-    """Store result in LRU cache, evicting oldest if full."""
+def _result_cache_put(key: tuple, value: dict, state: Optional[dict] = None) -> None:
+    """Store result in LRU cache, evicting oldest if full.
+
+    ``state`` is the subject state the scan measured (#377 item 3). It rides
+    with the entry so a later hit can prove the answer still describes the same
+    subject rather than assuming a reindex is the only thing that can change it.
+    """
+    if state is not None:
+        # Copy down to the verdict so the dispatcher's post-return writes (the
+        # absence evidence_ref) cannot land in the stored entry.
+        value = dict(value)
+        value["_subject_state"] = state
+        if isinstance(value.get("_meta"), dict):
+            value["_meta"] = dict(value["_meta"])
+            if isinstance(value["_meta"].get("verdict"), dict):
+                value["_meta"]["verdict"] = dict(value["_meta"]["verdict"])
     with _result_cache_lock:
         if key in _result_cache:
             _result_cache.move_to_end(key)
@@ -669,6 +703,21 @@ def search_symbols(
         )
         _cached = _result_cache_get(_cache_key)
         if _cached is not None:
+            _cached_state = _result_cache_state(_cache_key)
+            # #377 item 3: a cached NEGATIVE must prove it still describes the
+            # current subject before it stays citable. A cached positive may
+            # keep serving with disclosure, so only an absence-shaped verdict
+            # pays for the working-tree probe.
+            try:
+                from ..retrieval import subject_state as _subject
+                _cv = (_cached.get("_meta") or {}).get("verdict")
+                _is_negative = isinstance(_cv, dict) and _cv.get("state") == "absent"
+                _now_state = _subject.capture(index, include_tree=_is_negative)
+                _why = _subject.changed(_cached_state, _now_state)
+                if _why:
+                    _subject.revalidate_verdict(_cv, _why)
+            except Exception:
+                logger.debug("Cached-result revalidation failed", exc_info=True)
             # Cache hit — return immediately with fresh timing.
             # Synthesize _meta if the cached result lacks it (#331): a cached
             # entry without _meta must not raise KeyError here, because the
@@ -688,6 +737,14 @@ def search_symbols(
             _hit_meta["timing_ms"] = round((time.perf_counter() - start) * 1000, 1)
             _hit_meta["cache_hit"] = True
             return _cached
+
+    # #377 item 6: identity BEFORE the scan, compared after it. A search can
+    # start against one state and finish after a concurrent edit, a watcher
+    # reindex or a published generation, and neither reading then describes
+    # what was searched. Cheap here (one stat plus a cached HEAD); the fresh
+    # HEAD read is paid only by a zero-result scan, in `moved_during_scan`.
+    from ..retrieval import subject_state as _subject_pre
+    _state_before = _subject_pre.capture(index)
 
     # Semantic: validate provider before doing any expensive work
     _semantic_provider: Optional[tuple[str, str]] = None
@@ -779,6 +836,10 @@ def search_symbols(
             provider=_semantic_provider[0],
             model=_semantic_provider[1],
             start=start,
+            # #377 item 6 reaches this exit too (v1.108.184): the capture is taken
+            # before retrieval on the shared path above and was simply never
+            # handed to the branch that diverges here.
+            state_before=_state_before,
         )
 
     # ── Fusion search path ──────────────────────────────────────────────
@@ -809,6 +870,8 @@ def search_symbols(
             start=start,
             cache_key=_cache_key,
             cacheable=_cacheable,
+            # #377 item 6 reaches this exit too (v1.108.185).
+            state_before=_state_before,
         )
 
     # Narrow candidates using inverted index: only score symbols that
@@ -1079,6 +1142,7 @@ def search_symbols(
     from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     _vres = _build_verdict(
         result_count=len(scored_results),
+        matches_before_packing=heap_count,
         scanned_symbols=candidates_scored if candidates_scored > 0 else len(index.symbols),
         scanned_files=len(seen_files) if seen_files else len(index.source_files),
         best_score=max_bm25_score,
@@ -1087,11 +1151,41 @@ def search_symbols(
         source_files=index.source_files,
         semantic_requested=bool(semantic or semantic_only),
         index_stale=_probe.repo_is_stale,
+        freshness=_probe.repo_freshness,
         index_changed=_index_changed_since_load(index),
         coverage=_index_coverage_meta(index),
+        moved_during_scan=_subject_pre.moved_during_scan(
+            _state_before, index, result_count=len(scored_results)
+        ),
+        working_tree=(
+            _subject_pre.working_tree_state(
+                index, scope=file_pattern, freshness=_probe.repo_freshness
+            )
+            if not scored_results else None
+        ),
     )
     negative_evidence = _vres["negative_evidence"]
     meta["verdict"] = _vres["verdict"]
+
+    # Exact-match honesty (v1.108.173). An identifier-shaped query that returns
+    # only token-overlap neighbours previously came back as state "ok" with the
+    # note "Confident matches returned", so a fuzzy near-miss was
+    # indistinguishable from a hit. Attach the finding, and downgrade the
+    # verdict so the note stops vouching for results that are ranked guesses.
+    #
+    # Deliberately NOT `absent`: results WERE returned, and under the absence
+    # contract only `absent` proves absence. `low_confidence` is the honest
+    # state and cannot be cited as evidence the symbol does not exist.
+    from ..retrieval.query_shape import exact_match_report as _exact_match_report
+    _exact = _exact_match_report(query, scored_results)
+    if _exact is not None:
+        meta["exact_match"] = _exact
+        if not _exact["found"] and scored_results:
+            _v = meta["verdict"]
+            if _v.get("state") == "ok":
+                _v["state"] = "low_confidence"
+                _v["note"] = _exact["note"]
+
     _attach_index_truncation(meta, index)
 
     # Feature 1: Add negative_evidence if present
@@ -1112,7 +1206,18 @@ def search_symbols(
 
     # Feature 5: Cache the result if cacheable
     if _cacheable and _cache_key is not None:
-        _result_cache_put(_cache_key, result)
+        # #377 item 3: record what this answer was measured against. The
+        # working tree is captured only for an absence, the one answer a later
+        # edit can falsify while the index and its generation sit still.
+        from ..retrieval import subject_state as _subject
+        _result_cache_put(
+            _cache_key,
+            result,
+            _subject.capture(
+                index,
+                include_tree=(meta.get("verdict") or {}).get("state") == "absent",
+            ),
+        )
 
     return result
 
@@ -1144,6 +1249,7 @@ def _search_symbols_semantic(
     provider: str,
     model: str,
     start: float,
+    state_before: Optional[dict] = None,
 ) -> dict:
     """Semantic / hybrid scoring path for search_symbols.
 
@@ -1156,6 +1262,7 @@ def _search_symbols_semantic(
     When ``semantic_weight=0.0`` the result is identical to pure BM25.
     """
     from .embed_repo import embed_texts, _sym_text, EMBED_BATCH_SIZE, _gemini_task_aware
+    from ..retrieval import subject_state as _subject_state
     from ..storage.embedding_store import EmbeddingStore
     import logging as _logging
 
@@ -1397,38 +1504,84 @@ def _search_symbols_semantic(
         **_feat,
     )
     best_score = max_cos if semantic_only else max_bm25
-    if not scored_results or best_score < _ne_threshold:
-        # Find files whose names partially match query terms
-        query_lower = query.lower()
-        related_existing: list[str] = []
-        for f in index.source_files:
-            fname = f.lower().split("/")[-1].split("\\")[-1]
-            for term in query_terms:
-                if term in fname:
-                    related_existing.append(f)
-                    break
-        related_existing = related_existing[:5]  # cap at 5
 
-        verdict = "no_implementation_found" if not scored_results else "low_confidence_matches"
-        result["negative_evidence"] = {
-            "verdict": verdict,
-            "scanned_symbols": len(raw),
-            "scanned_files": len(seen_files) if seen_files else len(index.source_files),
-            "best_match_score": round(best_score, 3) if best_score > 0 else 0.0,
-            **({"related_existing": related_existing} if related_existing else {}),
-        }
-        # Add warning string alongside negative_evidence
+    # v1.108.184. This exit used to hand-roll the legacy `negative_evidence` block
+    # and emit NO `_meta.verdict` at all, so not one of the absence gates shipped
+    # since v1.108.166 applied to it \u2014 and it asserted "Do not claim this feature
+    # exists" anyway.
+    #
+    # \u26a0 The reproduction, because the shape matters more than the missing block:
+    # `semantic=True, token_budget=1` over a repo CONTAINING the target returned
+    # `result_count: 0`, `_meta.truncated: True`, "No implementation found ... Do
+    # not claim this feature exists", and `best_match_score: 53.774` \u2014 a strong
+    # match reported in the same breath as its own absence. That is the item-1
+    # defect ("an empty RESPONSE is not an empty SEARCH") fixed on the lexical
+    # path in v1.108.177 and left standing here, which is what an early return
+    # that reimplements the answer costs.
+    #
+    # This exit now builds the SAME verdict as the lexical one, so every gate
+    # applies: stale, rebuilding, partial, unknown freshness, working tree,
+    # movement, packing. `matches_before_packing` is the post-cap match count, so
+    # a budget that empties the response can no longer read as an empty search.
+    from ..retrieval.verdict import build_verdict as _build_verdict
+    from ..retrieval.verdict import index_changed_since_load as _index_changed_since_load
+    from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
+    _vres = _build_verdict(
+        result_count=len(scored_results),
+        matches_before_packing=len(top),
+        scanned_symbols=len(raw),
+        scanned_files=len(seen_files) if seen_files else len(index.source_files),
+        best_score=best_score,
+        threshold=_ne_threshold,
+        query_terms=query_terms,
+        source_files=index.source_files,
+        # The provider was resolved before this function was reached, so the
+        # channel really did run; `semantic_requested` would re-probe it.
+        semantic_requested=False,
+        index_stale=_probe.repo_is_stale,
+        freshness=_probe.repo_freshness,
+        index_changed=_index_changed_since_load(index),
+        coverage=_index_coverage_meta(index),
+        moved_during_scan=_subject_state.moved_during_scan(
+            state_before, index, result_count=len(scored_results)
+        ),
+        working_tree=(
+            _subject_state.working_tree_state(
+                index, scope=file_pattern, freshness=_probe.repo_freshness
+            )
+            if not scored_results else None
+        ),
+        # \u26a0 The load-bearing line. A zero result here is a statement about
+        # embedding geometry, not about the repository: a symbol can sit in the
+        # corpus and still score at or below zero against the query vector. The
+        # lexical path's absence rests on a corpus fact (no symbol contains any
+        # query term); this one cannot, ever, at any freshness. Expressed as a
+        # DOWNGRADE so `handoff.absence_refusal` does the refusing off the
+        # existing "only `absent` proves absence" rule, with no second rule to
+        # keep in sync.
+        absence_unprovable=(
+            "a semantic ranking scores similarity rather than looking a name up, "
+            "so a symbol can be present in the index and still fall at or below "
+            "zero against this query vector."
+        ),
+    )
+    meta["verdict"] = _vres["verdict"]
+    # The semantic channel really ran, and the verdict should say so rather than
+    # inherit the `off` default from `semantic_requested=False` above.
+    meta["verdict"]["channels"]["semantic"] = "ok"
+    negative_evidence = _vres["negative_evidence"]
+    if negative_evidence is not None:
+        result["negative_evidence"] = negative_evidence
         query_display = query[:80]
-        if verdict == "no_implementation_found":
+        if negative_evidence["verdict"] == "no_implementation_found":
             result["\u26a0 warning"] = (
                 f"No implementation found for '{query_display}'. "
                 f"Do not claim this feature exists."
             )
         else:
-            _best = result["negative_evidence"]["best_match_score"]
             result["\u26a0 warning"] = (
                 f"Low-confidence matches for '{query_display}' "
-                f"(best score: {_best}). "
+                f"(best score: {negative_evidence['best_match_score']}). "
                 f"Verify before claiming this feature exists."
             )
 
@@ -1462,6 +1615,7 @@ def _search_symbols_fusion(
     start: float,
     cache_key,
     cacheable: bool,
+    state_before: Optional[dict] = None,
 ) -> dict:
     """Fusion search path: multi-signal WRR ranking."""
     from ..retrieval.signal_fusion import (
@@ -1486,12 +1640,35 @@ def _search_symbols_fusion(
         candidates = index.symbols
 
     if not candidates:
+        # v1.108.185. A FOURTH exit in this tool, and the one with the least
+        # standing to stay silent: the filters selected nothing, so not a byte was
+        # read. Previously this returned a bare empty result with no verdict at
+        # all, which reads exactly like "we looked everywhere and it is not there"
+        # (#377 hardening item 9).
         elapsed = (time.perf_counter() - start) * 1000
-        return {
-            "result_count": 0,
-            "results": [],
-            "_meta": {"timing_ms": round(elapsed, 1), "total_symbols": len(index.symbols)},
+        _empty_meta: dict = {
+            "timing_ms": round(elapsed, 1),
+            "total_symbols": len(index.symbols),
+            "fusion": True,
+            "search_mode": "fusion",
         }
+        from ..retrieval.verdict import retrieval_verdict_for_index as _rv
+        _empty_meta["verdict"] = _rv(
+            index,
+            result_count=0,
+            query_terms=query_terms,
+            scope=file_pattern,
+            state_before=state_before,
+            incomplete={
+                "reason": "empty_scope",
+                "files_eligible": 0,
+                "note": (
+                    "No indexed symbol matched this scope, so nothing was scanned. "
+                    "An empty eligible set proves nothing about the corpus."
+                ),
+            },
+        )["verdict"]
+        return {"result_count": 0, "results": [], "_meta": _empty_meta}
 
     # Load config weights
     weights, smoothing = load_fusion_weights()
@@ -1534,7 +1711,13 @@ def _search_symbols_fusion(
     try:
         from ..storage.embedding_store import EmbeddingStore
         emb_store = EmbeddingStore(store._sqlite._db_path(owner, name))
-        all_embeddings = emb_store.get_all()
+        # v1.108.185: read-only, because the plain read wrote. `_connect` runs a
+        # WAL pragma and a CREATE-TABLE script on every connection, so probing for
+        # embeddings here moved the .db mtime mid-scan and made this exit report
+        # `rebuilding` + `moved_during_scan` on the first fusion search of any
+        # process — which downgraded the verdict and put `absent` out of reach for
+        # an entirely self-inflicted reason.
+        all_embeddings = emb_store.get_all_readonly()
         if all_embeddings:
             from .embed_repo import _detect_provider, embed_texts
             provider = _detect_provider()
@@ -1637,6 +1820,7 @@ def _search_symbols_fusion(
         "total_tokens_saved": total_saved,
         **cost_avoided(tokens_saved, total_saved),
         "fusion": True,
+        "search_mode": "fusion",
         "channels": [ch.name for ch in channels],
     }
     if token_budget is not None:
@@ -1691,8 +1875,66 @@ def _search_symbols_fusion(
         **_feat,
     )
 
+    # v1.108.185. This exit emitted no verdict and no negative evidence at all, so
+    # a zero-result fusion search came back as a bare empty response: nothing
+    # false, and nothing honest either. The same token_budget packing that broke
+    # the lexical path in v1.108.177 and the semantic path in v1.108.184 lives here
+    # too, so an empty response could be pure packing.
+    #
+    # ⚠ Unlike the semantic exit, fusion CAN prove absence, and the reason is the
+    # channel construction rather than a judgement call. `build_lexical_channel`
+    # and `build_identity_channel` each score EVERY eligible candidate with no cap,
+    # and `fuse` keeps every symbol appearing in ANY channel — so a zero fused set
+    # means every candidate scored zero on both BM25 and identity, which is the
+    # same corpus fact the lexical path's absence rests on. The similarity channel
+    # can only ADD symbols to the fused set, never remove one, so its absence
+    # weakens the RANKING and cannot manufacture a false absence. That asymmetry is
+    # exactly what the semantic exit lacked, and it is why there is no
+    # `absence_unprovable` here.
+    from ..retrieval.verdict import retrieval_verdict_for_index as _rv
+    _vres = _rv(
+        index,
+        result_count=len(scored_results),
+        # Pre-cap AND pre-packing: `fused[:effective_limit]` drops matches before
+        # the packer ever sees them, and both drops are the caller's to know about.
+        matches_before_packing=len(fused),
+        scanned_symbols=len(candidates),
+        scanned_files=len(seen_files) if seen_files else len(index.source_files),
+        best_score=_conf_scores[0] if _conf_scores else None,
+        query_terms=query_terms,
+        scope=file_pattern,
+        state_before=state_before,
+        semantic_channel="ok" if similarity_used else "off",
+    )
+    meta["verdict"] = _vres["verdict"]
+    if _vres["negative_evidence"] is not None:
+        # Parity with this tool's other exits: the same question must not get a
+        # differently-honest answer depending on which ranking mode ran.
+        result["negative_evidence"] = _vres["negative_evidence"]
+        _q = query[:80]
+        if _vres["negative_evidence"]["verdict"] == "no_implementation_found":
+            result["⚠ warning"] = (
+                f"No implementation found for '{_q}'. Do not claim this feature exists."
+            )
+        else:
+            result["⚠ warning"] = (
+                f"Low-confidence matches for '{_q}' "
+                f"(best score: {_vres['negative_evidence']['best_match_score']}). "
+                f"Verify before claiming this feature exists."
+            )
+
     _attach_index_truncation(result.get("_meta"), index)
     if cacheable and cache_key is not None:
-        _result_cache_put(cache_key, result)
+        from ..retrieval import subject_state as _subject
+        _result_cache_put(
+            cache_key,
+            result,
+            _subject.capture(
+                index,
+                include_tree=((result.get("_meta") or {}).get("verdict") or {}).get(
+                    "state"
+                ) == "absent",
+            ),
+        )
 
     return result

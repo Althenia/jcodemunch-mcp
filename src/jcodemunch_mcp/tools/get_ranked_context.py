@@ -289,6 +289,10 @@ def get_ranked_context(
     if not index:
         return index_status_to_tool_error(store.inspect_index(owner, name))
 
+    # #377 item 6: identity before the scan, compared after it.
+    from ..retrieval import subject_state as _subject
+    _state_before = _subject.capture(index)
+
     # BM25 corpus — cached on CodeIndex
     query_terms = _tokenize(query) or [query.lower()]
     # Guard: empty string in query_terms causes "" to match every filename
@@ -336,6 +340,8 @@ def get_ranked_context(
             scope=scope,
             compress=compress,
             start=start,
+            # #377 item 6 reaches this exit too (v1.108.185).
+            state_before=_state_before,
         )
 
     # Normalize PageRank to [0,1] for score combination
@@ -414,6 +420,39 @@ def get_ranked_context(
                 "total_tokens_saved": 0,
             },
         }
+        # This path asserts "Do not claim this feature exists" in prose, and
+        # until #377 item 6 it did so with none of the machinery that decides
+        # whether such a claim is allowed: no verdict, no freshness, no
+        # coverage, no gates. It gets the same verdict every other retrieval
+        # answer gets, so a genuine no-candidate result is citable and a scan
+        # over a stale, partial, rebuilding or moving subject is refused.
+        from ..retrieval.freshness import FreshnessProbe as _FreshnessProbe
+        from ..retrieval.verdict import build_verdict as _bv
+        from ..retrieval.verdict import index_changed_since_load as _icsl
+        from ..retrieval.verdict import index_coverage_meta as _icm
+        _p = _FreshnessProbe(
+            source_root=getattr(index, "source_root", "") or None,
+            indexed_at=getattr(index, "indexed_at", ""),
+            index_sha=getattr(index, "git_head", None),
+            file_mtimes=getattr(index, "file_mtimes", None),
+        )
+        result["_meta"]["verdict"] = _bv(
+            result_count=0,
+            scanned_symbols=len(candidates),
+            scanned_files=len(index.source_files),
+            query_terms=query_terms,
+            source_files=index.source_files,
+            index_stale=_p.repo_is_stale,
+            freshness=_p.repo_freshness,
+            index_changed=_icsl(index),
+            coverage=_icm(index),
+            moved_during_scan=_subject.moved_during_scan(
+                _state_before, index, result_count=0
+            ),
+            working_tree=_subject.working_tree_state(
+                index, scope=scope, freshness=_p.repo_freshness
+            ),
+        )["verdict"]
         return result
 
     # Normalize and compute combined score
@@ -552,6 +591,10 @@ def get_ranked_context(
     from ..retrieval.verdict import index_coverage_meta as _index_coverage_meta
     _vres = _build_verdict(
         result_count=len(context_items),
+        # #377 hardening item 8: a candidate set that could not be packed into
+        # the context budget is not a no-match. The zero-candidate case returns
+        # earlier, so anything reaching here really did match something.
+        matches_before_packing=items_considered,
         scanned_symbols=items_considered,
         scanned_files=len(set(s.get("file", "") for _, _, _, s in scored)),
         best_score=max(max_bm25, _EXACT_SEED_VERDICT_SCORE) if exact_ids else max_bm25,
@@ -560,8 +603,18 @@ def get_ranked_context(
         source_files=index.source_files,
         semantic_requested=False,
         index_stale=_probe.repo_is_stale,
+        freshness=_probe.repo_freshness,
         index_changed=_index_changed_since_load(index),
         coverage=_index_coverage_meta(index),
+        moved_during_scan=_subject.moved_during_scan(
+            _state_before, index, result_count=len(context_items)
+        ),
+        working_tree=(
+            _subject.working_tree_state(
+                index, scope=scope, freshness=_probe.repo_freshness
+            )
+            if not context_items else None
+        ),
     )
     negative_evidence = _vres["negative_evidence"]
     result["_meta"]["verdict"] = _vres["verdict"]
@@ -606,6 +659,7 @@ def _get_ranked_context_fusion(
     scope,
     start: float,
     compress: bool = False,
+    state_before: Optional[dict] = None,
 ) -> dict:
     """Fusion-based ranked context: WRR across channels, greedy budget packing."""
     from ..retrieval.signal_fusion import (
@@ -627,6 +681,12 @@ def _get_ranked_context_fusion(
         ]
 
     if not candidates:
+        # v1.108.185. The scope selected nothing, so not a byte was read — and
+        # this returned a bare empty result, which reads like a completed search
+        # that found nothing (#377 hardening item 9). Same shape as the
+        # no-candidate early return the non-fusion path got a verdict for in
+        # v1.108.179; this is the exit that was missed.
+        from ..retrieval.verdict import retrieval_verdict_for_index as _rv
         elapsed = (time.perf_counter() - start) * 1000
         return {
             "context_items": [],
@@ -634,7 +694,29 @@ def _get_ranked_context_fusion(
             "budget_tokens": token_budget,
             "items_included": 0,
             "items_considered": 0,
-            "_meta": {"timing_ms": round(elapsed, 1), "tokens_saved": 0, "total_tokens_saved": 0},
+            "_meta": {
+                "timing_ms": round(elapsed, 1),
+                "tokens_saved": 0,
+                "total_tokens_saved": 0,
+                "fusion": True,
+                "search_mode": "fusion",
+                "verdict": _rv(
+                    index,
+                    result_count=0,
+                    query_terms=query_terms,
+                    scope=scope,
+                    state_before=state_before,
+                    incomplete={
+                        "reason": "empty_scope",
+                        "files_eligible": 0,
+                        "note": (
+                            "No indexed symbol matched this scope, so nothing was "
+                            "scanned. An empty eligible set proves nothing about "
+                            "the corpus."
+                        ),
+                    },
+                )["verdict"],
+            },
         }
 
     # Centrality for BM25 tiebreaker
@@ -727,6 +809,7 @@ def _get_ranked_context_fusion(
             "total_tokens_saved": total_saved,
             **_cost_avoided(tokens_saved, total_saved),
             "fusion": True,
+            "search_mode": "fusion",
             "channels": [ch.name for ch in channels],
         },
     }
@@ -760,4 +843,42 @@ def _get_ranked_context_fusion(
         semantic_used=True,
         repo_is_stale=_probe.repo_is_stale,
     )
+
+    # v1.108.185. The last exit in this tool without a verdict. The non-fusion
+    # no-candidate return got one in v1.108.179 and the main path has had one since
+    # v1.108.166; this branch was simply never revisited.
+    #
+    # ⚠ This exit builds NO similarity channel at all — lexical, identity and
+    # structural only — so `channels.semantic` stays `off`, which is the truth
+    # rather than the `semantic_used=True` the ranking ledger above records for it.
+    # Left alone here: that argument feeds weight tuning and changing it would move
+    # a learned parameter, which is not this change.
+    from ..retrieval.verdict import retrieval_verdict_for_index as _rv
+    _vres = _rv(
+        index,
+        result_count=len(context_items),
+        # A candidate set that could not be packed into the budget is not a
+        # no-match (#377 hardening item 8), and `_pack_budget` can empty it.
+        matches_before_packing=len(fused),
+        scanned_symbols=len(candidates),
+        scanned_files=len(set(s.get("file", "") for s in candidates)),
+        best_score=max((fr.score for fr in fused), default=None),
+        query_terms=query_terms,
+        scope=scope,
+        state_before=state_before,
+    )
+    fusion_result["_meta"]["verdict"] = _vres["verdict"]
+    if _vres["negative_evidence"] is not None:
+        fusion_result["negative_evidence"] = _vres["negative_evidence"]
+        if _vres["negative_evidence"]["verdict"] == "no_implementation_found":
+            fusion_result["⚠ warning"] = (
+                f"No implementation found for '{query[:80]}'. "
+                f"Do not claim this feature exists."
+            )
+        else:
+            fusion_result["⚠ warning"] = (
+                f"Low-confidence matches for '{query[:80]}' "
+                f"(best score: {_vres['negative_evidence']['best_match_score']}). "
+                f"Verify before claiming this feature exists."
+            )
     return fusion_result

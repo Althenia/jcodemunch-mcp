@@ -2455,3 +2455,148 @@ def test_verilog_extension_mapping():
     assert get_language_for_path("src/alu.sv") == "verilog"
     assert get_language_for_path("src/pkg.svh") == "verilog"
     assert get_language_for_path("SRC/ALU.SV") == "verilog"
+
+
+# ---------------------------------------------------------------------------
+# TOML
+# ---------------------------------------------------------------------------
+
+TOML_SOURCE = '''\
+# Project configuration
+name = "jcodemunch-mcp"
+version = "1.0.0"
+description = "A token-efficient MCP server for GitHub code search"
+
+[author]
+name = "John Doe"
+email = "john@example.com"
+
+[server]
+host = "localhost"
+port = 8080
+
+[[features]]
+name = "search"
+enabled = true
+
+[[features]]
+name = "semantic"
+enabled = false
+'''
+
+
+def test_parse_toml():
+    """Test TOML parsing — tables, array tables, and key-value pairs."""
+    symbols = parse_file(TOML_SOURCE, "pyproject.toml", "toml")
+
+    # Top-level constants
+    name = next((s for s in symbols if s.name == "name" and s.kind == "constant"), None)
+    assert name is not None
+    assert name.qualified_name == "name"
+
+    version = next((s for s in symbols if s.name == "version" and s.kind == "constant"), None)
+    assert version is not None
+
+    description = next((s for s in symbols if s.name == "description" and s.kind == "constant"), None)
+    assert description is not None
+
+    # Tables (type symbols)
+    author = next((s for s in symbols if s.name == "author" and s.kind == "type"), None)
+    assert author is not None
+    assert author.signature == "[author]"
+
+    server = next((s for s in symbols if s.name == "server" and s.kind == "type"), None)
+    assert server is not None
+    assert server.signature == "[server]"
+
+    # Array tables (class symbols)
+    features_array = next((s for s in symbols if s.name == "features[]" and s.kind == "class"), None)
+    assert features_array is not None
+    assert features_array.signature == "[[features]]"
+
+    # Nested constants inside tables
+    author_name = next((s for s in symbols if s.name == "name" and s.qualified_name == "author.name"), None)
+    assert author_name is not None
+    assert author_name.kind == "constant"
+
+    author_email = next((s for s in symbols if s.name == "email" and s.qualified_name == "author.email"), None)
+    assert author_email is not None
+    assert author_email.kind == "constant"
+
+    server_host = next((s for s in symbols if s.name == "host" and s.qualified_name == "server.host"), None)
+    assert server_host is not None
+
+    server_port = next((s for s in symbols if s.name == "port" and s.qualified_name == "server.port"), None)
+    assert server_port is not None
+
+    # All symbols tagged as toml
+    assert all(s.language == "toml" for s in symbols)
+
+
+def test_toml_extension_mapping():
+    """.toml extensions map to toml language."""
+    from jcodemunch_mcp.parser.languages import get_language_for_path
+    assert get_language_for_path("pyproject.toml") == "toml"
+    assert get_language_for_path("config/settings.toml") == "toml"
+    assert get_language_for_path("CONFIG/SETTINGS.TOML") == "toml"
+
+
+TOML_DEEP_SOURCE = '''\
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pkg"]
+
+[a]
+x.y.z = 1
+
+[[tool.pytest.suites]]
+name = "unit"
+'''
+
+
+def test_parse_toml_dotted_paths_deeper_than_two_levels():
+    """Every segment of a dotted key survives.
+
+    tree-sitter-toml nests ``dotted_key`` left-recursively, so a walker that
+    matches only leaf key types keeps the last segment and silently drops the
+    rest. Two-level paths still look right under that bug, which is why the
+    assertions below go three and five deep: ``[tool.hatch.build.targets.wheel]``
+    came back as ``wheel`` with a fabricated ``[wheel]`` signature.
+    """
+    symbols = parse_file(TOML_DEEP_SOURCE, "pyproject.toml", "toml")
+    tables = {s.qualified_name: s for s in symbols if s.kind == "type"}
+
+    assert "tool.ruff.lint" in tables
+    assert "tool.hatch.build.targets.wheel" in tables
+
+    lint = tables["tool.ruff.lint"]
+    # name is the leaf, qualified_name the full path — the convention every
+    # other extractor in extractor.py follows.
+    assert lint.name == "lint"
+    # The signature must be text that actually appears in the file.
+    assert lint.signature == "[tool.ruff.lint]"
+    assert lint.signature in TOML_DEEP_SOURCE
+
+    wheel = tables["tool.hatch.build.targets.wheel"]
+    assert wheel.name == "wheel"
+    assert wheel.signature == "[tool.hatch.build.targets.wheel]"
+
+    # Pairs inherit the full table path, and a dotted key inside a table keeps
+    # its own segments too.
+    select = next(s for s in symbols if s.qualified_name == "tool.ruff.lint.select")
+    assert select.kind == "constant"
+    assert select.name == "select"
+
+    nested_pair = next(s for s in symbols if s.qualified_name == "a.x.y.z")
+    assert nested_pair.name == "z"
+
+    # Array tables carry the full path as well.
+    suites = next(s for s in symbols if s.kind == "class")
+    assert suites.qualified_name == "tool.pytest.suites"
+    assert suites.name == "suites[]"
+    assert suites.signature == "[[tool.pytest.suites]]"

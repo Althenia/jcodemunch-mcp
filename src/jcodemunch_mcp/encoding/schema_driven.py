@@ -31,6 +31,32 @@ from .format import (
     write_table,
 )
 
+# Structured `_meta` keys every encoder must preserve, whether or not its own
+# schema remembered to list them.
+#
+# A per-schema allowlist is the right default for tool-specific payloads and the
+# wrong one for CONTRACT keys, because the failure is silent and asymmetric: the
+# encoder drops the key, the response still looks complete, and the agent loses
+# exactly the field that told it not to trust the answer. That is how the whole
+# verdict contract went invisible in v1.108.169, and adding a key to 45 tuples
+# only guarantees the 46th encoder forgets it.
+#
+# Add a key here ONLY when losing it would make a response misleading rather
+# than merely less informative.
+UNIVERSAL_META_JSON = frozenset({
+    "verdict",            # retrieval verdict incl. absence evidence_ref
+    "ignored_arguments",  # v1.108.175: part of the call was silently discarded
+    # #377 hardening item 11: the carrier the server re-attaches when the
+    # verdict itself was filtered out. An encoder that drops it hands back a
+    # response that looks complete while the proof token has vanished.
+    "absence_evidence",
+    # #377 phase 2: the evidence-receipt carrier. It is the ONLY thing in the
+    # response that names the receipt — the body lives at munch://evidence/<id>
+    # and is read on demand — so an encoder that drops it silently converts an
+    # opted-in call back into one that proved nothing.
+    "receipts",
+})
+
 
 @dataclass
 class TableSpec:
@@ -116,7 +142,7 @@ def encode(
     # verdict is the reason this exists: dropping it hands the agent a confident
     # zero-result answer with no way to know the scan was degraded (and silently
     # discards the absence evidence_ref minted in call_tool).
-    for k in meta_json_blobs:
+    for k in set(meta_json_blobs) | UNIVERSAL_META_JSON:
         if k in meta:
             scalar_payload[f"__json._meta.{k}"] = json.dumps(
                 meta[k], separators=(",", ":")
@@ -236,7 +262,7 @@ def decode(
         prefixed = f"_meta.{k}"
         if prefixed in raw_scalars:
             meta_out[k] = _coerce(raw_scalars[prefixed], stypes.get(prefixed, "str"))
-    for k in meta_json_blobs:
+    for k in set(meta_json_blobs) | UNIVERSAL_META_JSON:
         prefixed = f"__json._meta.{k}"
         if prefixed in raw_scalars:
             try:

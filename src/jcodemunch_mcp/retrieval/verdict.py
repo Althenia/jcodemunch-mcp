@@ -83,7 +83,29 @@ def index_coverage_meta(index) -> Optional[dict]:
         out["excluded"] = skips
     if cov.get("no_symbols_count"):
         out["no_symbols_files"] = cov["no_symbols_count"]
+    # v1.108.176 (#375 sub-problem C). `complete` is tri-state on purpose:
+    # True / False / None-for-unknown. Older indexes have no `files_accepted`
+    # and report None, which must never be read as True — an index that cannot
+    # account for itself is not thereby complete.
+    if "complete" in cov:
+        out["complete"] = cov["complete"]
+    if cov.get("files_accepted") is not None:
+        out["files_accepted"] = cov["files_accepted"]
+    if cov.get("dropped_after_discovery"):
+        out["dropped_after_discovery"] = cov["dropped_after_discovery"]
+    if cov.get("unaccounted"):
+        out["unaccounted"] = cov["unaccounted"]
     return out
+
+
+def coverage_is_incomplete(coverage: Optional[dict]) -> bool:
+    """True only when coverage PROVES files are missing from the corpus.
+
+    Unknown coverage (`complete is None`, or no block at all) is not
+    incompleteness: it is the absence of a measurement, and treating it as a
+    defect would fire on every index built before this contract existed.
+    """
+    return bool(coverage) and coverage.get("complete") is False
 
 
 def _attach_coverage(verdict: dict, coverage: Optional[dict]) -> None:
@@ -170,6 +192,12 @@ def build_verdict(
     index_changed: bool = False,
     timed_out: bool = False,
     coverage: Optional[dict] = None,
+    matches_before_packing: Optional[int] = None,
+    incomplete: Optional[dict] = None,
+    moved_during_scan: Optional[str] = None,
+    freshness: Optional[str] = None,
+    working_tree: Optional[dict] = None,
+    absence_unprovable: Optional[str] = None,
 ) -> dict:
     """Compute the unified verdict plus the legacy negative_evidence dict.
 
@@ -182,6 +210,17 @@ def build_verdict(
     """
     terms = [t for t in (query_terms or []) if t]
     did_you_mean = _did_you_mean(source_files, terms)
+
+    # #377 item 4. `index_stale` is a Boolean with nowhere to put "I could not
+    # find out", and False was being rendered as `fresh` — so an index whose
+    # freshness was never established claimed current-snapshot equivalence.
+    # A producer that passes the richer state wins; one that does not keeps
+    # exactly its previous two-state behavior.
+    if freshness not in ("fresh", "stale", "unknown", "not_tracked"):
+        freshness = "stale" if index_stale else "fresh"
+    elif freshness == "stale":
+        index_stale = True
+    freshness_unknown = freshness == "unknown"
 
     semantic_available = _semantic_provider_available() if semantic_requested else True
     below_threshold = (
@@ -204,6 +243,66 @@ def build_verdict(
         # still returns them (they were really in the index) and only discloses
         # the rebuild via channels.index below.
         state = STATE_DEGRADED
+    elif result_count == 0 and coverage_is_incomplete(coverage):
+        # #375 sub-problem C. Freshness answers "is the index BEHIND the tree in
+        # time" (SHA vs HEAD) and was being read as "does the index COVER the
+        # tree". A corpus that dropped files at index time sits at the same SHA
+        # as the checkout, so it reported `fresh` while whole files were missing
+        # — a user watched that combination hand back confident zero-results for
+        # ~1,975 unindexed files and moved their code lookup to another tool.
+        #
+        # A file that never entered the corpus cannot be proven absent from it,
+        # so the same degraded gate as the stale/truncated/rebuilding cases
+        # applies and the absence-refusal rule falls out of the existing "only
+        # `absent` proves absence" check with nothing new to keep in sync.
+        state = STATE_DEGRADED
+    elif result_count == 0 and (working_tree or {}).get("blocks"):
+        # #377 hardening item 5. Git HEAD can sit still while the tree holds an
+        # edit the corpus has not read, and a zero-result scan has no returned
+        # file to hang per-file freshness on. Only work INSIDE the scanned
+        # scope, and only work the index has not caught up with, gets here.
+        state = STATE_DEGRADED
+    elif result_count == 0 and freshness_unknown:
+        # This subject HAS a revision we should be able to read and we could
+        # not, so whether the index lags the tree is unestablished — and an
+        # absence claim rests entirely on that. `not_tracked` is deliberately
+        # NOT here: a subject with no revision at all is disclosed, not refused,
+        # or every plain-folder index would lose absence evidence outright.
+        state = STATE_DEGRADED
+    elif result_count == 0 and moved_during_scan:
+        # #377 hardening item 6. The scan started against one state and finished
+        # against another, so "we looked and it is not there" describes neither
+        # of them. Same degraded gate as every sibling case.
+        state = STATE_DEGRADED
+    elif result_count == 0 and incomplete:
+        # #377 hardening items 7 and 9. Inputs the scan was supposed to read but
+        # could not, or an eligible set that was empty before a byte was read:
+        # either way nothing here proves the target is not in the corpus. Same
+        # degraded gate, same single refusal rule.
+        state = STATE_DEGRADED
+    elif result_count == 0 and (matches_before_packing or 0) > 0:
+        # #377 hardening item 1. `result_count` is what the RESPONSE carried,
+        # and the response is packed after ranking: a token budget or a result
+        # cap can empty it while matches really were found. An empty response
+        # is not an empty search, so the scan cannot prove absence — same
+        # degraded gate as the stale/truncated/rebuilding/partial cases, so the
+        # refusal falls out of the existing "only `absent` proves absence"
+        # check with no second rule to keep in sync.
+        state = STATE_DEGRADED
+    elif result_count == 0 and absence_unprovable:
+        # v1.108.184. Checked LAST among the degraded gates on purpose: every gate
+        # above names a condition the caller can do something about (re-index,
+        # widen the scope, raise the budget, re-run the search). This one names a
+        # permanent property of the retrieval mode that ran, so reporting a
+        # fixable cause in preference to it is strictly more useful.
+        #
+        # The case it exists for: a zero result from an embedding ranking. The
+        # lexical path's absence rests on a corpus fact — no symbol in the index
+        # contains any query term. A cosine ranking's zero result rests on
+        # embedding geometry, and a symbol can exist in the corpus while scoring
+        # at or below zero against the query vector. That is a statement about the
+        # model, not about the repository, and it must not be citable as one.
+        state = STATE_DEGRADED
     elif result_count == 0:
         state = STATE_ABSENT
     elif below_threshold:
@@ -225,23 +324,122 @@ def build_verdict(
         "channels": {
             "lexical": "ok",
             "semantic": semantic_channel,
-            # "rebuilding" is disclosed on EVERY state, not just the degraded
-            # one above: a caller reading an `ok` result still deserves to know
-            # the index moved under it. Only the absence CLAIM is refused.
+            # Disclosed on EVERY state, not just the degraded one above: a
+            # caller reading an `ok` result still deserves to know the index
+            # moved under it, or does not cover the tree. Only the absence CLAIM
+            # is refused.
+            #
+            # Order is by how badly each condition undermines the answer:
+            # a rebuild in flight beats a known gap beats mere lag. "partial"
+            # exists because `fresh` was answering the wrong question — it means
+            # "not behind in time", never "covers everything" (#375).
+            # `unknown` and `not_tracked` (#377 item 4) sit below `stale` and
+            # above `fresh`: a known lag is worse than an unestablished one, and
+            # both are worse than proven currency. `fresh` now means only what
+            # it says.
             "index": (
-                "rebuilding" if index_changed else ("stale" if index_stale else "fresh")
+                "rebuilding" if index_changed
+                else "partial" if coverage_is_incomplete(coverage)
+                else "stale" if index_stale
+                else freshness
             ),
         },
         "scorer": SCORER_VERSION,
         "note": _NOTES[state],
     }
+    if state == STATE_DEGRADED and result_count == 0:
+        # The verdict is the authority on this, so it says it here rather than
+        # leaving the dispatcher to re-derive "was the response empty" from a
+        # hand-kept tuple of per-tool result keys — which is exactly the class of
+        # bug that tuple always has (a new producer is added, nobody adds its key,
+        # and the disclosure silently stops firing for it).
+        #
+        # It matters because jcodemunch ships `meta_fields: []` by DEFAULT: on a
+        # default install the verdict is deleted before the agent sees it, and only
+        # the re-attached carrier survives. That carrier used to fire for `absent`
+        # alone, so every REFUSED zero-result reached a default-configured caller
+        # as a bare empty response with no reason attached.
+        verdict["absence_refused"] = True
     if did_you_mean:
         verdict["did_you_mean"] = did_you_mean
+    # Disclosed on EVERY state, not just the refused one: a caller reading a
+    # short result list deserves to know matches were dropped to fit the
+    # response, whether or not an absence claim is involved.
+    if working_tree:
+        # Disclosed whenever it was measured. It is measured only for a
+        # zero-result scan: probing the tree on every search would price a
+        # subprocess into the answers that do not need it.
+        verdict["working_tree"] = {k: v for k, v in working_tree.items() if k != "blocks"}
+        if working_tree.get("blocks") and state == STATE_DEGRADED and result_count == 0:
+            _n = working_tree.get("files_not_in_index", 0)
+            verdict["note"] = (
+                f"{_n} uncommitted change(s) inside this scope are not in the index "
+                "yet, so the target may sit in an edit the scan could not read. "
+                "Absence is NOT proven; re-index or narrow the scope."
+            )
+    if freshness_unknown and state == STATE_DEGRADED and result_count == 0:
+        verdict["note"] = (
+            "Index freshness could not be established for this repository, so "
+            "whether the index lags the tree is unknown and absence is NOT proven. "
+            "Results a scan returns are still real; only the claim that nothing "
+            "exists needs the comparison this scan could not make."
+        )
+    if moved_during_scan:
+        verdict["moved_during_scan"] = {"reason": moved_during_scan}
+        if state == STATE_DEGRADED and result_count == 0:
+            verdict["note"] = (
+                f"The subject moved while this scan ran: {moved_during_scan}. "
+                "Absence is NOT proven against either state; re-run the search."
+            )
+    if absence_unprovable:
+        # Disclosed on EVERY state, like every sibling block: a caller reading an
+        # `ok` semantic result still deserves to know this mode cannot prove
+        # absence, because the next thing they do may be to re-run it expecting
+        # one. Only the CLAIM is refused.
+        verdict["absence_unprovable"] = {"reason": absence_unprovable}
+        if state == STATE_DEGRADED and result_count == 0:
+            verdict["note"] = (
+                f"Nothing was returned, and {absence_unprovable} Absence is NOT "
+                "proven; re-run the search without the semantic channel to get an "
+                "answer that can prove it."
+            )
+    if incomplete:
+        verdict["incomplete"] = dict(incomplete)
+        if state == STATE_DEGRADED and result_count == 0 and incomplete.get("note"):
+            verdict["note"] = incomplete["note"]
+    if matches_before_packing is not None and matches_before_packing > result_count:
+        verdict["omitted"] = {
+            "matches_found": int(matches_before_packing),
+            "returned": int(result_count),
+            "by_response_budget": int(matches_before_packing) - int(result_count),
+        }
+        if state == STATE_DEGRADED and result_count == 0:
+            verdict["note"] = (
+                f"{matches_before_packing} match(es) were found, but none fit the "
+                "response budget, so the response is empty and the search is not. "
+                "Absence is NOT proven; re-run with a larger token_budget or "
+                "max_results."
+            )
     _attach_coverage(verdict, coverage)
 
     # --- legacy negative_evidence: unchanged trigger + shape ---
     negative_evidence = None
-    if result_count == 0 or below_threshold:
+    _packed_empty = result_count == 0 and (
+        (matches_before_packing or 0) > 0
+        or bool(incomplete)
+        or bool(moved_during_scan)
+        or freshness_unknown
+        or bool((working_tree or {}).get("blocks"))
+        or bool(absence_unprovable)
+    )
+    if _packed_empty:
+        # The legacy block would say "no_implementation_found", and
+        # search_symbols renders that as "Do not claim this feature exists" —
+        # a false statement when matches were found and dropped by the packer,
+        # and an unfounded one when the mode that ran cannot establish absence
+        # at all (v1.108.184).
+        pass
+    elif result_count == 0 or below_threshold:
         negative_evidence = {
             "verdict": (
                 "no_implementation_found" if result_count == 0 else "low_confidence_matches"
@@ -254,6 +452,81 @@ def build_verdict(
             negative_evidence["related_existing"] = did_you_mean
 
     return {"verdict": verdict, "negative_evidence": negative_evidence}
+
+
+def retrieval_verdict_for_index(
+    index,
+    *,
+    result_count: int,
+    scanned_symbols: int = 0,
+    scanned_files: int = 0,
+    query_terms: Optional[Sequence[str]] = None,
+    best_score: Optional[float] = None,
+    threshold: Optional[float] = None,
+    matches_before_packing: Optional[int] = None,
+    scope: Optional[str] = None,
+    state_before: Optional[dict] = None,
+    semantic_channel: str = "off",
+    incomplete: Optional[dict] = None,
+    absence_unprovable: Optional[str] = None,
+) -> dict:
+    """Index-aware wrapper over :func:`build_verdict` (v1.108.185).
+
+    Every retrieval exit needs the same five index-derived signals — the freshness
+    probe, the rebuild check, the coverage contract, the movement comparison and
+    the scope-level working-tree state — and every exit was assembling them by
+    hand. That is how three exits ended up with no verdict at all: adding one
+    meant reproducing five call patterns correctly, so the cheap thing was to skip
+    it and hand-roll the answer instead.
+
+    Sibling of :func:`symbol_verdict_for_index` and :func:`file_verdict_for_index`,
+    which already do this for the file and symbol tools. Returns
+    ``{"verdict", "negative_evidence"}`` exactly as ``build_verdict`` does.
+
+    ``semantic_channel`` is stated by the caller rather than probed: an exit that
+    has already resolved a provider and run the channel knows more than a
+    re-detection would, and ``semantic_requested=True`` would make the verdict
+    re-probe and possibly contradict the exit that just used it.
+    """
+    from . import subject_state as _subject
+    from .freshness import FreshnessProbe
+
+    probe = FreshnessProbe(
+        source_root=getattr(index, "source_root", "") or None,
+        indexed_at=getattr(index, "indexed_at", ""),
+        index_sha=getattr(index, "git_head", None),
+        file_mtimes=getattr(index, "file_mtimes", None),
+    )
+    freshness = probe.repo_freshness
+    result = build_verdict(
+        result_count=result_count,
+        scanned_symbols=scanned_symbols,
+        scanned_files=scanned_files,
+        best_score=best_score,
+        threshold=threshold,
+        query_terms=query_terms,
+        source_files=getattr(index, "source_files", None),
+        semantic_requested=False,
+        index_stale=probe.repo_is_stale,
+        freshness=freshness,
+        index_changed=index_changed_since_load(index),
+        coverage=index_coverage_meta(index),
+        matches_before_packing=matches_before_packing,
+        incomplete=incomplete,
+        absence_unprovable=absence_unprovable,
+        moved_during_scan=_subject.moved_during_scan(
+            state_before, index, result_count=result_count
+        ),
+        # Measured for a zero-result scan only: probing the tree on every search
+        # would price a subprocess into the answers that do not need it.
+        working_tree=(
+            _subject.working_tree_state(index, scope=scope, freshness=freshness)
+            if result_count == 0 else None
+        ),
+    )
+    if semantic_channel != "off":
+        result["verdict"]["channels"]["semantic"] = semantic_channel
+    return result
 
 
 def suggest_paths(

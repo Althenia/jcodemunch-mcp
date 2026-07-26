@@ -2,6 +2,958 @@
 
 All notable changes to jcodemunch-mcp are documented here.
 
+## [1.108.185] - 2026-07-26 - fusion gets a verdict, and fusion can prove absence
+
+### Fixed
+
+- **The last two exits without a verdict.** `_search_symbols_fusion` and
+  `_get_ranked_context_fusion` emitted no verdict and no negative evidence, so a
+  zero-result fusion search came back as a bare empty response: nothing false, and
+  nothing honest either. Both now build the same verdict as their tools' other
+  exits, so every gate applies — and both finally receive the pre-scan identity
+  capture (#377 item 6) that was taken on the shared path and never handed to the
+  branches that diverge.
+
+- ⚠ **`build_structural_channel` treated "restrict to nothing" as "no
+  restriction", and a no-match fusion query returned the whole repository.** The
+  guard was a falsy check (`if candidate_ids and ...`), while both callers pass
+  `set(lexical.ranked_ids) | set(identity.ranked_ids)`. A query matching nothing
+  produced an EMPTY set, which skipped the filter and let every symbol with
+  nonzero PageRank into the channel. Measured live: `fusion=True` on a nonsense
+  query returned ranked rows, and because fusion had no verdict nobody could see
+  that it was reporting centrality as relevance. It also made `absent` unreachable
+  on both fusion paths, so the absence contract could not have applied to them
+  however carefully it was wired. `None` and `set()` are now different things.
+
+- ⚠ **A read that wrote, and `mode=ro` was not enough to stop it.**
+  `EmbeddingStore._connect` runs `PRAGMA journal_mode = WAL` and a CREATE-TABLE
+  script on every connection, so the fusion exit's "does this repo have
+  embeddings" probe wrote to the database it was reading. That bumped
+  `_db_mtime_ns`, which made `index_changed_since_load` report
+  `channels.index: "rebuilding"` and `moved_during_scan` fire — so **the first
+  fusion search in any process downgraded to `degraded` and could not reach
+  `absent`**, entirely self-inflicted. Same defect `runtime/confidence.py` was
+  fixed for.
+
+  New `EmbeddingStore.get_all_readonly`. ⚠ **`mode=ro` alone does NOT fix this and
+  the first attempt shipped nothing:** read-only in SQLite means "cannot modify the
+  DATABASE", not "cannot touch the filesystem", and a plain read-only connection to
+  a WAL database still creates the `-wal` and `-shm` sidecars — measured going
+  None -> present across one fusion search — while `_db_mtime_ns` maxes over the
+  `.db` AND the `-wal`. `immutable=1` is the flag that guarantees no sidecar. The
+  trade-off it accepts is stated rather than hidden: vectors sitting in an
+  un-checkpointed WAL are not read, so the similarity channel may be skipped after
+  a watcher writes embeddings. That can only weaken the RANKING, because the
+  channel adds candidates and never removes any, which is the opposite of what the
+  mtime bump did.
+
+- Both fusion exits' no-candidate early returns now carry a verdict with
+  `incomplete: empty_scope` (#377 item 9). The filters selected nothing, so not a
+  byte was read, and a bare empty result reads exactly like a completed search that
+  found nothing.
+
+### Added
+
+- **`verdict.retrieval_verdict_for_index`**, the sibling of the existing
+  `symbol_verdict_for_index` and `file_verdict_for_index` wrappers. Three exits
+  shipped with no verdict at all, and the reason is worth naming: adding one meant
+  reproducing five call patterns by hand (freshness probe, rebuild check, coverage
+  contract, movement comparison, scope-level working-tree state), so the cheap
+  thing was to skip it and hand-roll the answer. The wrapper binds all five, and
+  is what the two fusion exits now call.
+
+- Both fusion exits emit `negative_evidence` and the warning string their tools'
+  other exits already emit, gated by every gate. Parity is the point: the same
+  question must not get a differently-honest answer depending on which ranking mode
+  ran.
+
+### Changed
+
+- **Fusion CAN prove absence, and the review reached the OPPOSITE conclusion to
+  1.108.184's.** That is why modes are reviewed rather than having a rule ported
+  onto them. `build_lexical_channel` and `build_identity_channel` each score every
+  eligible candidate with no cap, and `fuse` keeps every symbol appearing in ANY
+  channel, so an empty fused set means every candidate scored zero on both BM25 and
+  identity — the same corpus fact the lexical path's absence rests on. The
+  similarity channel can only ADD symbols, never remove one, so its absence weakens
+  the ranking and cannot manufacture a false absence. That asymmetry is exactly
+  what the semantic exit lacked, which is why it carries `absence_unprovable` and
+  fusion does not.
+
+- ⚠ **The receipt gate fired on its own author a second time.** Giving both fusion
+  exits a verdict made them mintable under `completeness` declarations written for
+  a different operation, and the pinning tests from 1.108.183 failed again. The
+  modes were reviewed and `completeness_by_mode["fusion"]` now declares what a
+  fusion receipt actually rests on, for both producers. `fusion` also joins both
+  producers' `mode_args`: a fused search and a lexical search of one string are
+  different operations and must not collide on one evidence id.
+
+### Notes
+
+- `get_ranked_context`'s fusion exit builds NO similarity channel at all, so its
+  `channels.semantic` is `off` — which is the truth, and differs from the
+  `semantic_used=True` its ranking-ledger call has always recorded. Left alone: that
+  argument feeds weight tuning, and moving a learned parameter is not this change.
+- New `tests/test_v1_108_185.py` (39), including the structural-backfill defect
+  pinned at unit and exit level, the sidecar regression pinned by filesystem
+  assertion, and a drift guard asserting every `search_mode` the code emits has a
+  declared completeness. **Every retrieval exit in the suite now carries a verdict**,
+  pinned structurally rather than by inspection. No tool-count change, no
+  `INDEX_VERSION` change, no schema change.
+
+## [1.108.184] - 2026-07-26 - a ranking cannot prove absence
+
+### Fixed
+
+- **`search_symbols`'s semantic exit asserted absence with no verdict at all, and
+  the reproduction is worse than the missing block.** Named as an open finding when
+  1.108.183 shipped; this closes it. That exit hand-rolled the legacy
+  `negative_evidence` block and emitted no `_meta.verdict`, so not one of the
+  absence gates shipped since 1.108.166 applied to it — while it printed "Do not
+  claim this feature exists" anyway. Third instance of the class found in
+  1.108.179: an early return is a second implementation of the answer and inherits
+  nothing.
+
+  ⚠ **Reproduced before touching code, `semantic=True, token_budget=1` over a repo
+  CONTAINING the target:**
+
+  ```
+  result_count:     0
+  _meta.truncated:  true
+  best_match_score: 53.774
+  warning:          "No implementation found for 'refresh_token'.
+                     Do not claim this feature exists."
+  _meta.verdict:    null
+  ```
+
+  A strong match reported in the same breath as its own absence, with nothing in
+  the response able to contradict it. That is the item-1 defect ("an empty RESPONSE
+  is not an empty SEARCH") fixed on the lexical path in 1.108.177 and left standing
+  here, which is exactly what a duplicated answer costs.
+
+  The exit now builds the **same** verdict as the lexical one, so every gate
+  applies: stale, rebuilding, partial, unknown freshness, working tree, movement,
+  packing. It also finally receives the pre-scan identity capture (#377 item 6),
+  which was taken on the shared path and simply never handed to the branch that
+  diverges. `matches_before_packing` is the post-cap match count, so a budget that
+  empties the response can no longer read as an empty search.
+
+- ⚠ **A refused scan now reaches a default-configured caller.** Every absence gate
+  since 1.108.166 works by DOWNGRADING to `degraded`, and the in-band disclosure
+  was gated on the state still reading `absent` — so **the better a gate worked,
+  the less the caller was told.** A refused zero-result came back as a bare empty
+  response, and since jcodemunch ships `meta_fields: []` by default, with no
+  verdict either. New `verdict.absence_refused` (set by the verdict, which is the
+  only party that knows both that the result was empty and that the claim was
+  refused) widens the carrier to every refused zero-result. The alternative was a
+  hand-kept tuple of per-tool result keys in the dispatcher, which is the class of
+  bug that stops covering the next producer somebody adds.
+
+### Added
+
+- **`verdict.absence_unprovable`: a retrieval mode that cannot establish absence
+  says so, on every state.** The lexical path's absence rests on a corpus fact —
+  no symbol in the index contains any query term. An embedding ranking's zero
+  result rests on embedding geometry, and **a symbol can sit in the corpus while
+  scoring at or below zero against the query vector.** That is a statement about
+  the model, not about the repository, and it must never be citable as one. A
+  semantic or hybrid zero result is therefore `degraded` and can never reach
+  `absent` at any freshness, at any coverage.
+
+  ⚠ **Expressed as a DOWNGRADE, so `handoff.absence_refusal` does the refusing off
+  the existing "only `absent` proves absence" rule — no second rule to keep in
+  sync.** `absence_refusal` names this cause before the generic state branch,
+  because unlike every sibling gate it describes something that cannot be different
+  next time, and a caller told only "the verdict was degraded" would keep re-running
+  a search that can never answer the question.
+
+  ⚠ **Checked LAST among the degraded gates, deliberately.** Every gate above it
+  names a condition the caller can act on (re-index, widen the scope, raise the
+  budget). Measured: the `token_budget=1` reproduction above now reports the budget
+  as its note and carries `absence_unprovable` alongside, rather than leading with
+  a permanent property when a fixable one applies.
+
+- Both new blocks published in `schemas/retrieval-verdict.schema.json` in the same
+  commit that emits them. Live verdicts from all three semantic shapes are
+  validated against it.
+
+### Changed
+
+- **`Producer.completeness_by_mode`, and the receipt gate caught its own author.**
+  Giving the semantic exit a verdict made it mintable — under a `completeness`
+  declaration reading "lexical BM25 over the inverted index", which is false for an
+  embedding ranking. `test_v1_108_183.py`'s pinning test failed, the mode got
+  reviewed, and `hybrid` / `semantic_only` now declare their own completeness
+  (every filtered symbol, no inverted-index narrowing, ranked by similarity, so the
+  receipt speaks for what was returned and never for what was not). **A capability
+  that reads enforced and is not is the failure Phase 2 exists to prevent, so the
+  gate catching this is the design working rather than a nuisance.** A mode absent
+  from the table falls back to the default, so adding one without reviewing it is a
+  visible omission instead of a silent inheritance.
+
+- `semantic`, `semantic_only` and `semantic_weight` join `search_symbols`' receipt
+  `mode_args`, and the projector records the exit's own `_meta.search_mode`: a
+  semantic and a lexical search of one string are different operations and must not
+  collide on one evidence id. `channels.semantic` alone could not tell hybrid from
+  `semantic_only`.
+
+### Notes
+
+- **DELIBERATELY NOT DONE: the two fusion exits still carry no verdict.** They
+  assert nothing false — no verdict and no absence prose either — so nothing there
+  is lying to anyone. Giving them one means first deciding whether a
+  Weighted-Reciprocal-Rank ranking that *includes* a lexical channel can prove
+  absence, and that is its own review rather than a rider on this one. Pinned by a
+  test so the decision cannot be made by accident.
+- A genuine semantic zero-result now returns no `negative_evidence` and no warning
+  string, because the only sentence the old block could produce was one it had no
+  standing to make. The reason rides the verdict and, on a default install, the
+  re-attached carrier.
+- New `tests/test_v1_108_184.py` (31), including the reproduction pinned and the
+  lexical path proven still able to reach `absent` — the gate has to be scoped to
+  the mode that earned it, not applied to every search. No tool-count change, no
+  `INDEX_VERSION` change.
+
+## [1.108.183] - 2026-07-26 - a receipt says what it proves, and only that
+
+### Added
+
+- **Exact immutable evidence receipts** (`jcodemunch.evidence/v1`),
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377) Phase 2, P1 + P2
+  of the PRD sequencing. Design by **@mightydanp**, whose post-ship review items
+  12-22 this implements.
+
+  Phase 1 (1.108.165) answered *which reference is attached to which claim*. It
+  did not narrow **what a reference proves**, and we said so publicly when we
+  shipped it. `handoff._validate_evidence` attests a ref matching a served symbol
+  id **or the file component of one**, so:
+
+      served this session:  src/auth/session.py::refresh_token#function
+      attests:              src/auth/session.py::refresh_token#function   correct
+      attests:              src/auth/session.py                           over-broad
+
+  A claim citing a whole file was attested when one unrelated symbol from it was
+  the only thing retrieved, and the reader of a finalized handoff could not tell
+  those two citations apart. The server was the only party in the exchange that
+  knew the difference.
+
+  A receipt is the narrow answer. New `evidence/receipts.py` binds one canonical
+  subject — symbol id, file, line range, `content_sha256` — to one snapshot and
+  to the operation that actually ran, then derives its identity from exactly
+  those three, so **different snapshots cannot share an evidence id**. Read at
+  `munch://evidence/<id>`, beside `munch://runtime/identity` (#371) and
+  `munch://handoff/<id>` (#374). **No new tool**: the tool-schema budget is a
+  real constraint (90 tools in `full`, `core_compact` pinned at 3996) and the
+  reviewer flagged it before we did. The response carries an **id**, not the
+  receipt; the body is read from the resource on demand.
+
+- **Producer registration with canonical projectors** (`evidence/producers.py`),
+  the load-bearing half. An envelope without registration is a contract anything
+  can mint into, which is the defect this phase exists to fix, so P1 and P2
+  shipped together. A reviewed producer declares its verdict shape, the proof
+  kinds it may mint, its canonical projector, and its completeness / freshness /
+  coverage / integrity semantics — once.
+
+  ⚠ **This is where the hardest lesson of the 1.x hardening work goes.**
+  `get_ranked_context` asserted "Do not claim this feature exists" from an early
+  return that never called `build_verdict`, so eight shipped absence gates were
+  invisible to it until 1.108.179 went looking. An early return is a second
+  implementation of the answer and inherits nothing. Registration makes that
+  structural rather than remembered: **minting requires a verdict of the shape
+  the producer registered**, so an exit that asserts an answer without building
+  one cannot mint — not as a listed exception, but because it never produced the
+  thing a receipt is derived from.
+
+- **Four producers registered, and the boundary is stated rather than implied.**
+  `get_symbol_source` (`symbol_definition`; positive only — its "not in the
+  index" answer carries no scan counts, no coverage and no query, so it cannot
+  back an absence claim and is not registered to try), `search_symbols` and
+  `get_ranked_context` (`symbol_definition` + `symbol_lookup_absence`, both
+  `get_ranked_context` exits since 1.108.179), `search_text`
+  (`literal_text_absence` only — a text hit is a `(file, line, matched text)`
+  tuple, not a symbol definition, and giving it a positive kind would mean
+  inventing a subject nothing downstream knows how to compare).
+
+- **Opt-in `receipt` argument** on those four, and only those four. Default false
+  is today's response bytes, **pinned by a test**. Passing it to an unregistered
+  tool is disclosed as `ignored_arguments` (the 1.108.175 contract) rather than
+  silently accepted, so "no receipt came back" is never a mystery.
+
+- **`schemas/evidence-receipt.schema.json`**, published in the same commit that
+  emits it. That trap has now fired three times (1.108.168, .176, .180); the
+  receipt envelope is closed (`additionalProperties: false`) and the tests
+  validate live receipts from all three shapes against it.
+
+### Changed
+
+- **`_meta.receipts` joins `UNIVERSAL_META_JSON`.** It is the only thing in the
+  response that names the receipt, so an encoder that dropped it would convert an
+  opted-in call back into one that proved nothing. Verified across json, compact
+  and auto encoding, `meta_fields: []`, a partial `meta_fields` filter and
+  `suppress_meta` — the same ordering rule as 1.108.177 item 10: the receipt is
+  minted against the COMPLETE internal result and the carrier is re-attached
+  after presentation filtering. A display preference must never decide what a
+  scan proved.
+
+- **`finalize_handoff` distinguishes exact evidence from broadened evidence, and
+  the input picks the contract.** A handoff citing **no** receipt keeps the
+  historical file-component broadening exactly and renders byte-identically, so
+  no shipped caller changes — but its receipt now carries `evidence_precision`
+  (`exact` / `symbol_exact` / `broadened`) and `broadened_refs`, which name the
+  file-level citation and what actually backed it. A handoff that **does** cite a
+  receipt is held to the subject its evidence proves: a file-level ref backed
+  only by a served symbol from that file is **refused** as over-broad, with its
+  own error and its own fix. That closes the Phase 1 caveat, and
+  `tests/test_v1_108_183.py` proves the test is not vacuous by showing the same
+  finalization attests the file ref with the narrowing disabled.
+
+- `absence_attested` now counts absence **receipts** as well as bare `absent:`
+  tokens: a receipt points at the same recorded scan, and a reader counting
+  absence proofs would otherwise undercount every receipt-citing handoff. (The
+  rename to `absence_scans_attested` is P4 and is not in this release.)
+
+### Notes
+
+- **Phase 3 refs keep working, unchanged.** An absence receipt LINKS to the scan
+  `note_absence` recorded (new `handoff.absence_ref_for` derives the ref from the
+  same projection) instead of re-deriving whether that scan proves anything, so
+  `absence_refusal` stays the single implementation of the refusal rules and a
+  receipt read hours later cannot disagree with the gate that issued it.
+  `capabilities.proves_absence` is advisory; finalization re-derives it.
+
+- **The snapshot is BOUND, not built.** Every field already ships:
+  `subject_state.capture` (1.108.178), `FreshnessProbe.repo_freshness`
+  (1.108.180), `index_coverage_meta` (1.108.176), `verdict.working_tree`
+  (1.108.181). ⚠ One divergence found while wiring it and handled rather than
+  papered over: `build_symbol_verdict` never got the item-4 four-state treatment,
+  so ITS `channels.index` reports `fresh` for a plain indexed folder that has no
+  revision at all. A receipt from `get_symbol_source` therefore probes
+  `repo_freshness` directly instead of trusting the channel — believing that
+  value would have been the 1.108.176 mistake again, a signal read as answering a
+  question it does not answer. The divergence is visible inside one envelope
+  (`channels.index: fresh`, `snapshot.freshness: not_tracked`) and pinned.
+
+- **The subject is read from the SERVED row only, never re-read from the index.**
+  A receipt describes what the caller was handed: `search_symbols` at standard
+  detail serves no `end_line` and no content hash, so the receipt omits both and
+  says so in `limitations` rather than quietly filling them in from a lookup the
+  caller never saw. `detail_level: "full"` serves the body, so the served bytes
+  are hashed. `limitations` is what makes a weak receipt usable rather than
+  discardable.
+
+- **Full digests, and fail-closed on collision.** 48 bits of displayed identity
+  is a birthday problem waiting for a large session (review item 19), so the id
+  is the whole sha256; rendered prose shows a short prefix, identity and storage
+  never do. An id that has ever named two different receipts names neither
+  afterwards — keeping one would make every later citation of it a coin flip.
+
+- ⚠ **`snapshot.conditions` exists because fail-closed and `limitations` were
+  about to fight each other.** `limitations` is not part of the evidence id, so a
+  condition that changed it WITHOUT changing the id would give one id two
+  different bodies — and the fail-closed check would then refuse both, deleting a
+  receipt an agent was already holding. A cached `search_symbols` replay whose
+  verdict gains `revalidated` is exactly that case: the generation and both
+  revisions sit still while the response's honesty changes. So every condition is
+  now a token INSIDE the snapshot (`rebuilding`, `partial`, `stale`,
+  `freshness_unknown`, `not_tracked`, `no_coverage_contract`,
+  `semantic_unavailable`, `replayed_from_stale_cache`, `moved_during_scan`,
+  `incomplete_inputs`, `omitted_matches`), every limitation is derived from one,
+  and a subject measured under different conditions therefore gets a different
+  id — which is what "different snapshot, different id" has to mean when the
+  conditions are what changed. Found reviewing this change, not by a test failing.
+
+- **DELIBERATELY NOT DONE, so nobody builds on it:** session keying, the full
+  expiry taxonomy (`wrong_session` / `wrong_subject` / `expired` /
+  `snapshot_invalidated`) and finalization deep-freeze are P3; redacted public
+  rendering and the `absence_scans_attested` rename are P4; **suite parity for
+  jdocmunch and jdatamunch is P5 and is untouched here.** `lookup` does
+  distinguish `never_recorded` from `evicted`, because a bounded store makes that
+  one bit unavoidable and reporting the wrong reason would be worse than
+  reporting none. Receipts are capped at 25 per call, and the truncation is
+  DISCLOSED in the carrier rather than silent.
+
+- **Two ungated absence assertions found and NOT fixed here, stated plainly
+  rather than left to be discovered:** `search_symbols`'s semantic exit emits the
+  legacy `negative_evidence` block — including "Do not claim this feature
+  exists" — with no `_meta.verdict` at all, so none of the absence gates shipped
+  since 1.108.166 apply to it; both fusion exits emit neither a verdict nor
+  negative evidence. Neither can mint a receipt, which is the registration gate
+  working, and tests pin that against the source so a future verdict there forces
+  a review before it starts minting. Repairing the semantic exit's prose would
+  change response bytes on calls that never asked for a receipt, so it is its own
+  change, not a rider on this one.
+
+- New `tests/test_v1_108_183.py` (79). No tool-count change, no `INDEX_VERSION`
+  change, no new background process, no write to the user's repository or index
+  store.
+
+## [1.108.182] - 2026-07-26 - a stall has a name and a ceiling
+
+### Fixed
+
+- **Provider discovery was unbounded, and it runs before a single file is
+  indexed.** [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375),
+  reopened by @dkiaulakis after a re-run at 1.108.176 measured no improvement on
+  the subtree that stalled at 1.108.169 — 268s versus 240s, both unfinished. The
+  1.108.171 regex fix removed one known cost centre. It could not remove the
+  SHAPE of the failure: `discover_providers` ran all fourteen providers'
+  `detect()` + `load()` inline with no ceiling and no attribution, so any
+  provider that ground took the whole index down with it and the caller saw
+  silence. Each provider now runs under a wall-clock budget
+  (`JCODEMUNCH_PROVIDER_BUDGET_SECONDS`, default 30s, `0` disables). An overrun
+  is skipped and NAMED — `providers_skipped` on the index result plus a warning
+  that states the consequence, that symbols are indexed but carry no context
+  from that provider and its import edges (route mounts, template renders) are
+  missing from the graph. A budget cannot make a slow provider fast; it makes
+  the gap survivable and attributable instead of an unbounded wait.
+- **Source walks paid for dependency trees they then discarded.**
+  `ExpressProvider.load` ran five recursive `Path.glob("**/*.js")`-shaped passes
+  and dropped `node_modules` by substring AFTER the walk had already enumerated
+  it — five full descents through a dependency tree to index none of it. Same
+  defect in `_scan_package_json_forced_paths`, which `rglob`'d for manifests and
+  filtered `node_modules` out afterwards. New `iter_source_files` prunes at the
+  walk. Measured on a 42-file project over a 9,600-file `node_modules`, warm and
+  alternating: **0.639s → 0.001s for the identical 41 files.**
+- **One pathological file could stall a whole index.** `parse_file` now runs
+  under a per-file wall-clock ceiling
+  (`JCODEMUNCH_PARSE_BUDGET_SECONDS`, default 20s, `0` disables) via
+  `parse_file_budgeted`. On overrun the file is skipped and named in the index
+  result's `warnings` instead of the run hanging with nothing to point at. The
+  watchdog is armed only for files at or above 128 KiB, so the common path
+  parses inline exactly as before.
+
+### Known limits, stated
+
+- A watchdog stops the CALLER waiting; it cannot stop the work. Python cannot
+  preempt a thread, and tree-sitter is C code, so an abandoned parse or provider
+  keeps consuming CPU until it finishes or notices its cooperative deadline.
+  These bounds make the index finish and the gap visible — they do not cap CPU.
+- `ContextProvider.budget_expired()` is the cooperative half, and it only helps
+  where a provider polls it. Wired into the Express walk; the other thirteen
+  providers still rely on the thread watchdog alone.
+
+## [1.108.181] - 2026-07-26 - uncommitted work is represented, per scope
+
+### Fixed
+
+- **A zero-result scan could not see the edit that would have answered it.**
+  Item 5 of the [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377)
+  review by @mightydanp. Git HEAD sits still while the tree holds a modified
+  file, a brand-new untracked implementation, a deletion, or a rename into or
+  out of scope, so every freshness gate we had could report `fresh` over a
+  corpus that had not read the file the target lives in. A scan that returns
+  rows carries per-file freshness on them; a scan that returns nothing has
+  nowhere to put it.
+- New `subject_state.working_tree_state` gives the SCOPE a state of its own:
+  `clean` / `dirty_in_scope` / `dirty_outside_scope` / `unknown` /
+  `not_applicable`, disclosed as `verdict.working_tree` and wired into
+  `search_symbols`, `search_text` and both of `get_ranked_context`'s exits.
+
+### Notes
+
+- **Only `dirty_in_scope` can refuse, and only when the index has not caught
+  up.** Two restrictions do the work, and both are load-bearing:
+  - work OUTSIDE the scanned scope never blocks, which is the reviewer's own
+    distinction: a dirty file elsewhere does not invalidate a narrow proof;
+  - an edit the index has ALREADY re-read is not a gap. `files_not_in_index`
+    compares each dirty in-scope path against `index.file_mtimes`, so a
+    watcher-fresh corpus keeps proving absence. Without that, the gate would
+    fire on every developer with unsaved work in an up-to-date repo, and a
+    signal that fires constantly is one people learn to ignore.
+- The refusal counts the files and names up to five of them, so the reader can
+  see what the scan could not read rather than being told to distrust it.
+- **Measured for a zero-result scan only.** Probing the tree costs a `git
+  status`, and pricing a subprocess into answers that do not need it would be a
+  tax on the common path. Same discipline as items 3 and 6; the reading is
+  TTL-cached and shared with the cached-negative revalidation.
+- Rename handling matters here: `R old -> new` records the NEW path, which is
+  the one that exists in the tree and the one a search would have had to see.
+  Quoted and backslashed paths are normalised so they compare against index
+  paths.
+- `working_tree` published in `schemas/retrieval-verdict.schema.json`. New
+  `tests/test_v1_108_181.py` (27). No tool-count or INDEX_VERSION change.
+
+## [1.108.180] - 2026-07-26 - unknown freshness stops collapsing into fresh
+
+### Fixed
+
+- **An index whose freshness was never established was claiming current-snapshot
+  equivalence.** Item 4 of the
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377) review by
+  @mightydanp. `FreshnessProbe.repo_is_stale` is a Boolean, and a Boolean has
+  nowhere to put "I could not find out": it returned `False` both when the SHAs
+  matched and when either of them was missing, and the verdict rendered `False`
+  as `channels.index: "fresh"`. Every absence gate downstream then trusted a
+  comparison that had never been made.
+- New `FreshnessProbe.repo_freshness` returns `fresh` / `stale` / `unknown` /
+  `not_tracked`, and `build_verdict` takes it as `freshness=`. `channels.index`
+  reports it, so `fresh` now means only what it says.
+
+### Notes
+
+- **`unknown` and `not_tracked` get opposite treatment, on purpose.** `unknown`
+  is a capability we have, failing (git absent, the source root moved, the index
+  stored no SHA), so a zero-result scan is `degraded` and the absence claim is
+  refused. `not_tracked` is a capability the subject does not support — a plain
+  indexed folder has no revision and never will — so it is disclosed and the
+  absence stays citable. That is the call jDataMunch made in v1.26.0 for
+  freshness it cannot model, and refusing here instead would strip absence
+  evidence from every folder index on the grounds of a limitation that is
+  permanent, already stated, and unrelated to whether the target exists.
+- **A subdirectory of a checkout is tracked by the checkout above it.** The
+  trackability test walks up the way git does, so a monorepo subdir index still
+  reports `fresh` or `stale` rather than understating what we know about it.
+- Precedence: `rebuilding` > `partial` > `stale` > `unknown` / `not_tracked` >
+  `fresh`. A known lag is worse than an unestablished one; both beat proven
+  currency.
+- Disclosed on every state, refused only for the absence claim, expressed as a
+  downgrade. The refusal names the failed capability rather than the state.
+- **Zero blast radius for a producer that passes nothing:** `build_verdict`
+  without `freshness=` keeps its exact two-state behavior, pinned by a test. An
+  unrecognized value is ignored rather than propagated.
+- `channels.index` gains `unknown` and `not_tracked` in
+  `schemas/retrieval-verdict.schema.json` — the enum is closed, so a value not
+  published there fails our own contract.
+- New `tests/test_v1_108_180.py` (26), including a real one-commit checkout,
+  because `fresh` is the one state a fixture cannot fake. No tool-count or
+  INDEX_VERSION change.
+
+## [1.108.179] - 2026-07-26 - the subject has to hold still for the scan
+
+### Fixed
+
+- **A scan could start against one state and finish against another, and still
+  prove absence.** Item 6 of the
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377) review by
+  @mightydanp. `search_symbols`, `search_text` and `get_ranked_context` now
+  capture the subject's identity before retrieval and compare it after: a
+  concurrent edit, a watcher reindex, an incremental save, a published
+  generation or a long scan crossing a rebuild all mean the scan describes
+  neither the state it started against nor the one it finished in. A zero-result
+  scan in that position is `degraded`, with `verdict.moved_during_scan` naming
+  what moved.
+- **`get_ranked_context`'s no-candidate path carried no verdict at all.** It
+  returned "No implementation found ... Do not claim this feature exists" in
+  prose, with no freshness, no coverage, no scan counts and none of the absence
+  gates, because it returned before `build_verdict` was ever called. It now
+  builds the same verdict every other retrieval answer gets, so a genuine
+  no-candidate result is citable and a scan over a stale, partial, rebuilding or
+  moving subject is refused.
+
+### Notes
+
+- **The check is scoped to a zero-result scan, and that is what makes it
+  affordable.** A scan that returned rows read them out of a generation that
+  really held them, and the freshness channels already disclose that the tree
+  moved underneath. The after-reading therefore bypasses the TTL-cached HEAD
+  lookup and pays for a real `git rev-parse`: without that, a before/after
+  comparison inside the cache window compares one reading with itself.
+- Disclosed on every state, refused only for the absence claim, expressed as a
+  downgrade so `handoff.absence_refusal` does the refusing. Its message names
+  the movement rather than falling through to "the verdict was degraded".
+- `subject_state.changed` now takes the *when* of the comparison, so the cached
+  replay (v1.108.178) and the live scan produce sentences a reader can tell
+  apart: "after this scan was cached" versus "while the scan was running".
+- Working-tree movement DURING a scan is still not checked: the before-reading
+  would have to pay for `git status` on every search to make that comparison
+  possible. Whole-scope working-tree state is item 5.
+- `moved_during_scan` published in `schemas/retrieval-verdict.schema.json`. New
+  `tests/test_v1_108_179.py` (19), all three tools covered by one parametrized
+  end-to-end case. No tool-count or INDEX_VERSION change.
+
+## [1.108.178] - 2026-07-26 - a cached negative must prove it still describes the subject
+
+### Fixed
+
+- **A cached absence could be replayed over a tree that no longer existed.**
+  Item 3 of the [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377)
+  review by @mightydanp. The `search_symbols` result cache keys on the index's
+  `indexed_at`, so it invalidates on a REINDEX and on nothing else. A query that
+  was absent against snapshot A cached its `fresh` / `absent` verdict; the source
+  then changed without the index being rebuilt; the same query hit the cache; and
+  the old verdict was replayed, minting an absence proof against a state nobody
+  had scanned.
+- New `retrieval/subject_state.py` captures what the answer depends on at
+  cache-write time (index generation, .db mtime, live git HEAD, and for an
+  absence the working-tree fingerprint) and re-checks it at cache-read time.
+  When something moved, `verdict.revalidated` is disclosed, an `absent` state is
+  downgraded to `degraded`, and any evidence token minted on the earlier pass is
+  stripped, because it was issued against the state that just failed to hold.
+- **The dispatcher's write leaked into the cache.** `_result_cache_get` copied
+  the result and its `_meta` but not the nested `verdict`, so the `evidence_ref`
+  the dispatcher attached AFTER the tool returned landed in the stored entry and
+  was replayed to every later hit. The copy now reaches the verdict, and the
+  stored entry is written pristine.
+
+### Notes
+
+- **Only a negative pays for the expensive signal.** `git status` runs only when
+  the cached verdict is `absent` — the one answer a working-tree edit can falsify
+  while the index and its generation sit still. A cached positive costs a few
+  stats, and its results were really in the index at that generation, so it keeps
+  serving with disclosure. That split is the reviewer's, and it is right.
+- **Unknown is never reported as changed.** A non-git checkout knows none of
+  this and did not change either; treating unknown as moved would refuse every
+  absence on such a repo. Same reasoning as the tri-state `coverage.complete`.
+- The refusal names what moved (rebuilt, rewritten, checkout moved with both
+  short SHAs, working tree changed) rather than falling through to the generic
+  "the verdict was degraded".
+- Verified on a real checkout, not only on fixtures: the same absent query is
+  replayed unchanged when nothing moves, and downgrades with
+  `revalidated.stale_cache` the moment an untracked file appears.
+- Working-tree state here is scoped to the cached-negative path. Whole-scope
+  working-tree semantics for a LIVE absence is item 5 and is not in this release.
+- `revalidated` published in `schemas/retrieval-verdict.schema.json`. New
+  `tests/test_v1_108_178.py` (20). No tool-count or INDEX_VERSION change.
+
+## [1.108.177] - 2026-07-26 - an omitted match is not an absent match
+
+### Fixed
+
+- **The token-budget packer could mint an absence proof over a corpus that
+  contained the target.** Raised as item 1 of the
+  [#377](https://github.com/jgravelle/jcodemunch-mcp/issues/377) post-ship
+  review by @mightydanp, and confirmed in the shipped code: `search_symbols`
+  saved `heap_count` before packing and then passed the POST-packing count into
+  `build_verdict`. Matching symbols that did not fit the remaining token budget
+  left `result_count == 0`, the verdict reached `absent`, and a citable
+  `evidence_ref` was issued. An empty response is not an empty search.
+- `build_verdict` gains `matches_before_packing`. When the response is empty and
+  matches were found, the state is `degraded` and the note says how many were
+  dropped. Disclosed on every state as `verdict.omitted` — a caller reading a
+  short result list deserves to know matches were omitted whether or not an
+  absence claim is involved. `search_symbols` reports the pre-packing heap;
+  `get_ranked_context` reports the candidate set (item 8: candidates that could
+  not be packed are not a no-match; the zero-candidate case returns earlier).
+- **`search_text` counted only the files it managed to open** (item 7). A file
+  whose safe content path could not be produced, or that raised `OSError`, was
+  skipped by a bare `continue` — so 3 unreadable files out of 10 read as a
+  complete sweep of 7. Now counted and reported as
+  `verdict.incomplete.reason = "unreadable_inputs"`.
+- **An empty scope proved absence** (item 9). A `file_pattern` matching zero
+  indexed files searched nothing and returned `absent`. Now
+  `verdict.incomplete.reason = "empty_scope"`.
+- **`search_text` never passed index freshness into its verdict**, so the stale
+  gate its sibling tools enforce could not fire on a `search_text` absence. It
+  now builds the same `FreshnessProbe` and reports `channels.index`.
+- **A display preference decided whether a scan was citable** (item 10).
+  `meta_fields` filtering ran BEFORE the absence-evidence block, so
+  `meta_fields: []` (the shipped default) deleted the verdict and the evidence
+  was never recorded, while the narrower `meta_fields: ["verdict"]` deleted
+  `index_truncated` and handed `note_absence` a truncated scan as untruncated —
+  minting exactly the ref the truncation gate exists to refuse. The argument
+  contract and the absence block now run against the complete internal result,
+  and what filtering removes is re-attached afterwards as
+  `_meta.absence_evidence` (the carrier shape jdocmunch and jdatamunch already
+  use). `absence_evidence` joins `UNIVERSAL_META_JSON` so it survives compact
+  encoding (item 11).
+- **`suppress_meta` was treated as a caller mistake.** It is read by the
+  dispatcher, so no per-tool schema declares it; v1.108.175 therefore counted it
+  as an ignored argument, downgraded the verdict, and cost a well-formed call its
+  absence evidence. Added to `PROTOCOL_KEYS` with `_current_model`. Found while
+  wiring item 10, not reported.
+
+### Changed
+
+- Evidence identity now includes the effective search operation (item 12):
+  `is_regex`, `decorator`, `semantic`, `semantic_only`, `semantic_weight`,
+  `fuzzy`, `fuzzy_threshold`, `fusion`, `sort_by`, `strategy` join `_SCOPE_ARGS`.
+  A literal substring search and a regex search of the same string are different
+  operations and must not collide on one absence id.
+
+### Notes
+
+- **Same shape as every gate before it: disclose on every state, refuse only the
+  absence CLAIM, and express the refusal as a downgrade** so
+  `handoff.absence_refusal` does the refusing and there is no second rule to keep
+  in sync. The refusals name their cause rather than falling through to the
+  generic "the verdict was degraded".
+- The legacy `negative_evidence` block is suppressed for a packed-empty or
+  incomplete scan. `search_symbols` renders it as "Do not claim this feature
+  exists", which is false when the matches were found and dropped by the packer.
+- **Zero blast radius for a producer that reports nothing:** `build_verdict`
+  without `matches_before_packing` is byte-identical to before, pinned by a test.
+- `omitted` and `incomplete` published in `schemas/retrieval-verdict.schema.json`.
+- New `tests/test_v1_108_177.py` (26), non-vacuity proven on the live path: the
+  same packed-empty scan reported the old way is `absent` and mints a ref.
+- No tool-count or INDEX_VERSION change.
+
+## [1.108.176] - 2026-07-26 - a partial index stops reporting itself fresh
+
+### Fixed
+
+- **#375 sub-problem C: freshness answered the wrong question.** The reported
+  symptom: *"it has learned about 7,659 of 9,634 code files. But it still
+  reports itself as up to date. So 'I never learned that file' and 'that file
+  doesn't exist' look identical to every agent."* That ambiguity is why a paying
+  user moved their default code lookup to another tool.
+- The check was not broken; it was answering a different question. Freshness
+  compares index SHA against git HEAD, which asks *is the index BEHIND the tree
+  in time* — and was being read as *does the index COVER the tree*. A corpus
+  that dropped files at index time sits at the SAME SHA as the checkout, so it
+  truthfully reported `fresh` while whole files were missing.
+- Underneath it, `index_folder`'s second pass dropped files with **three
+  uncounted `continue`s** (`validate_path` failure, `relative_to` failure,
+  no-language). The corpus could end up smaller than the walk reported with
+  nothing anywhere recording the difference.
+
+### Added
+
+- Post-discovery drops are now counted by reason (`outside_root`,
+  `no_language`, `stat_failed`) and persisted with the coverage contract.
+- The coverage contract records `files_accepted` (what the walk handed
+  downstream) alongside `files_indexed` (what survived), plus `unaccounted` for
+  any remainder no named reason explains.
+- New `channels.index: "partial"`, disclosed on every state.
+
+### Notes
+
+- **`complete` is tri-state on purpose: true / false / null-for-unknown.** An
+  index predating this accounting reports null, and null must never be read as
+  true — an index that cannot account for itself is not thereby complete. Every
+  pre-upgrade index therefore behaves byte-identically until it is re-indexed.
+- **Disclose on every state, refuse only the absence CLAIM.** A zero-result over
+  a corpus with known gaps degrades, because a file that never entered the
+  corpus cannot be proven absent from it. Hits are still real hits. Because the
+  refusal is expressed as a downgrade, `handoff.absence_refusal` does the
+  refusing and there is no second rule to keep in sync — the same shape as the
+  stale, truncated and rebuilding gates.
+- Channel precedence is by how badly each condition undermines the answer:
+  `rebuilding` > `partial` > `stale` > `fresh`.
+- **A partial walk over a wider index reports unknown, not incomplete.** v1.96
+  subdir-merge and branch-delta modes walk a prefix while the index carries the
+  rest, so reconciliation does not describe that shape and must not fire a false
+  incomplete.
+- ⚠ **The published `retrieval-verdict` schema closes `channels` AND the
+  `coverage` block, so both had to be extended or every mid-gap response would
+  fail our own contract** (`test_provenance.py` validates live responses). That
+  is the v1.108.168 trap; it fired again here on the coverage block and was
+  caught by validating the projected shape, not the raw persisted one.
+- Measured against this repo before shipping, to be sure the signal is not
+  noise: 672 accepted, 672 indexed, `complete: true`. No false positives.
+- New `tests/test_v1_108_176.py` (20), non-vacuity proven: with the gate
+  disabled a corpus with two provably-missing files still returns `absent` +
+  `fresh` and mints `absent:cda93cdd5447`.
+- No tool-count or INDEX_VERSION change.
+
+## [1.108.175] - 2026-07-25 - an ignored argument cannot prove absence
+
+### Fixed
+
+- **A misspelled parameter no longer produces a citable absence proof.** Found
+  live while auditing
+  [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375): a `search_text`
+  call passed `regex=true`, but the parameter is `is_regex`. Every tool reads its
+  arguments key-by-key (`arguments.get("is_regex", False)`), so the flag was
+  dropped in silence, the regex SOURCE TEXT was searched as a literal substring,
+  nothing matched, and the response reached `state: "absent"` with the note
+  "treat this as strong evidence the target is not present" plus a citable
+  `evidence_ref` — over a corpus that plainly contained the target. Reproduced
+  and pinned: with the gate disabled the same call still mints
+  `absent:2a1a6b8520c3`.
+- The dispatcher now compares each call's arguments against the tool's published
+  `inputSchema` and, when keys were discarded, attaches
+  `_meta.ignored_arguments` and downgrades an `absent` verdict to `degraded`
+  with a note naming the offending keys.
+
+### Notes
+
+- **Disclose on every state, refuse only the absence CLAIM** — the same shape as
+  the `rebuilding` gate in 1.108.168. Results an `ok` scan returned were really
+  in the index and are still the best available answer; only the claim that
+  nothing exists is unfounded. Because the refusal is expressed as a downgrade,
+  `handoff.absence_refusal` does the refusing and there is no second rule to keep
+  in sync.
+- **Deliberately never rejects the call.** Under the 1.x zero-surprise contract
+  an unknown key has always been accepted, so a client that has been sending a
+  harmless extra for a year must not start erroring, and a hard reject would turn
+  a recoverable mistake into a dead call. Disclosure is strictly additive.
+- **An unknown schema accuses nobody.** When a tool's declaration cannot be read
+  the check returns nothing rather than guessing, so it can never manufacture a
+  warning about a legitimate key.
+- New `UNIVERSAL_META_JSON` in `encoding/schema_driven.py`: structured `_meta`
+  keys every encoder preserves whether or not its own schema listed them. A
+  per-schema allowlist is right for tool payloads and wrong for CONTRACT keys —
+  the encoder drops the key, the response still looks complete, and the field
+  that said "don't trust this" is the one that vanishes. That is how the verdict
+  contract went invisible in 1.108.169; adding a key to 45 tuples only
+  guarantees the 46th encoder forgets it.
+- New `tests/test_v1_108_175.py` (21). No schema, tool-count, or INDEX_VERSION
+  change.
+
+## [1.108.174] - 2026-07-25 - an empty index says so
+
+### Added
+
+- **`list_repos` reports an empty store instead of returning a bare zero.**
+  Raised in correspondence on
+  [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375). A user ran the
+  suite for months with jdatamunch holding zero datasets and jdocmunch holding
+  three documents, and only discovered it by going looking. Their summary of the
+  class: every tool answers confidently regardless of how little it holds, so an
+  agent cannot tell "I searched everything and it is not there" from "I have
+  almost nothing indexed". Their words on the fix: "we would have fed both tools
+  months ago."
+
+  An empty listing is the one case where that ambiguity is trivially removable,
+  because zero indexed repositories is a fact rather than an inference. When
+  nothing is indexed, `list_repos` now adds `empty: true` and a `hint` naming
+  the command that fixes it and why it matters.
+
+  ⚠ Top-level rather than under `_meta` deliberately: the sibling servers strip
+  `_meta` by default, so a nudge placed there would be deleted before the agent
+  ever saw it. Same key names across all three servers.
+
+  Additive and silent once anything is indexed: no key, no token, no behavior
+  change. New `tests/test_v1_108_174.py` (4). Suite parity: jdatamunch-mcp
+  v1.28.0. NO schema, tool-count, or INDEX_VERSION change.
+
+## [1.108.173] - 2026-07-25 - exact-match honesty: a fuzzy near-miss stops looking like a hit
+
+### Fixed
+
+- **`search_symbols` reported token-overlap guesses as confident matches.**
+  Raised in correspondence on
+  [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375): a user searched
+  the exact token `runPromiseFulfillmentCheck`, a function committed that day and
+  not yet indexed. Instead of "no exact match" they got ten ranked hits on the
+  substring "fulfillment" (order fulfilment, shipping routing, PHP helpers)
+  formatted exactly like real hits. In their words, that turns a missing index
+  into confident misinformation.
+
+  Reproduced against this repo: `extractMountsFulfillmentCheck` returned
+  `_extract_mounts`, `TestExpressRouterMount` and `_JS_MOUNT` under
+  `state: "ok"` with the note **"Confident matches returned."** The verdict was
+  actively vouching for guesses.
+
+  BM25 tokenization is the cause and is not itself wrong: the query splits into
+  run/promise/fulfillment/check, so token overlap scores. Correct for prose,
+  misleading for an identifier.
+
+  `search_symbols` now attaches `_meta.exact_match`
+  (`{queried, found, exact, prefix, note}`) when the query is a single
+  source-shaped identifier, and **downgrades an `ok` verdict to
+  `low_confidence`** when nothing exact or prefix-matching came back. Results are
+  labelled, not suppressed: they are still the best available guesses.
+
+  Deliberately NOT `absent`. Results were returned, and under the absence
+  contract only `absent` proves absence, so `low_confidence` cannot be cited as
+  evidence the symbol does not exist.
+
+  Scope is deliberately narrow. Only a single identifier-shaped token qualifies
+  (camel, snake, qualified, dunder), reusing the `query_shape` classifier from
+  v1.108.137. Prose, multi-word queries, filenames, and **bare lowercase words**
+  are untouched and byte-identical: without an interior case change or an
+  underscore there is nothing separating "I am naming a symbol" from "I am
+  describing a topic", and guessing wrong would stamp a false negative on an
+  ordinary keyword search.
+
+  ⚠ `exact_match` is added to `_META_JSON` in the `search_symbols` encoder. A
+  structured `_meta` value left off that allowlist is **silently dropped** by
+  MUNCH compaction, which is exactly how the whole verdict contract went
+  invisible in v1.108.169; a test pins the round-trip.
+
+New `tests/test_v1_108_173.py` (24). NO schema, tool-count, or INDEX_VERSION
+change.
+
+## [1.108.172] - 2026-07-25 - idle index-cache TTL (opt-in) + process presence registry
+
+### Added
+
+- **`get_session_stats` now reports how many jCodeMunch processes share this
+  index store.** Follow-up to
+  [#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375), where a user
+  found **25+ live instances** on one box against a single ~140MB store, ages to
+  1d15h, mostly stdio servers their MCP client never reaped at session end.
+  Reaping the day-plus-old ones freed **~17 GB of RAM**. Nobody could see it.
+
+  We cannot reap another program's children. New `storage/process_registry.py`
+  makes the sprawl visible instead: each server writes one small
+  `~/.code-index/_processes/<pid>.json` (pid, client, transport, version, start
+  time — no repos, paths, or queries) and removes it on exit. Readers filter by
+  PID liveness and prune what they find dead, so a hard kill leaves nothing
+  behind and there is no daemon keeping the registry honest. Surfaced as a
+  `processes` block; a hint naming the memory lever appears only past 5 live
+  processes, so a normal setup stays quiet. Wrapped so a registry failure can
+  never fail a stats call. Disclosed in the README background-behavior section.
+
+- **`JCODEMUNCH_INDEX_CACHE_TTL`: opt-in idle eviction for the in-memory index
+  cache.** A hydrated `CodeIndex` is large and was released only under LRU
+  pressure (`_CACHE_MAX_SIZE = 32`), never on idle, so an abandoned process sat
+  on every index it had touched. The same fact appeared in #370 as one worker at
+  ~16 GiB.
+
+  ⚠ **Disabled by default, and it must stay that way.** Cold hydration of that
+  665k-symbol index was measured at 7.5 to 11.4 minutes, so a TTL that evicts
+  during a quiet spell hands the next query that bill. Defaulting it on would
+  fix the leaking box by breaking the large-index one. Unset, `0`, negative, or
+  unparseable all mean disabled, which is byte-identical to previous behavior.
+  Swept on access rather than by a timer thread: a leaked process makes no
+  calls, so it needs no timer to stay small.
+
+### Fixed
+
+- **`_is_pid_alive` reported dead Windows processes as alive.** Uncovered while
+  testing the registry. A successful `OpenProcess` does not mean the process is
+  running: while any handle to it remains open the PID stays queryable after
+  exit, and the parent that spawned it normally holds exactly such a handle. So
+  a killed child read as alive.
+
+  This is a shared primitive. `process_locks.inspect` treats a dead holder's
+  lock as stale and ignorable, so a crashed server's lock file could look
+  permanently held. Now checks `GetExitCodeProcess` for `STILL_ACTIVE`, and
+  falls back to the old answer if the call fails rather than declaring a
+  possibly-live process dead. Also sets the `argtypes`/`restype` that were
+  missing: `OpenProcess` returns a pointer-sized HANDLE and ctypes defaults the
+  return type to `c_int`, truncating it on 64-bit — the same trap already
+  documented for `GetProcessTimes`. On POSIX, a zombie now reads as dead via
+  `/proc/<pid>/stat` (best effort; reap state is only visible for our own
+  children).
+
+New `tests/test_v1_108_172.py` (21), including a real spawn-and-kill check that
+fails against the pre-fix liveness logic. NO schema, tool-count, or
+INDEX_VERSION change.
+
+## [1.108.171] - 2026-07-25 - provider discovery no longer scans in quadratic time
+
+### Fixed
+
+- **A single large file could hang `index_folder` for minutes at 100% CPU, before
+  file indexing even started.** Reported on Ubuntu against a ~40-file subtree
+  ([#375](https://github.com/jgravelle/jcodemunch-mcp/issues/375)): the call ran
+  4m0s at ~99% CPU, emitted no progress and no log line, and did not complete.
+  With `context_providers` disabled the same index finished in **5.1s**.
+
+  A mid-stall `py-spy` dump pinned every sample inside
+  `ExpressProvider._extract_mounts`, reached through `discover_providers` ->
+  `_resolve_active_providers`. Provider discovery runs BEFORE the file walk, so
+  the whole index hung with nothing to show for it.
+
+  Cause: a leading uncaptured `(?:\w+)` before the `\.` in **six** patterns
+  across two providers (`_JS_ROUTE`, `_JS_MIDDLEWARE`, `_JS_MOUNT`, `_GO_ROUTE`,
+  `_GO_MIDDLEWARE`, `_GO_GROUP`). It asserts nothing the `.` does not already
+  imply, but it makes the scan **quadratic**: at every offset inside an unbroken
+  word run the engine matches the run greedily, fails on the `.`, then
+  backtracks a character at a time. One minified chunk or base64 blob in a
+  single source file is enough to trigger it.
+
+  Measured on a lone `\w` run, before -> after: 8k chars 0.45s -> 0.00001s,
+  32k 7.5s -> 0.00002s, 128k **over 120s** -> 0.00006s. Every provider regex in
+  the package now scans a 128k run in 0.0104s in total.
+
+  Extraction is unchanged: the dropped group was uncaptured, and the `.` still
+  requires a receiver. Dropping it is marginally more permissive (it now also
+  matches `getRouter().use(...)`), which is a correctness gain, not a loss.
+
+  New `tests/test_v1_108_171.py` (11). The scaling guard is **empirical, not a
+  pattern-text assertion** — a future provider can reintroduce the blowup with
+  different syntax and only timing catches that — plus a non-vacuity check, and
+  a named pin on the six so a careless revert fails with an obvious message
+  rather than a stopwatch. Verified non-vacuous: reintroducing the prefix on one
+  pattern turns the suite red in 11.6s across three tests.
+
+  NO schema, tool-count, or INDEX_VERSION change.
+
 ## [1.108.170] - 2026-07-25 - the file and symbol tools can see a rebuild too
 
 ### Fixed

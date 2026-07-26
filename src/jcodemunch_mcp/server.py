@@ -22,6 +22,7 @@ from mcp.types import Tool, ToolAnnotations, TextContent, Resource, Prompt, Prom
 from . import __version__
 from . import config as config_module
 from . import runtime_identity
+from .tools import _arg_contract
 # Tool modules are imported lazily inside each call_tool() dispatch branch.
 # This defers loading heavy dependencies (tree-sitter, httpx, pathspec) until
 # the first actual call to a tool that needs them, reducing cold-start latency
@@ -328,6 +329,34 @@ def _raw_catalog_tools() -> list:
     if _RAW_CATALOG is None:
         _build_tools_list()  # populates _RAW_CATALOG as a side effect
     return _RAW_CATALOG or []
+
+
+# Declared on the REGISTERED evidence producers only (#377 phase 2), so that
+# passing it to a tool that cannot mint is surfaced as an ignored argument rather
+# than silently accepted — the v1.108.175 contract doing its job. Kept as one
+# string so the four producers cannot drift into describing it differently.
+_RECEIPT_ARG_DESCRIPTION = (
+    "Opt in to an immutable evidence receipt (jcodemunch.evidence/v1). Response "
+    "carries only the id in _meta.receipts; read the body from munch://evidence/<id>. "
+    "Binds the exact subject (symbol id, line range, content hash) and the snapshot "
+    "it was measured against, so a handoff citing it attests what was retrieved "
+    "rather than the whole file. Default false = unchanged response."
+)
+
+_DECLARED_ARG_KEYS: "Optional[dict]" = None
+
+
+def _declared_arg_keys(name: str):
+    """Declared inputSchema property names for a tool, or None if unknown.
+
+    Built from the same catalog `list_tools` publishes, snapshotted BEFORE the
+    compact-schemas strip, so the contract can never drift from what the tool
+    actually accepts. None (not an empty set) when the tool or its schema is
+    missing: an absent declaration is not evidence that a caller's key is wrong.
+    """
+    if _DECLARED_ARG_KEYS is None:
+        _build_tools_list()  # populates the snapshot as a side effect
+    return (_DECLARED_ARG_KEYS or {}).get(name)
 
 
 def _catalog_rows() -> "list[dict]":
@@ -659,21 +688,29 @@ async def _apply_model_announcement(model: str) -> dict:
 # Parameters stripped from tool schemas when compact_schemas is enabled.
 # These are advanced/rarely-used params that cost tokens every session but
 # are used <5% of the time.  The underlying handler still accepts them.
+#
+# `receipt` (v1.108.183) is stripped from all four evidence producers for the
+# same reason and with the same guarantee: the core_compact ceiling is 4000
+# tokens and it sits at 3996, so a param declared on four core tools does not
+# fit there at any description length. The dispatcher honors it regardless, and
+# `_DECLARED_ARG_KEYS` is snapshotted before this strip runs, so a hidden-but-
+# honored param is never reported as an ignored argument.
 _COMPACT_STRIP_PARAMS: dict[str, set[str]] = {
     "search_symbols": {
         "debug", "fusion", "semantic", "semantic_only", "semantic_weight",
         "fuzzy", "fuzzy_threshold", "max_edit_distance", "sort_by", "fqn",
-        "decorator", "token_budget",
+        "decorator", "token_budget", "receipt",
     },
     # Bounded-source mode is an advanced opt-in; the tool still accepts these
     # params under compact, they're just hidden from the schema to protect the
     # core_compact budget (the body is always callable with them).
     "get_symbol_source": {
         "source_start_line", "source_end_line", "max_source_lines",
-        "max_source_bytes", "max_total_source_bytes",
+        "max_source_bytes", "max_total_source_bytes", "receipt",
     },
     "get_context_bundle": {"budget_strategy"},
-    "get_ranked_context": {"detail_level", "compress"},
+    "get_ranked_context": {"detail_level", "compress", "receipt"},
+    "search_text": {"receipt"},
     "get_blast_radius": {"cross_repo", "max_depth"},
     "get_endpoint_impact": {"include_infra"},
     "index_dependency": {"ecosystem", "max_files"},
@@ -1598,6 +1635,11 @@ def _build_tools_list() -> list[Tool]:
                     "max_total_source_bytes": {
                         "type": "integer",
                         "description": "Bounded mode (batch): cap on total returned source bytes across all symbols. Oversized symbols come back partial (source_truncated) rather than dropped, preventing an N×per-symbol blowup."
+                    },
+                    "receipt": {
+                        "type": "boolean",
+                        "description": _RECEIPT_ARG_DESCRIPTION,
+                        "default": False
                     }
                 },
                 "required": ["repo"]
@@ -1725,6 +1767,11 @@ def _build_tools_list() -> list[Tool]:
                     "fqn": {
                         "type": "string",
                         "description": "PHP fully-qualified class name (e.g. 'App\\Models\\User'). Resolves via PSR-4 and uses the class name as query. Alternative to query."
+                    },
+                    "receipt": {
+                        "type": "boolean",
+                        "description": _RECEIPT_ARG_DESCRIPTION,
+                        "default": False
                     }
                 },
                 "required": ["repo", "query"]
@@ -1776,6 +1823,11 @@ def _build_tools_list() -> list[Tool]:
                         "type": "integer",
                         "description": "Lines of context to include before and after each match (like grep -C N). Essential for understanding code around matches.",
                         "default": 0
+                    },
+                    "receipt": {
+                        "type": "boolean",
+                        "description": _RECEIPT_ARG_DESCRIPTION,
+                        "default": False
                     }
                 },
                 "required": ["repo", "query"]
@@ -3629,6 +3681,11 @@ def _build_tools_list() -> list[Tool]:
                         "description": "Keystone-protected structural compression: prune low-signal lines from oversized bodies so more relevant symbols fit the budget (control-flow/returns/signatures always kept). Model-free; pruned items carry source_pruned + line counts. Default False.",
                         "default": False,
                     },
+                    "receipt": {
+                        "type": "boolean",
+                        "description": _RECEIPT_ARG_DESCRIPTION,
+                        "default": False,
+                    },
                 },
                 "required": ["repo", "query"],
             },
@@ -4182,8 +4239,22 @@ def _build_tools_list() -> list[Tool]:
     ]
     # --- The Counter: register the front door + capture the raw catalog ------
     all_tools = all_tools + _counter_front_door_tools()
-    global _RAW_CATALOG
+    global _RAW_CATALOG, _DECLARED_ARG_KEYS
     _RAW_CATALOG = list(all_tools)
+    # Snapshot the DECLARED argument surface here, before the compact-schemas
+    # strip below. `compact_schemas` pops rarely-used params out of the published
+    # schema while "the underlying handler still accepts them"
+    # (_COMPACT_STRIP_PARAMS), and it pops them out of the same dicts _RAW_CATALOG
+    # holds — so building the argument contract from that catalog afterwards made
+    # a hidden-but-honored param look like a caller mistake, which downgrades the
+    # verdict and costs a well-formed call its absence evidence. Exactly the
+    # `suppress_meta` bug from v1.108.177, one layer down. Key sets are frozen
+    # values, so this snapshot cannot be mutated by the strip.
+    _DECLARED_ARG_KEYS = {
+        t.name: frozenset(props)
+        for t in all_tools
+        if isinstance((props := (t.inputSchema or {}).get("properties")), dict) and props
+    }
     surface = _effective_surface()
     if surface == "counter":
         # Collapse to the front door + always-present controls. Tier filtering
@@ -4322,6 +4393,20 @@ async def list_resources() -> list[Resource]:
                 mimeType=_handoff.HANDOFF_CONTENT_TYPE,
             )
         )
+    # Evidence receipts (jcodemunch.evidence/v1, #377 phase 2). A resource, not a
+    # tool: the tool-schema budget is a real constraint, and a receipt is read on
+    # demand by a client that wants the body rather than shipped inside every
+    # response.
+    from .evidence import receipts as _receipts
+    for row in _receipts.list_evidence_resources():
+        resources.append(
+            Resource(
+                uri=row["uri"],
+                name=row["name"],
+                description=row["description"],
+                mimeType=_receipts.EVIDENCE_CONTENT_TYPE,
+            )
+        )
     return resources
 
 
@@ -4344,6 +4429,22 @@ async def read_resource(uri) -> "list[ReadResourceContents]":
                 mime_type=_handoff.HANDOFF_CONTENT_TYPE,
             )
         ]
+    from .evidence import receipts as _receipts
+    if str(uri).startswith(_receipts.EVIDENCE_URI_PREFIX):
+        envelope = _receipts.evidence_for_uri(str(uri))
+        if envelope is not None:
+            return [
+                ReadResourceContents(
+                    # Deterministic: repeated reads of one receipt are
+                    # byte-identical. A proof that renders differently on the
+                    # second read is not a proof.
+                    content=_receipts.envelope_json(envelope),
+                    mime_type=_receipts.EVIDENCE_CONTENT_TYPE,
+                )
+            ]
+        # Name the failure rather than collapsing every miss into "unknown".
+        _envelope, _why = _receipts.lookup(str(uri))
+        raise ValueError(f"Evidence receipt not available ({_why}): {uri}")
     raise ValueError(f"Unknown resource: {uri}")
 
 
@@ -6268,6 +6369,103 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         except Exception:
             logger.debug("Agent selector scoring failed", exc_info=True)
 
+        # Argument contract (v1.108.175): every tool reads its arguments
+        # key-by-key, so a misspelled parameter is dropped in silence and the
+        # call that runs is not the call that was asked for. Disclose the
+        # ignored keys on every state, and downgrade `absent` to `degraded` so
+        # the absence-refusal rule below does the refusing — MUST run before the
+        # absence-evidence block for that to hold.
+        #
+        # #377 hardening item 10 moved this ahead of presentation filtering, so
+        # anything it attaches is re-attached below once filtering has run.
+        _ignored: list[str] = []
+        try:
+            _ignored = _arg_contract.unrecognized_keys(
+                arguments, _declared_arg_keys(name)
+            )
+            if _ignored:
+                _arg_contract.apply_argument_contract(result, _ignored)
+                logger.debug("Ignored unknown arguments for %s: %s", name, _ignored)
+        except Exception:
+            logger.debug("Argument-contract check failed", exc_info=True)
+
+        # Absence evidence (#377 phase 3): record every absence-shaped verdict
+        # so a handoff claim can cite the SCAN when nothing was served, and
+        # hand the caller the citable ref in-band. A ref is only surfaced when
+        # the scan can actually prove absence; otherwise the verdict says so,
+        # rather than offering a token that would be refused at finalization.
+        #
+        # #377 hardening item 10: this MUST run before presentation filtering.
+        # `meta_fields` is a display preference, and a display preference must
+        # never decide whether a scan counts as complete — filtering first meant
+        # `meta_fields: []` silently deleted the evidence, and the narrower
+        # `meta_fields: ["verdict"]` deleted `index_truncated` while keeping the
+        # verdict, so a TRUNCATED scan reached note_absence as untruncated and
+        # minted a citable ref the truncation gate exists to refuse.
+        _absence_carrier: dict | None = None
+        try:
+            if isinstance(result, dict):
+                _v = (result.get("_meta") or {}).get("verdict")
+                if isinstance(_v, dict):
+                    from . import handoff as _handoff_abs
+                    _ref, _why = _handoff_abs.note_absence(
+                        name,
+                        repo_arg,
+                        arguments.get("query"),
+                        _v,
+                        arguments=arguments,
+                        truncated=bool((result.get("_meta") or {}).get("index_truncated")),
+                    )
+                    if _ref:
+                        _v["evidence_ref"] = _ref
+                        _absence_carrier = {"ref": _ref, "citable": True}
+                    elif _why and (
+                        _v.get("state") == "absent" or _v.get("absence_refused")
+                    ):
+                        # v1.108.184: `absence_refused` widens this to every
+                        # zero-result scan whose absence claim was refused, not
+                        # just the ones that still read `absent`. Every gate since
+                        # v1.108.166 works by DOWNGRADING to `degraded`, so gating
+                        # the disclosure on `absent` meant the better the gate
+                        # worked, the less the caller was told: a refused scan came
+                        # back as a bare empty response, and on a default install
+                        # (`meta_fields: []`) with no verdict either.
+                        _v["absence_citable"] = False
+                        _v["absence_blocked_by"] = _why
+                        _absence_carrier = {"citable": False, "blocked_by": _why}
+        except Exception:
+            logger.debug("Absence-evidence record failed", exc_info=True)
+
+        # Evidence receipts (#377 phase 2): opt-in per call. A receipt binds one
+        # canonical subject to one snapshot and one effective operation, so a
+        # file-level citation stops being indistinguishable from a symbol-level
+        # one. Default off means today's bytes, exactly.
+        #
+        # Runs AFTER the absence block, because an absence receipt links to the
+        # scan that block recorded; and BEFORE presentation filtering, for the
+        # same reason that block does (#377 item 10) — a display preference must
+        # never decide what a scan proved. The carrier is re-attached below.
+        #
+        # Minting is gated on producer registration: an unregistered tool, or a
+        # registered tool's unreviewed exit, mints nothing. That is what makes
+        # the v1.108.179 early-return class structural instead of remembered.
+        _receipt_carrier: dict | None = None
+        try:
+            if arguments.get("receipt") is True and isinstance(result, dict):
+                from .evidence import producers as _receipt_producers
+                _receipt_carrier = await asyncio.to_thread(
+                    functools.partial(
+                        _receipt_producers.mint,
+                        name,
+                        arguments,
+                        result,
+                        repo_arg,
+                        storage_path,
+                    )
+                )
+        except Exception:
+            logger.debug("Evidence-receipt minting failed", exc_info=True)
+
         if isinstance(result, dict):
             meta_fields = config_module.get("meta_fields")
             if meta_fields == [] or arguments.get("suppress_meta"):
@@ -6297,6 +6495,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                             _item_filtered["powered_by"] = "jcodemunch-mcp by jgravelle · https://github.com/jgravelle/jcodemunch-mcp"
                         if _item_filtered:
                             _item["_meta"] = _item_filtered
+
+            # #377 hardening item 10: re-attach the contract keys when they did
+            # not survive filtering. Both blocks now run against the COMPLETE
+            # internal result — the point of the reorder — so what a display
+            # preference removes has to be put back deliberately rather than
+            # avoided by deciding safety after the fields were deleted. Same
+            # shape jdocmunch and jdatamunch already use, because their default
+            # config strips `_meta` outright. jcodemunch's default is
+            # `meta_fields: []`, so this is the normal path, not the edge case.
+            if _ignored and "ignored_arguments" not in (result.get("_meta") or {}):
+                result.setdefault("_meta", {})["ignored_arguments"] = _ignored
+            if _absence_carrier and "verdict" not in (result.get("_meta") or {}):
+                result.setdefault("_meta", {})["absence_evidence"] = _absence_carrier
+            if _receipt_carrier:
+                # Unconditional, unlike the absence carrier: the receipt id has
+                # no home in the verdict, so there is no "already present" case
+                # and nothing for a filter to have left behind.
+                result.setdefault("_meta", {})["receipts"] = _receipt_carrier
+
         # Per-call pulse for downstream consumers (dashboards, monitors)
         _saved = result.get("_meta", {}).get("tokens_saved", 0) if isinstance(result, dict) else 0
         _write_pulse(name, tokens_saved=_saved, base_path=storage_path)
@@ -6352,32 +6569,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 _requested_format = "json"
         except Exception:
             logger.debug("Steering attach failed", exc_info=True)
-
-        # Absence evidence (#377 phase 3): record every absence-shaped verdict
-        # so a handoff claim can cite the SCAN when nothing was served, and
-        # hand the caller the citable ref in-band. A ref is only surfaced when
-        # the scan can actually prove absence; otherwise the verdict says so,
-        # rather than offering a token that would be refused at finalization.
-        try:
-            if isinstance(result, dict):
-                _v = (result.get("_meta") or {}).get("verdict")
-                if isinstance(_v, dict):
-                    from . import handoff as _handoff_abs
-                    _ref, _why = _handoff_abs.note_absence(
-                        name,
-                        repo_arg,
-                        arguments.get("query"),
-                        _v,
-                        arguments=arguments,
-                        truncated=bool((result.get("_meta") or {}).get("index_truncated")),
-                    )
-                    if _ref:
-                        _v["evidence_ref"] = _ref
-                    elif _why and _v.get("state") == "absent":
-                        _v["absence_citable"] = False
-                        _v["absence_blocked_by"] = _why
-        except Exception:
-            logger.debug("Absence-evidence record failed", exc_info=True)
 
         # Response-level secret redaction — scrub leaked credentials
         # before they reach the LLM context window. Skipped for tools that
@@ -9667,6 +9858,27 @@ def main(argv: Optional[list[str]] = None):
                     "'jcodemunch-mcp[watch]'"
                 )
                 watcher_enabled = False
+
+        # Presence registry (jcm#375 follow-up): record that this server process
+        # exists so `get_session_stats` can report how many jcodemunch servers
+        # share this index store. A client that never reaps stdio servers at
+        # session end accumulates them silently (25+ were found on one box,
+        # holding ~17 GB between them). We cannot reap another program's
+        # children; we can stop the sprawl being invisible. Registered here,
+        # above both serve branches, so every transport is covered once. Best
+        # effort, and never allowed to block startup.
+        try:
+            from .storage.process_registry import (
+                register as _register_process,
+                unregister as _unregister_process,
+            )
+            _register_process(
+                args.transport, __version__, os.environ.get("CODE_INDEX_PATH")
+            )
+            import atexit
+            atexit.register(_unregister_process)
+        except Exception:
+            logger.debug("process registry: register failed", exc_info=True)
 
         if watcher_enabled:
             # Watcher params: CLI flag > config > default
