@@ -1,14 +1,14 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.108.185 — **Fusion gets a verdict, and fusion CAN prove absence. EVERY retrieval exit in the suite now carries a verdict.** The last two silent exits (`_search_symbols_fusion`, `_get_ranked_context_fusion`) emitted no verdict AND no negative evidence — nothing false, nothing honest either. Both now build the same verdict as their tools' other exits and finally receive `_state_before` (#377 item 6). ⚠ **THE REVIEW REACHED THE OPPOSITE CONCLUSION TO .184's, which is why modes are REVIEWED rather than having a rule ported onto them: `build_lexical_channel` and `build_identity_channel` each score EVERY eligible candidate with no cap, and `fuse` keeps every symbol appearing in ANY channel — so an empty fused set means every candidate scored zero on both BM25 and identity, the same CORPUS FACT the lexical path's absence rests on. The similarity channel can only ADD symbols, never remove one, so its absence weakens RANKING and cannot manufacture a false absence. That asymmetry is what the semantic exit lacked ⇒ semantic carries `absence_unprovable`, fusion does not.** ⚠ **DEFECT 1, and it made `absent` unreachable anyway: `build_structural_channel` treated "restrict to NOTHING" as "no restriction" (`if candidate_ids and ...` — a FALSY check), while both callers pass `lexical ∪ identity`. A query matching nothing produced an EMPTY set, skipped the filter, and let every symbol with nonzero PageRank in — so a no-match fusion query returned THE WHOLE REPOSITORY ranked by centrality, and with no verdict nobody could see it was reporting centrality as relevance.** `None` and `set()` are now different. ⚠ **DEFECT 2, a read that WROTE: `EmbeddingStore._connect` runs a WAL pragma + CREATE-TABLE on EVERY connection, so the fusion "does this repo have embeddings" probe wrote to the db it was reading, bumped `_db_mtime_ns`, and made the FIRST fusion search of any process report `rebuilding` + `moved_during_scan` ⇒ `degraded` ⇒ `absent` unreachable. Same defect `runtime/confidence.py` was fixed for.** New `get_all_readonly`. ⚠⚠ **`mode=ro` ALONE DOES NOT FIX IT and the first attempt shipped nothing: read-only in SQLite means "cannot modify the DATABASE", not "cannot touch the filesystem" — a plain ro connection to a WAL db still CREATES the `-wal`/`-shm` sidecars (measured None → present), and `_db_mtime_ns` maxes over `.db` AND `-wal`. `immutable=1` is the flag that guarantees no sidecar; the trade-off (vectors in an un-checkpointed WAL go unread ⇒ similarity channel skipped) can only weaken RANKING, never fabricate absence.** Both no-candidate early returns now carry `incomplete: empty_scope` (#377 item 9). **NEW `verdict.retrieval_verdict_for_index`** — sibling of `symbol_verdict_for_index`/`file_verdict_for_index`; three exits shipped verdict-less because adding one meant reproducing FIVE call patterns by hand, so the wrapper is the structural answer. ⚠ **The receipt gate fired on its own author a SECOND time** (both .183 fusion pins failed) → `completeness_by_mode["fusion"]` on both producers + `fusion` in both `mode_args`. New `tests/test_v1_108_185.py` (39) incl. a drift guard that every emitted `search_mode` is declared. No tool-count/INDEX_VERSION/schema change.
-- **Prior (1.108.184):** — **A ranking cannot prove absence (closes the finding disclosed at .183).** ⚠ **`search_symbols`' SEMANTIC exit hand-rolled the legacy `negative_evidence` block and emitted NO `_meta.verdict`, so NOT ONE absence gate shipped since 1.108.166 applied to it — while it printed "Do not claim this feature exists" anyway. Third instance of the 1.108.179 early-return class.** ⚠ **REPRODUCED BEFORE TOUCHING CODE — `semantic=True, token_budget=1` over a repo CONTAINING the target returned `result_count 0` + `_meta.truncated true` + `best_match_score 53.774` + "No implementation found ... Do not claim this feature exists" + `verdict: null`. A strong match reported in the same breath as its own absence. That is the item-1 defect ("an empty RESPONSE is not an empty SEARCH") fixed on the lexical path in 1.108.177 and left standing here — what a duplicated answer costs.** The exit now builds the SAME verdict as the lexical one (every gate applies) and finally receives the pre-scan identity capture (#377 item 6) that was taken on the shared path and never handed to the diverging branch. ⚠ **NEW `verdict.absence_unprovable`: the lexical path's absence rests on a CORPUS FACT (no symbol in the index contains any query term); an embedding ranking's zero result rests on EMBEDDING GEOMETRY, and a symbol can sit in the corpus scoring at or below zero against the query vector. So a semantic/hybrid zero result is `degraded` and can NEVER reach `absent`, at any freshness or coverage. Expressed as a DOWNGRADE so `absence_refusal` does the refusing off the existing rule — no second rule. Checked LAST among the degraded gates on purpose: every gate above names something the caller can FIX.** ⚠ **SECOND FIX, systematic: a REFUSED scan now reaches a default-configured caller. Every gate since 1.108.166 works by DOWNGRADING, and the in-band disclosure was gated on the state still reading `absent` — so THE BETTER A GATE WORKED, THE LESS THE CALLER WAS TOLD. On a default install (`meta_fields: []`) a refused zero-result arrived as a bare empty response with no verdict and no reason.** New `verdict.absence_refused` (set by the verdict, the only party knowing BOTH that the result was empty and that the claim was refused — the alternative was a hand-kept per-tool result-key tuple, the class of bug that stops covering the next producer added). ⚠ **THE RECEIPT GATE CAUGHT ITS OWN AUTHOR: giving the semantic exit a verdict made it MINTABLE under a `completeness` reading "lexical BM25 over the inverted index" — false for an embedding ranking. The .183 pinning test FAILED, the mode got reviewed, and `completeness_by_mode` now declares hybrid/semantic_only separately. A capability that reads enforced and is not is the failure Phase 2 exists to prevent, so this is the design working.** `semantic`/`semantic_only`/`semantic_weight` join the receipt `mode_args` + the projector records `_meta.search_mode` (a semantic and a lexical search of one string must not collide on one evidence id). Both new blocks published in the verdict schema. ⚠ **DELIBERATELY NOT DONE: the two FUSION exits still carry no verdict — they assert nothing false (no verdict AND no absence prose), and giving them one means first deciding whether a WRR ranking that INCLUDES a lexical channel can prove absence. Its own review, pinned by a test.** New `tests/test_v1_108_184.py` (31). No tool-count/INDEX_VERSION change.
-- **Prior (1.108.183):** — **A receipt says what it proves, and only that (#377 Phase 2, P1+P2).** ⚠ **Phase 1 attested a ref matching a served symbol id OR THE FILE COMPONENT OF ONE, so citing `src/auth/session.py` was attested when `session.py::refresh_token#function` was the only thing retrieved — and the finalized handoff gave a reader no way to tell those two citations apart.** New `evidence/receipts.py` binds one canonical subject (symbol id + file + line range + `content_sha256`) to one snapshot and to the operation that actually ran, and derives the id from exactly those three, so **different snapshots cannot share an evidence id**. Read at `munch://evidence/<id>`; **NO new tool** (tool-schema budget); the response carries an **id**, not the receipt. Opt-in `receipt` arg on the four registered producers only. ⚠ **P2 is the load-bearing half and shipped together with P1 on purpose — an envelope without registration is a contract anything can mint into.** `evidence/producers.py` declares per producer: verdict shape, proof kinds, canonical projector, completeness/freshness/coverage/integrity semantics. **The early-return lesson made STRUCTURAL: minting requires a verdict of the shape the producer registered**, so an exit that asserts an answer without calling `build_verdict` cannot mint — not as a listed exception, but because it never produced the thing a receipt derives from. ⚠ **finalize_handoff: THE INPUT PICKS THE CONTRACT.** No receipt cited ⇒ historical broadening stands, body byte-identical, but the receipt now NAMES it (`evidence_precision`, `broadened_refs`). A receipt cited ⇒ a file-level ref backed only by a served symbol is REFUSED as over-broad. ⚠ **Absence receipts LINK to the scan `note_absence` recorded (`handoff.absence_ref_for`) so `absence_refusal` stays the ONLY implementation of the refusal rules; `capabilities.proves_absence` is advisory and finalization re-derives it.** ⚠ **Divergence found while wiring: `build_symbol_verdict` never got the item-4 four-state treatment, so ITS `channels.index` says `fresh` for a plain folder with no revision — a `get_symbol_source` receipt therefore probes `repo_freshness` DIRECTLY (trusting the channel would be the 1.108.176 mistake again). Visible inside one envelope and pinned.** ⚠ **Subject read from the SERVED row only, never re-read from the index** — `search_symbols` at standard detail serves no `end_line`/hash, so the receipt omits both and says so in `limitations`. Full digests + fail-closed on collision (an id that ever named two receipts names neither). `_meta.receipts` in `UNIVERSAL_META_JSON`. `schemas/evidence-receipt.schema.json` published in the same commit. ⚠ **NOT done: session keying / full expiry taxonomy / deep-freeze = P3; redacted rendering + `absence_scans_attested` rename = P4; suite parity = P5.** ⚠ **Two ungated absence assertions FOUND, not fixed, said out loud: `search_symbols`'s SEMANTIC exit emits "Do not claim this feature exists" with NO `_meta.verdict` at all (so no absence gate since 1.108.166 applies to it), and both FUSION exits emit neither. Neither can mint — the gate working — and tests pin it against the source. Fixing the prose would change bytes on calls that never asked for a receipt, so it is its own change.** New `tests/test_v1_108_183.py` (79). No tool-count/INDEX_VERSION change.
-- **Older releases (1.108.182 and earlier):** see `CHANGELOG.md`. The 1.108.182 entry ("a stall has a name and a ceiling", #375) and the 1.108.177-.181 #377 hardening arc are there in full.
+- **Version:** 1.108.249 — **a flag that claimed a compaction it never performed, and an advisory that measures where a doc points** (both internal; no issue). **(1)** Past 80% of turn budget the dispatcher set `_meta.auto_compacted: true` while **shortening nothing**, and the comment at the emission site conceded it ("result is already computed. Inject warning + flag instead"). The shipped agent policy — `cli/init.py` AND its committed rendering `AGENTS.md` — told the reader "results were automatically compressed". ⚠⚠ **The annotation ALONE is the cost**: a reader told its result was truncated re-fetches to recover data that was never removed, and the flag fires only when budget is already tight. ⚠ **The tests asserted the PREDICATE** (`should_compact()` returns True) and nothing asserted a payload got smaller — a green suite encoding the defect. `should_compact()` is RETAINED (test_v1_108_55 uses it to prove the #327 reader-reset) with a docstring forbidding rewiring without implementing the compaction it names. ⚠ The dispatcher deliberately still does NOT shorten: discarding context after computing it, before the caller reveals what it needs, is eager compaction's known failure mode. **(2)** Skill-candidate advisory — `audit_agent_config`'s sixth check flags always-resident H2 sections whose index-resolved refs concentrate in ONE subtree; `skill_candidate` correction kind in `suggest_corrections` (rides `reflect`); `skill_advisor_mode` **default off**, unrecognised value also off. ⚠ **Signal is CONCENTRATION, not size** — returns [] with no index. ⚠⚠ **Nothing is generated/summarised/rewritten**; `suggested_patch` stays None because a deletion-only diff reads as "delete this section". ⚠ **STATED LIMIT: relevance is NOT measured** (nothing records which section a turn needed); every finding says so + carries `relevance_measured: false`. ⚠⚠ **My thresholds were BACKWARDS and measurement caught it**: the check takes the DEEPEST prefix clearing the floor, so a narrow subtree failing the floor hands selection to its permissive PARENT — raising the floor makes the answer LESS specific. 0.8 floor + 0.6 share cap found NOTHING across 5 real configs (that is "off", not "strict"); the SHARE CAP discriminates (real subtrees 0.12-0.13 of tree, package roots 0.33-0.50) so cap→0.25 and floor CAME DOWN to 0.65. ⚠⚠ **The dogfood case I filed was FALSE** — jcm's own Current State bloat yields ZERO candidates (its refs span the whole package; `_check_bloat` already catches it); corrected in ROADMAP.md rather than dropped. ⚠ Corpus n=5 → 2 findings, **one a known weak positive** (guidance naming our own tools resolves to the files implementing them); recorded in `_TUNING_SET`, **never quotable as precision**. **(3)** Found en route: `_stale_config_corrections` read `f["type"]` while audit findings carry `category`, so that correction kind had **never once emitted** since it was written. Tests: `test_skill_candidates.py` (19, the NEGATIVE assertions load-bearing), `test_turn_budget.py` (+2).
+- **Prior (1.108.248):** **starter packs install again, and stop misreporting why they did not** (#417 + the client half of #418, @MotoMato85). ⚠⚠ **Both root causes are OUTSIDE this repo** and that shaped everything shipped: the 403 is a Hostinger CDN rule in front of `jcodemunch.com`, the ignored `X-JCM-License` is `index.php`. Only the client half is here. **(1)** The CDN answers httpx's EXACT default header set (`Host, Accept, Accept-Encoding, Connection, User-Agent`, Title-Case, that order) with a 403 challenge page, so `--list` failed for everyone and a free-pack install failed on any KEYLESS seat — precisely the audience the free pack exists for. ⚠ The rule keys on the header NAME SET, not any value: changing the `User-Agent` VALUE does nothing, adding any sixth header clears it. That is why a licensed seat was rescued BY ACCIDENT (`X-JCM-License` perturbs the set) and why Console looked healthy. Now sends `User-Agent` + `X-JCM-Client` on every pack call. ⚠⚠ **A MITIGATION, not the fix** — the durable fix is a CDN bot-protection exception; do NOT delete those headers because "the 403 stopped happening", that IS the mitigation working. **(2)** `_list_packs` called `raise_for_status()` inside `except httpx.HTTPError`, and `HTTPStatusError` SUBCLASSES `HTTPError`, so every non-2xx from a live server printed "check your network connection" (the reporter checked DNS, Pi-hole and firewall first). ⚠ `_install_pack` already had this right and its OWN COMMENT described the bug its sibling still had. **(3)** ⚠⚠ **`pathlib.glob` matches DOTFILES** — unlike the shell glob `list_repos`' `glob("*.json")` reads like — so `.pack-<id>.json` was read as a repo index and reported as corrupt, **and the printed advice DELETES it**: `_repo_slug(".pack", "<id>")` round-trips to the marker's own filename, so `delete-index .pack/<id>` unlinks it and the pack's "already installed" check goes blind while its indexes stay. Reproduced on jjg's own box, 3 markers, 3 lines, EVERY CLI invocation. **(4, #418)** A key sent in the header and refused was answered with the server's hint "use `--license YOUR-KEY`" — advice the client ALREADY followed — so a paying user read it as a rejected key; suppressed when a key was actually sent, kept when it was not. ⚠ **Transport deliberately UNCHANGED**: `?license=` would work today and would undo audit finding V12 (key out of access logs); that trade is not the client's to make. ⚠⚠ **My marker test's first draft was VACUOUS and passed pre-fix** — the warning goes through `logging` so `capsys` never saw it, AND the emitter dedupes on `(owner, name)` in a PROCESS-GLOBAL set; `caplog` + a unique id + an explicit `discard()` made it fail pre-fix. Tests: `test_pack_api_transport.py` (10), `test_pack_marker_not_a_repo_index.py` (5).
+- **Prior (1.108.247):** — **a project's file-count cap is no longer resolved and then discarded** (#416, @domis86). `max_folder_files` set in a repo's `.jcodemunch.jsonc` had no effect on `index .`; the walk stopped at the 2,000 default while `config --check` printed `15000 [project]` the whole time. ⚠⚠ **Not a missing route — a route that WON over the right one.** `index_folder` resolved the cap from GLOBAL config and handed it to the walk as an explicit `max_files=` argument, and `_discover_source_files` treats a non-`None` argument as a caller override (by design), so the repo-aware resolution .194/.197 added was computed and then thrown away. This is the exact inverse of the .194/.197 defects: those were resolvers that never ran, this is a resolver that ran and lost. ⚠⚠ **The report's scope was too NARROW and I confirmed that by measurement, not by reading** — it diagnosed an incremental-only path with full walks unaffected; a repro with `performed_incremental: false` and a project cap of 5 against 20 files indexed all 20. Every entry point was fed the same overriding argument: full walk, explicit `paths=[...]`, watcher, `PostToolUse`. `JCODEMUNCH_MAX_FOLDER_FILES` worked (the reporter's workaround) only because it lands in global config, which is what was being read. ⚠ **The #366 truncation block reads the same value**, so a capped index was also under-reporting what it dropped. ⚠ Audited per the report's closing question: every other config read in `index_folder` already passes `repo=`, and `max_file_size` is correct on both the walk and the watcher fast path — this was the last one. ⚠ **The test sets the cap DOWNWARD**, because proving a raised cap end to end needs a 2,001-file project and a lowered cap falsifies the same sentence; the default-cap control is what stops it passing because caps quietly stopped working. Tests: `test_count_cap_end_to_end.py` (10), sibling of `test_size_cap_end_to_end.py`, non-vacuous — exactly the 3 `project_config` cells fail pre-fix and both other routes pass on both sides.
+- **Older releases (1.108.246 and earlier):** see `CHANGELOG.md`. The 1.108.182 entry ("a stall has a name and a ceiling", #375) and the 1.108.177-.181 #377 hardening arc are there in full.
 - **INDEX_VERSION:** 17
-- **Tests:** 5947 passed, 7 skipped (1.108.182) + the KNOWN 12 local-ONNX `test_semantic_search` env failures (green in CI on all 4 ubuntu jobs — never read them as a regression)
+- **Tests:** 7089 passed, 7 skipped, **0 failed** (1.108.249, full local run POST-bump, 14m09s). ⚠ **The "KNOWN 12 local-ONNX `test_semantic_search` env failures" are GONE** — .207's autouse `no_local_onnx` fixture fixed them, so a local run is now fully green and **any** red is a real signal. Do not carry that 12-failure allowance forward; it papered over a real failure once already (.197 had one hiding inside it). ⚠ **Still do not eyeball the COUNT** — diff the FAILED names against the same tree with your changes stashed; for .199 and .205 that diff was empty, and for .209 the failure set was empty outright, which is the one case that needs no baseline. ⚠ **Stashing is the wrong tool when the change is already committed and pushed** — for .205 the comparison ran in a throwaway `git worktree add --detach <pre-release-sha>`, which also survives a concurrent writer in the main tree.
 - **Python:** >=3.10
-- **Tool count:** 90 in `full` (front door hidden; +1 v1.108.111 `get_parity_map`, +1 v1.108.112 `get_decorator_census`, +1 v1.108.113 `get_architecture_metrics`); `tool_surface=counter` exposes a 3-tool front door (`order`/`menu`/`route`) instead
+- **Tool count:** 91 visible in `full` / 94 in catalog (front door hidden; counts verified 2026-07-30 from `jcodemunch-mcp surface`, which is the only place to get them — do NOT hand-type this; +1 v1.108.111 `get_parity_map`, +1 v1.108.112 `get_decorator_census`, +1 v1.108.113 `get_architecture_metrics`); `tool_surface=counter` exposes a 3-tool front door (`order`/`menu`/`route`) instead
 
 ## Key Files
 ```
@@ -16,7 +16,7 @@ src/jcodemunch_mcp/
   server.py            # MCP dispatcher (async); CLI subcommand dispatch, auth/rate-limit middleware. v1.108.66: the Counter front door (order/menu/route) — _effective_surface()/_counter_front_door_tools()/_raw_catalog_tools()/_catalog_names() + surface-collapse in _build_tools_list + _handle_order/menu/route + early front-door branch in call_tool
   counter.py           # (v1.108.66) The Counter: adaptive tool surface logic (pure, no server import). FRONT_DOOR set; STATE_CHANGING_ACTIONS + exec/write-verb tripwire (_FORBIDDEN_VERB_RE) → order_gate(); idf-weighted search_catalog() for menu; _INTENT_RULES + classify_intent()/shape_execute_args() for route. v1.108.124: EXAMPLES (curated per-action example arg objects) + example_for() — catalog_entry attaches `example` into menu rows, _handle_route uses it as the args_template fallback; validated against live inputSchemas in test_counter.py. server.py owns Tool registration + call_tool re-dispatch; counter.py is fed plain data
   watcher.py           # WatcherManager class (dynamic folder watching); watch_folders() wrapper
-  progress.py          # MCP progress notifications; ProgressReporter (thread-safe, monotonic), make_progress_notify() bridge
+  progress.py          # MCP progress notifications; ProgressReporter (thread-safe, monotonic), make_progress_notify() bridge. v1.108.189 adds HeartbeatReporter (#383) — the token-less fallback: elapsed-time WARNING lines on the LOG channel, duck-typing ProgressReporter so the dispatcher wires either identically. ⚠ Holds NO notify channel/session ref by construction (not in __slots__) and close() yields no futures, so it CANNOT become an unrequested notification; silent until the first JCODEMUNCH_HEARTBEAT_SECONDS elapses, and finish() is silent if it never spoke
   security.py          # Path validation, skip patterns, file caps
   redact.py            # Response-level secret redaction; regex patterns for AWS/GCP/Azure/JWT/GitHub/Slack/PEM/API keys/private IPs; redact_dict() post-processor
   config.py            # JSONC config: global + per-project layering, env var fallback, language/tool gating
@@ -42,16 +42,24 @@ src/jcodemunch_mcp/
     generic.py           # Shape-sniffer fallback encoder (covers all tools w/o custom encoder)
     decoder.py           # Public decode() — rehydrates MUNCH payloads back to dicts
     schemas/             # Per-tool custom encoders (tier-1, phase 2+); auto-discovered registry
+  investigator/
+    deletion_safety.py           # (v1.108.214) tri-state proof obligations; `investigate_deletion_safety`. NOT an MCP tool
+    retrieval_counterfactual.py  # (v1.108.217) `explain_route(task, expected_action)` / `explain_misses(per_query)` — names the FIRST gate that excluded an action: `catalog_absent` / `empty_query` / `rule_preempted` / `no_lexical_overlap` / `ranked_below_cutoff`, in pipeline order (reporting more than the first is reporting consequences). ⚠ Uses the SAME `counter` functions the live front door uses — never a second scorer. ⚠⚠ `rule_preempted` = **never scored**, because `route` runs the fallback ONLY when no rule matched; do NOT read it as a ranking loss. NOT an MCP tool (item 3 moratorium), test-asserted
   storage/
+    selective.py       # (v1.108.216, #398 Arc 2) `SelectiveIndexView` — a `CodeIndex`-SHAPED read view over metadata + named symbol rows. **NOT a subclass**: subclassing would inherit CodeIndex's corpus-wide methods silently operating over a partial `symbols` list, the one outcome this exists to make impossible. `EXACT_FIELDS` are copied onto the instance at construction; **everything else falls through `__getattr__` and promotes to one full load** — including fields invented later. `CORPUS_WIDE` documents the known ones and every entry is parametrized in the test. ⚠ `_PROVENANCE` (`_db_path`/`_loaded_mtime_ns`) MUST stay in `__slots__` — see Current State
+    generation.py      # (v1.108.215, #398 Arc 1) THE READ CONTRACT, both halves. `IndexGeneration`/`describe(index)` — the ONE place `indexed_at`/`git_head`/`_db_path`/`_loaded_mtime_ns` are read off an index; empty string normalises to None once (three surfaces used to disagree). `rewritten_since_load` keeps unknown ≠ changed. `connect_readonly(db_path)` / `readonly_uri` / `wal_sidecar_present` — ⚠⚠ **neither single flag is right**: plain `mode=ro` CREATES `-wal`/`-shm` when absent (moves `_db_mtime_ns`, the .185 `rebuilding` bug), `immutable=1` cannot READ them when present (measured: raises `no such table`, which `has_any()` maps to a confident False). Reads the WAL when its sidecar exists, immutably when it does not. **Every read-only opener in the tree routes through this**; `test_generation_contract.py` fails on a hand-rolled `?mode=ro` URI anywhere else
     sqlite_store.py    # CodeIndex, save/load/incremental_save, WAL-aware LRU cache (_db_mtime_ns); get_source_root(). v1.106.0: save_index + migrate_from_json acquire `indexwrite` process_locks before SQLite writes, body extracted to `_save_index_locked` / `_migrate_from_json_locked`; serialises across MCP processes
     process_locks.py   # v1.106.0: generic multi-process coordination (acquire/release/inspect/held). Atomic O_EXCL + fcntl flock (Unix) + PID liveness + scoped lock files. Scopes: `watcher` (one-watcher-per-repo, shared with watcher.py) + `indexwrite` (save coordination). Metadata: pid/client_id/scope/target/started_at. JCODEMUNCH_CLIENT_ID env var sets friendly client name (defaults to sys.argv[0] basename)
   embeddings/
+    ../storage/embedding_matrix.py # (v1.108.223, #399) Process-local cache of the L2-NORMALISED matrix, keyed by a size+mtime stamp over the .db AND its -wal/-shm sidecars. `get_matrix(db_path)` -> `EmbeddingMatrix | None`; `score_all(q)` is ONE `matrix @ q` under numpy and a norm-hoisted Python loop without it. ⚠ **numpy is opportunistic, never a dependency** — `_scores_python` is tested with numpy forced absent. ⚠ **The sidecars are load-bearing in the stamp**: a write lands in the WAL and may not touch the .db until a checkpoint, so a .db-only stamp pins a stale matrix across exactly the write it must see. ⚠ Rows are `array.array('f')` in the fallback, not `list[float]` (~8x the memory, and this is HELD not thrown away). Bounded to 2 repos; `JCODEMUNCH_EMBED_MATRIX_CACHE=0` disables retention only
+    ../storage/embedding_store.py  # CRUD over symbol_embeddings. ⚠ **Five read paths, pick deliberately**: `iter_raw()` (.223, read-only, UNDECODED blobs, for embedding_matrix only); `get_all()` (read-WRITE conn, bumps .db mtime), `get_all_readonly()` (.185, `mode=ro&immutable=1`, does not), `get_many(ids)` (.210, targeted + read-only, chunked at 900 for SQLITE_MAX_VARIABLE_NUMBER), `has_any()` (.211, `SELECT 1 ... LIMIT 1`, read-only, TRI-STATE — `None` means could-not-establish and is NEVER `False`). ⚠ `count()` and `get_all()` both use `_connect()`, which runs PRAGMA+CREATE-TABLE on EVERY connection — an existence check is NOT free and moves the mtime. Prefer `get_many` whenever the caller already knows its ids, and `has_any` over `count()` for a pure existence question
     local_encoder.py   # Bundled ONNX local encoder (all-MiniLM-L6-v2, 384-dim); WordPiece tokenizer, encode_batch(), download_model()
   enrichment/
     lsp_bridge.py      # LSP bridge — opt-in compiler-grade call graph resolution via pyright/gopls/ts-language-server/rust-analyzer; LSPServer lifecycle, LSPBridge multi-server manager, enrich_call_graph_with_lsp() + enrich_dispatch_edges() (interface/trait dispatch resolution)
   retrieval/
     subject_state.py     # (v1.108.178) #377 item 3: what a scan's answer depends on, cheap enough to re-check. capture() at cache-WRITE (index generation, .db mtime, live git HEAD, + working-tree fingerprint ONLY for an absence) / changed() at cache-READ / revalidate_verdict() downgrades a replayed `absent` and strips the stale evidence token. UNKNOWN is never a change. v1.108.179 adds moved_during_scan() (item 6: before/after identity around a scan, fresh_head bypasses the TTL cache) + changed(when=) so the cached-replay and live-scan refusals read differently. v1.108.181 adds working_tree_state() (item 5: scope-level clean/dirty_in_scope/dirty_outside_scope/unknown/not_applicable; blocks ONLY on in-scope dirt the index has not re-read) + _parse_porcelain/_in_scope/_unreflected_in_index
     signal_fusion.py   # Weighted Reciprocal Rank (WRR) fusion: lexical + structural + similarity + identity channels
+    ledger_trust.py    # (v1.108.186/.187) THE ONE RULE for which ranking_events labels are evidence, shared by tuning.py + regret.py + tools/analyze_perf.py instead of copied. semantic_label_is_trustworthy(row) refuses exactly (tool="get_ranked_context_fusion", semantic_used=1) — pre-fix rows from an exit that built no similarity channel. identity_label_is_trustworthy(row) (.187) refuses rows that RETURNED symbols while recording NO top1_score — the only exact signature of the exit that passed no ledger features; ⚠ it deliberately does NOT match on identity_hit itself (pre-fix is always 0 and 0 is an honest post-fix answer), and search_symbols_fusion's history is UNSEPARABLE (no discriminator exists, window is the only remedy). UNKNOWN, not False: consumers put them in a THIRD bucket and disclose the count. A short row is TRUSTED (this refuses a KNOWN lie; refusing the unclassifiable would be silent data loss). ⚠ The semantic rule EXPIRES if that exit ever builds a similarity channel — drift guard in tests/test_v1_108_186.py
     regret.py          # (v1.108.68) analyze_regret: mines the ranking_events ledger for SIX retrieval-regret signals (requery_churn/low_confidence/thin_result/ambiguous_top/stale_at_query/vocabulary_gap) as severity-ranked clusters. Pure read via token_tracker.ranking_db_query; no new tables. Consumed by suggest_corrections + the digest one-liner
   summarizer/
     batch_summarize.py # 3-tier: Anthropic > Gemini > OpenAI-compat > signature fallback
@@ -102,8 +110,8 @@ src/jcodemunch_mcp/
     get_untested_symbols.py   # get_untested_symbols: find functions with no test-file reachability (import graph + name matching)
     search_ast.py             # search_ast: cross-language AST pattern matching; 10 preset anti-patterns + custom mini-DSL (call:, string:, comment:, nesting:, loops:, lines:); enriched with symbol context
     winnow_symbols.py         # winnow_symbols: multi-axis constraint-chain query; AND-intersects kind/language/name/file/complexity/decorator/calls/summary/churn in one round trip; ranks by importance/complexity/churn/name
-    audit_agent_config.py    # audit_agent_config: token waste audit for CLAUDE.md, .cursorrules, etc.; cross-refs against index. Reused by suggest_corrections (_discover_files / _fuzzy_suggest / stale-config findings)
-    suggest_corrections.py   # (v1.108.68) Retrieval-regret synthesis: fuses regret.analyze_regret clusters + audit_agent_config + WeightTuner dry-run into SUGGESTED corrections (routing/vocabulary/index-freshness/stale-config) with difflib unified-diff CLAUDE.md previews. Read-only charter — never writes a user file; apply_weights touches only tuning.jsonc. Honest no-telemetry hint
+    audit_agent_config.py    # audit_agent_config: token waste audit for CLAUDE.md, .cursorrules, etc.; cross-refs against index. Reused by suggest_corrections (_discover_files / _fuzzy_suggest / stale-config findings). Skill-candidate advisory (_check_skill_candidates / _split_sections / _best_subtree): flags always-resident H2 sections whose index-resolved refs concentrate in ONE subtree, gated by `skill_advisor_mode` (default off). ⚠ The signal is CONCENTRATION, not size — it returns [] with no index, and `subtreeShareCap` (0.25) not `concentrationFloor` is the discriminator, because a narrow subtree failing the floor hands selection to its permissive parent. ⚠ Findings state relevance was NOT measured; nothing records which section a turn needed
+    suggest_corrections.py   # (v1.108.68) Retrieval-regret synthesis: fuses regret.analyze_regret clusters + audit_agent_config + WeightTuner dry-run into SUGGESTED corrections (routing/vocabulary/index-freshness/stale-config/skill-candidate) with difflib unified-diff CLAUDE.md previews. Read-only charter — never writes a user file; apply_weights touches only tuning.jsonc. Honest no-telemetry hint. ⚠ `_stale_config_corrections` read `f["type"]` while audit findings carry `category`, so stale_config had NEVER emitted; both spellings accepted now. ⚠ skill_candidate keeps `suggested_patch: None` deliberately — a diff showing only the deletion reads as "delete this section"
     analyze_perf.py          # analyze_perf: per-tool latency telemetry (p50/p95/max/error_rate) + cache hit-rate; reads in-memory session ring or persistent telemetry.db (opt-in via perf_telemetry_enabled); compare_release="X" loads benchmarks/token_baselines/vX.json and adds baseline_diff
   runtime/
     __init__.py          # Trace ingestion package (Phases 0-5): re-exports redact_trace_record, resolve_to_symbol_id, parse_otel_file, ingest_otel_file, OtelSpan, parse_sql_log_file, ingest_sql_log_file, SqlQueryRecord, parse_stack_log_file, ingest_stack_log_file, StackEvent, StackFrame, VALID_SOURCES = {'otel','sql_log','stack_log','apm'}
@@ -129,7 +137,7 @@ src/jcodemunch_mcp/
     get_redaction_log.py     # Phase 6: forensic accounting of PII redactions — surfaces per-pattern counts from runtime_redaction_log so operators can verify the redaction chokepoint is firing on production traffic. Filters by source + since_days. Read-only / immutable connection.
   retrieval/
     confidence.py        # compute_confidence/attach_confidence: 0-1 retrieval confidence score (geometric mean of gap, strength, identity, freshness sub-signals); attached to _meta.confidence on search_symbols / plan_turn / get_ranked_context
-    freshness.py         # FreshnessProbe: v1.108.180 adds repo_freshness (fresh/stale/unknown/not_tracked, #377 item 4 — the boolean repo_is_stale rendered 'could not find out' as fresh) + _is_git_backed (walks up, so a monorepo subdir is not mislabeled not_tracked). per-result _freshness classification (fresh / edited_uncommitted / stale_index); compares index SHA vs git HEAD + per-file mtime vs CodeIndex.file_mtimes; wired into search_symbols / get_symbol_source / get_context_bundle / get_ranked_context
+    freshness.py         # FreshnessProbe: v1.108.180 adds repo_freshness (fresh/stale/unknown/not_tracked, #377 item 4 — the boolean repo_is_stale rendered 'could not find out' as fresh) + _is_git_backed (walks up, so a monorepo subdir is not mislabeled not_tracked). per-result _freshness classification (fresh / edited_uncommitted / stale_index / **unknown, v1.108.209**); compares index SHA vs git HEAD + per-file mtime vs CodeIndex.file_mtimes; wired into search_symbols / get_symbol_source / get_context_bundle / get_ranked_context. ⚠ **classify() must NEVER answer `fresh` for a comparison it could not make** — no source root, moved root, file absent from the tree, stat raised, or no baseline (neither per-file mtime nor parseable indexed_at) all return `unknown`. That was .209's whole fix and it is easy to reintroduce, because the unmeasurable paths are the ones no local dev box ever exercises. summary() carries an `unknown` count and its buckets must sum to the entry count
     tuning.py            # WeightTuner + get_semantic_weight: learns per-repo semantic_weight from v1.78.0 ranking_events ledger; ±0.05 step (clamp 0.1-0.8) when mean confidence between semantic_used groups differs by ≥0.05; persists to ~/.code-index/tuning.jsonc; applied at query time when caller leaves semantic_weight at the default (identity_boost learning removed v1.108.102 — audit W6, was never consumed at query time)
     embed_drift.py       # CANARY_STRINGS (16) + capture_canary/check_drift: pins canary embeddings to ~/.code-index/embed_canary.json, re-checks cosine drift via check_embedding_drift MCP tool; catches silent provider model changes (Gemini/OpenAI/bundled-ONNX); default threshold 0.05 cosine distance
 ```
@@ -219,8 +227,8 @@ Tree-sitter grammar lacks clean named fields for these — custom regex extracto
 | `JCODEMUNCH_RUNTIME_INGEST_ENABLED` | 0 | (Phase 6) Set 1 to enable the HTTP live-ingest endpoints (POST /runtime/otel, /runtime/sql, /runtime/stack). Requires JCODEMUNCH_HTTP_TOKEN. Off by default — write endpoints are a deliberate two-key turn. |
 | `JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES` | 5242880 | (Phase 6) Per-request body cap in bytes (post-decompression). Decompressed size is checked separately from on-wire size — gzip-bomb guard. Minimum 1024. |
 | `JCODEMUNCH_CLIENT_ID` | basename(`sys.argv[0]`) | (v1.106.0) Friendly client name recorded in `process_locks` metadata. Auto-detected for common runtimes (claude, cursor, codex). Override for custom or wrapper runtimes so `get_watch_status.watcher_holder.client_id` surfaces a meaningful name to other processes. |
-| `ANTHROPIC_API_KEY` | — | Enables Claude Haiku summaries (`pip install jcodemunch-mcp[anthropic]`) |
-| `GOOGLE_API_KEY` | — | Enables Gemini Flash summaries (`pip install jcodemunch-mcp[gemini]`) |
+| `ANTHROPIC_API_KEY` | — | Enables Claude Haiku summaries (`pip install "jcodemunch-mcp[anthropic]"`) |
+| `GOOGLE_API_KEY` | — | Enables Gemini Flash summaries (`pip install "jcodemunch-mcp[gemini]"`) |
 | `OPENAI_API_BASE` | — | Local LLM endpoint (Ollama, LM Studio) |
 | `OPENAI_WIRE_API` | — | Set `responses` to use OpenAI Responses API instead of chat/completions |
 | `JCODEMUNCH_OPENAI_EXTRA_BODY` | — | JSON object merged into every OpenAI-compatible `/chat/completions` + `/responses` summarizer request (config key `openai_extra_body`, project-overridable). Disable a thinking model's reasoning so the output budget isn't burned on reasoning tokens, e.g. `{"chat_template_kwargs":{"enable_thinking":false}}` (#323) |
@@ -241,6 +249,9 @@ Tree-sitter grammar lacks clean named fields for these — custom regex extracto
 | `JCODEMUNCH_INDEX_CACHE_TTL` | 0 (off) | (v1.108.172) Seconds an unused hydrated index may sit in the in-memory cache before being released. **OPT-IN: 0/unset/garbage = disabled = today's behavior exactly.** ⚠ **Do NOT default this on** — cold hydration of a 665k-symbol index was measured at 7.5-11.4 min (#370), so evicting during a quiet spell hands the next query that bill. For hosts whose MCP client leaks stdio servers (#375: 25+ instances, ~17 GB), where each idle process otherwise sits on its own cache. Swept on access, no timer thread. |
 | `JCODEMUNCH_PROVIDER_BUDGET_SECONDS` | 30.0 | (v1.108.182) Wall-clock ceiling on ONE context provider's `detect()`+`load()`. Discovery runs before a single file is indexed, so an unbounded provider takes the whole index down with it (#375). On overrun the provider is skipped and NAMED in `providers_skipped` + `warnings`. `0`/negative = no ceiling (pre-.182 inline behaviour). ⚠ **A watchdog stops the CALLER waiting; it cannot stop the work** — Python cannot preempt a thread, so the abandoned provider keeps burning CPU until it finishes or polls `budget_expired()`. Only the Express walk polls it so far. |
 | `JCODEMUNCH_PARSE_BUDGET_SECONDS` | 20.0 | (v1.108.182) Per-file wall-clock ceiling on `parse_file`, via `parse_file_budgeted`. On overrun the file is skipped and named in the index result's `warnings` instead of the run hanging. ⚠ **Armed only at or above 128 KiB** (`_PARSE_WATCHDOG_MIN_BYTES`) so the common path stays inline — a 2 KB file that takes 20s is a bug to see, not to paper over. `0`/negative disables. Same no-preemption caveat: tree-sitter is C code. |
+| `JCODEMUNCH_MAX_FILE_SIZE` | 512000 | (v1.108.193, @dkiaulakis) Per-file byte cap for indexing (config key `max_file_size`; **settable per-project in `.jcodemunch.jsonc` as of v1.108.197 — before that the project file was parsed and then ignored**). ⚠ **This was the ONE limit of three with no route at all** — its neighbours `max_index_files`/`max_folder_files` each had a resolver, this was hardcoded. **Default deliberately UNCHANGED**; this is an escape hatch. ⚠ A file over the cap is `too_large`, which is now **WITHHELD** (real+current+wanted) rather than an ordinary exclusion, so it makes coverage `complete: false` and **refuses absence claims**. |
+| `JCODEMUNCH_HEARTBEAT_SECONDS` | 30.0 | (v1.108.189, #383) Elapsed wall-clock seconds between heartbeat log lines when the client sent **no `progressToken`** — the MCP spec makes progress notifications the client's opt-in, so the fallback signal goes to the log instead. Emitted at **WARNING** (the default `log_level`, or nobody sees it) and **only after the first interval elapses**, so a run finishing inside the window is byte-for-byte as silent as before. ⚠ **Garbage parses to the DEFAULT, not to 0** — a typo must not reintroduce the silence this exists to fix. `0`/negative disables. |
+| `JCODEMUNCH_EMBED_MATRIX_CACHE` | 1 | (v1.108.223, #399) Set `0`/`false`/`no`/`off` to stop RETAINING the decoded embedding matrix between queries. ⚠ **It does not disable the fast path** — the matrix is still built per call and scored in one vectorised pass, so only the SQLite decode is re-paid. On by default because the cache is what turns a ~2 s semantic query into ~3 ms; bounded to 2 repositories (~46 MB each at 30k x 384 float32) and dropped on every write to the store. Process memory only: nothing written, no network, dies with the process. Disclosed in README's "Background behavior". |
 | `JCODEMUNCH_SCIP_MAX_ROWS` | 200000 | (v1.108.96) Row cap for `scip_edges` / `scip_unmapped` (compile-time evidence from `import-scip`); FIFO-evicted oldest-first in 1k batches. Negative disables the cap; env-only, deliberately not a config key. |
 | `JCODEMUNCH_LAUNCH_ID` | — | (v1.108.152) Opaque host-supplied launch token echoed back as `launch_id` in the `munch://runtime/identity` resource (#371). Fallback: suite-generic `MUNCH_LAUNCH_ID`. Omitted from the payload when unset. Env-only, not a config key. |
 
@@ -283,34 +294,153 @@ one of these "we don't take branded providers"** — MiniMax/GLM/OpenRouter are
 exactly this shape and already merged; the comment concedes that on the record.
 The bar is a user asking, same as platform installers. It correctly added
 atlascloud to `_PAID_CLOUD_PROVIDERS`, so the money-safety guard was respected.
-**Open issues (2026-07-26): #377, #383, #384 — all jjg-filed; ZERO open PRs.**
-#375 was closed once the stall was fixed, with its two unfixed sub-problems split
-out as trackers: **#383** (sub-problem A, no progress emission when the client omits
-`progressToken`) and **#384** (the double-index finding below). Neither has a chosen
-fix; #384 names a third option nobody has explored (register the folder for watching
-WITHOUT an initial index when the tool about to run will index it anyway).
+**Tracker state 2026-07-28: ZERO open issues, ZERO open PRs.** Verified against
+`gh issue list --state open` / `gh pr list --state open`, with an
+`--state all` query alongside to prove the empty result was not a failed query
+([[feedback_empty_cli_query_is_not_evidence]]).
 
-**#375 (index_folder silent 1800s+ on Linux) — investigated 2026-07-25, NOT fixed,
-awaiting a py-spy dump.** Of the four sub-problems: **B (zero `index_folder` log
-lines) is CLOSED as not-a-defect** — that file has 16 `logger.info`/18
-`logger.debug` against 6 warnings/2 errors and the default `log_level` is
-`WARNING` (`config.py:432`), so a healthy run emits nothing; setting `log_level`
-to `INFO` is the cheapest heartbeat available today. **D (two-instance lock
-contention) is near-ruled-out** — every `indexwrite` acquire passes
-`wait_seconds=60.0` and RAISES naming the holder (`sqlite_store.py` 875/1323/1674/
-2966, `import_scip.py:83`), so it cannot present as unbounded silence. **A
-(no emission without `progressToken`) confirmed** (`progress.py:213`). **C
-(freshness lies) NOT yet investigated.** ⚠ **NEW finding not in the issue:
-`index_folder` is MISSING from `_AUTO_WATCH_EXCLUDED` (`server.py:4499`) while
-`index_file` is present, so `_auto_watch_if_needed` (`server.py:4531`) awaits a
-full `ensure_indexed(X)` BEFORE the tool dispatches and then the tool indexes X
-again — a silent double index, independent of progressToken.** ⚠ **Deliberately
-NOT patched: dropping the redundant `ensure_indexed` while keeping `add_folder`
-would let the watch task's own initial index race the tool's index on the same
-`indexwrite` lock (60s waits, plausibly WORSE); excluding `index_folder` outright
-silently removes auto-start-watching. Both wait on localisation.** The stall is
-still unexplained — one repro was a `.claude/` chunk, far too small for 1800s, so
-something BLOCKS rather than grinds.
+⚠⚠ **DO NOT quote a tracker count from this file — re-run the query.** The line
+that used to live here said "Open issues: #375, #377. Open PRs: #387 and #388"
+while a paragraph twelve lines below it recorded #388's own close. **It was
+internally contradictory and it was believed anyway**, which is how a stale
+"#375 ONLY" got written into this file on 2026-07-28 for an issue closed the day
+before. A count is the one fact here with a guaranteed expiry date.
+
+**Closed 2026-08-05: #414 (@MotoMato85) byte offsets slicing a decoded str in
+16 extractors** — shipped as 1.108.244, see Current State. ⚠ **The report is the
+best-instrumented one this project has received**: an AST audit finding exactly
+35 `source` subscripts and classifying 34 as byte-offset plus the ONE correct
+character-domain case, a per-symbol drift table proving the shift EQUALS the
+extra UTF-8 byte count, a 118-function whole-repo measurement (105 wrong before,
+1 after — and he diagnosed the survivor as an unrelated tree-sitter `ERROR`
+node), and a fix proposal with an AST argument for why substituting `source` is
+behaviour-preserving. **Every claim I checked reproduced byte-identically.**
+⚠ **His proposed helper had one flaw worth remembering**: its
+`for cut in range(4)` decode loop trims trailing bytes until a decode succeeds,
+which for a slice containing an INVALID byte in the middle silently returns the
+prefix and DROPS the rest. Shipped version only trims when the bad run reaches
+the END of the chunk. **A test I wrote for the degradation path caught it**;
+neither of us would have caught it by reading. ⚠⚠ **The reusable lesson is that
+fixing the producer left the DATA wrong and the obvious remedy did not work**:
+"re-index" is a no-op here, because the corrupt rows sit in files that never
+changed ([[feedback_fixing_a_producer_does_not_fix_its_history]]). Hence
+`PARSER_GENERATION`, and it must be checked BEFORE every early-returning fast
+path. ⚠ A pure-ASCII fixture cannot fail on this class at all, which is why it
+survived every existing parser test.
+
+**Closed 2026-08-05: #413 (@LuigiNicaPRO) a silent full rebuild replacing a
+requested incremental** — shipped as 1.108.243, see Current State. ⚠ **The
+reusable lesson is that the READ side and the WRITE side of one store drifted.**
+`inspect_index` was built in PR #291 specifically to discriminate the causes
+`load_index` collapses into `None`, four read-path tools adopted it, and the two
+INDEXING tools kept a hand-written branch that named one cause for seven. His
+own grep is the diagnostic worth copying: `loadab` / `load_error` /
+`index_status` / `sqlite_corrupt` / `index_present` returned **zero** hits in
+`index_folder.py` while `existing_index is None` was present. ⚠ **He measured
+the harm honestly and DOWN**: on his repos the substituted rebuild costs about a
+second, and he said so unprompted rather than inflating it. The defect is the
+undiagnosability, not the time. ⚠ **We shipped his options (1) and (2) and NOT
+(3)** — an `on_unloadable_index="error"` parameter is permanent surface under the
+1.x no-removal contract, and he stated (1)+(2) covers his case. Demand-driven, as
+with platform installers.
+
+**Closed 2026-08-04: #412 (@rknighton) git_sha verification accepted a truncated
+cache** — shipped as 1.108.235, see Current State. ⚠ **The reusable lesson is
+about WHERE it was measured, not about the comparison.** His repro exercised
+`_slice_matches` directly, which is the layer his own #401 patch had edited. At
+`get_symbol_source`'s entry point the sibling `content_verified` already returned
+`False` on those caches, so the served response was contradictory rather than
+uniformly wrong. **Neither view alone is the whole answer, and the tool response
+is the one that describes what a caller experiences**
+([[feedback_verify_at_the_users_entry_point]]). ⚠ **This is the first finding of
+his that got LESS severe on inspection** — the standing note says he understates,
+and #411 was the first time verifying upward came back neutral. Two in a row now
+land off that pattern: **check every time, report whichever way it lands, and do
+not reach for the expected direction.**
+
+**Closed 2026-08-04: #411 (@rknighton) test config isolation** — `_run_config`
+in `tests/test_v1_108_194.py` scrubbed `JCODEMUNCH_MAX_FILE_SIZE` but left the
+subprocess reading the developer's real `~/.code-index/config.jsonc`, so both
+`max_file_size` assertions failed on any box with the key set. Reported WITH a
+`git apply --check`-verified patch; applied as written in `5a3ee39`.
+⚠ **`TemporaryDirectory`, not the `mkdtemp` used elsewhere in that file** — the
+config reporter WRITES a `config.jsonc` into the directory it is pointed at, so
+an uncleaned temp dir per call accumulates. That is the whole reason the patch
+costs a reindent, and it is the part a later "simplification" would undo.
+⚠ **His severity framing was checked upward and HELD, which is the notable
+part** — the standing note on this reporter is that he understates, so both
+larger readings were tested and came back NEGATIVE. (1) Not a production
+precedence bug: config beats env for `max_file_size` and the resolver agrees,
+but `max_folder_files` / `max_index_files` behave identically, so .193's key
+follows its siblings. (2) Not wider than one file: `test_surface_cli.py` is the
+only other CLI-shelling test without `CODE_INDEX_PATH` isolation and it PASSES
+under a hostile config because its assertions are shape-based, not value-based
+(latently exposed if anyone adds a value-based one); `test_watch_all.py` is
+isolated by argument (`watch_all.py:48` honours `storage_path`).
+⚠ **The observation worth keeping: the file's docstring says it guards the #375
+failure mode, so the test protecting the large-file escape hatch was broken by
+USING the large-file escape hatch.** Reaching it at all required being exactly
+the user it was written for, which is why it went unseen on every dev box that
+had not capped out on a large repo. Same family as jdata's `test_v1_15_0` /
+`test_v1_16_0` false-greens reading the real `~/.data-index`. Test-only, no
+version bump; rides the next release.
+
+Closed this session: **#390** (@lazy-geeek, its own repro already fixed by
+`.194`), **#391** (@amarakramali, rewritten as 1.108.197), **#387** (@nyxst4ck,
+rewritten wider), **#377** (P3 remainder + P4 to `ROADMAP.md` with close
+conditions and @mightydanp's credit, same treatment as #385/#386). **#375** and
+**#388** were already closed 2026-07-27.
+
+⚠⚠ **PROCESS FAILURE WORTH NOT REPEATING: #388 fixed #384 and was opened
+2026-07-27 06:51 UTC. We shipped our own .189 fix and closed #384 at 12:56 UTC
+having NEVER LOOKED AT OPEN PRs — the cross-reference sat on #384's timeline the
+whole time. CHECK `gh pr list` BEFORE WRITING CODE ON AN ISSUE.** Their fix then
+went `CONFLICTING/DIRTY` because .189 rewrote the same functions. Resolved by
+PORTING the gap they covered and we missed (`maybe_takeover`) in **v1.108.190**
+with credit in the CHANGELOG, release notes and close comment, rather than
+asking a pre-empted first-time contributor to both rebase onto our version of
+their fix AND sign a CLA. **#388 closed 2026-07-27.** Cleaned up in
+v1.108.189 on a standing rule jjg set: **an issue opens when work STARTS or when
+a USER is BLOCKED** — an issue is a problem to fix or a feature to build, not a
+to-do list. **#383 and #384 are FIXED** (see Current State); **#385/#386 (evidence
+Phases 5 and 6) were CLOSED and moved to `ROADMAP.md`** — accepted design with no
+start date and an unmet dependency is a plan, not an issue. ⚠ **Closing them is
+NOT a rejection of @mightydanp's design and the close comments say so explicitly;
+credit and close conditions moved verbatim.** ⚠ **The convention that GENERATED
+the clutter was our own — "new scope gets its own close condition", cited in
+#385's body. It is right for scope being WORKED and wrong for scope PARKED.**
+Remaining: **#375** (needs a re-run from @dkiaulakis at >=1.108.182, not code) and
+**#377** (down to two concrete Phase 2 P3 edges @mightydanp pinned 2026-07-27:
+an absence receipt still links a MUTABLE `absent:<sha>` key `note_absence` can
+overwrite across snapshots, and validation vs rendering do two SEPARATE receipt
+lookups instead of one atomic snapshot).
+
+**#375 (index_folder silent 1800s+ on Linux) — REOPENED 2026-07-26, and the
+blocker is a RE-RUN, not code.** Closed 2026-07-26 on our own measurement after
+five releases; @dkiaulakis re-ran at 1.108.176 and the SAME `tools/eidos` subtree
+took **268s SIGTERM'd vs a 240s baseline at .169 — no improvement**, which is
+exactly the condition the close comment said would reopen it. ⚠ **No py-spy this
+round: ptrace is restricted in his sandbox and his agent correctly declined to
+grant itself CAP_SYS_PTRACE mid-task.** ⚠ **The 5400s full-repo number is a
+CLIENT-side MCP timeout and does NOT prove the server job stopped** — he flagged
+that himself; he runs 10+ concurrent stdio servers and had no safe way to
+identify his own process. What .176 DID deliver, in his words: "we can now see
+the problem we could not previously see" — `index_coverage` read ABSENT before
+and now reports a number plus `index_stale: true (git_head_lag)`. **The freshness
+half stands; the stall is a separate axis.** v1.108.182 shipped three bounds in
+response (provider-discovery budget, walk pruning at `iter_source_files`,
+per-file `parse_file_budgeted`), two of them his own twice-proposed suggestions.
+⚠ **STATED LIMIT, do not overclaim it: a watchdog stops the CALLER waiting, it
+cannot stop the WORK** — Python cannot preempt a thread and tree-sitter is C, so
+an abandoned parse keeps burning CPU. It makes the index finish and the gap
+visible; it does not cap CPU. Sub-problems: **A -> #383, FIXED in .189. B closed
+not-a-defect** (default `log_level` is WARNING, so a healthy run emits nothing).
+**C fixed in .176** (a partial index no longer reports itself fresh; `complete`
+is TRI-state and pre-.176 indexes report `null`, NEVER `true` — re-index or the
+signal is not there to see). **D near-ruled-out** (every `indexwrite` acquire
+passes `wait_seconds=60.0` and RAISES naming the holder, so it cannot present as
+unbounded silence). **The double-index finding -> #384, FIXED in .189.**
+⚠ **Next action is a PING, not a patch.**
 
 **Closed 2026-07-26: #382 "Old tree sitter dependency?" (@kecsap)** — asked why we
 pin `tree-sitter-language-pack>=0.7.0,<1.0.0` when "other code parser MCP tools
@@ -343,6 +473,59 @@ parsers WITHOUT parsing pathological input.
 author; the badge renders "Top 1% of 81,432", not the rank the PR body promised,
 and it is live third-party-controlled content in a README that also renders on PyPI.
 
+## Issue + release policy (2026-07-28)
+
+**1. One issue, one verdict.** A multi-finding report gets SPLIT at triage into
+one issue per finding, cross-linked, credit on each. Nothing is dropped and no
+detail is discouraged. The reason is closure mechanics: a 4-finding issue closes
+only when the last one settles, so three finished fixes sit behind one
+unfinished conversation and the tracker cannot say which is which.
+
+⚠ **This is the correction to a mistake we made deliberately.** On 2026-07-27 we
+CONSOLIDATED five jdoc issues (#80/#89/#90/#93) into one gate, #95. It cut the
+open count from 5 to 1 and manufactured a single artifact with the power to
+block a release. **Tracker-tidiness and granularity pull in opposite directions;
+do not optimize the count.**
+
+**2. A release is NEVER blocked on an open issue**, including a verification we
+asked for. Done + tested + green ships on schedule, carrying a plain-language
+verification-status line (the #95 disclosure sentence is the template; it is
+deliberately weaker than a sign-off and the changelog must never blur the two).
+Late re-verification counts IN FULL and is announced retroactively. Nothing
+expires. **Every timebox names its default action** ("verification by X, or Y
+ships with disclosure Z"); a date with no stated consequence is a wish.
+
+⚠ **The point is that a reviewer's thoroughness must never become a veto.** If
+being careful can stall a release, careful review becomes expensive to accept,
+which is backwards.
+
+**3. A contributor's PR is never the only path.** Timebox it and keep our own
+path warm (#388 taught this the expensive way).
+
+⚠⚠ **Do NOT answer "an issue is stuck" with aggregate stats.** Measured
+2026-07-28: jcm median 0 days to close (80 issues, 70 within a day, 2 ever past
+a week); jdoc median 1 day. **Those numbers are TRUE and they are NOT a
+response.** jjg: a fraction of an eyelash commands full attention and impairs
+binocularity; "it is a small fraction of your body" helps nobody. The cost of a
+blocked issue is CONCENTRATED, not distributed. Design the fix at the OUTLIER
+(policy 2), never at the median. See
+[[feedback_dont_answer_pain_with_aggregates]].
+
+Surfaces: `CONTRIBUTING.md` ("One issue, one verdict" + "A release is never
+blocked on an open issue") and `.github/ISSUE_TEMPLATE/` (bug_report,
+multi_finding_report, config.yml pointing parked design at ROADMAP.md).
+
+⚠ **CONTRIBUTING.md is now IDENTICAL suite-wide** (jcm/jdoc/jdata differ only by
+product name, repo slug, and jcm's extra quality-gates section). Two pre-existing
+bugs fell out of normalizing it: **the documented install command
+`pip install -e ".[test]"` was WRONG IN ALL THREE REPOS** — no repo declares a
+`test` extra; dev deps live in a PEP 735 `[dependency-groups]` block, so the
+FIRST command a new contributor ran failed. And jcm's
+`README.md#license-dual-use` anchor pointed at a heading that does not exist
+(`## License`). ⚠ **CI installs with `uv sync` and never runs the command the
+docs give a human**, which is why this survived: the thing we test is not the
+thing they do.
+
 ## Maintenance Practices
 
 1. **Document every tool before shipping.** Any PR adding a new tool to `server.py`
@@ -352,7 +535,33 @@ and it is live third-party-controlled content in a README that also renders on P
    minimum `logger.debug("...", exc_info=True)`. For user-facing fallbacks (AI
    summarizer, index load), use `logger.warning(...)`.
 3. **CHANGELOG.md** is the authoritative version history — update it with every release.
-4. **Keep `Current State` to the 3 newest releases.** It is a pointer, not a second
+4. **Never hand-type a jCodeMunch benchmark number.** The comparison harnesses
+   (`run_rag_baseline.py`, `run_odysseus_compare.py`) read
+   `benchmarks/jcm_reference.json`, written by `run_benchmark.py --reference`.
+   ⚠ **The failure this closes was invisible for four months:** our side was a
+   2026-03-28 constant while the other side of every ratio was re-measured each
+   run, so published ratios drifted on their own. Re-measuring moved all three
+   per-repo figures AGAINST us and flipped a published winner (gin: `jcm 1.2x
+   leaner` → `RAG 1.1x leaner`). ⚠ **A repo outside the artifact renders "not
+   measured" — there is deliberately no estimator.** The removed one allocated
+   our cost proportionally to repo size, i.e. it assumed the opposite of what we
+   claim. `tests/test_benchmark_reference.py` fails on a returning `JCODEMUNCH_*`
+   constant and asserts the estimator absent BY NAME. ⚠ **FOUR artifacts mirror
+   one run** — `results.md`, `METHODOLOGY.md`, README, and
+   `benchmarks/provenance/measured.json`. Re-syncing three and missing the
+   fourth failed `test_provenance.py`, **inside the known 12 local-ONNX env
+   failures**. `--reference` now rewrites the provenance block itself; two
+   committed artifacts disagreeing is the same defect in a different costume.
+   ⚠ **v1.108.222: the corpus is PINNED by upstream commit** in
+   `benchmarks/tasks.json`, and `--reference` refuses to publish a number
+   measured against an unpinned, drifted, or unknown-completeness corpus. **A
+   fifth artifact now mirrors the run: `benchmarks/REPRODUCING.md`**, and a test
+   fails if it does not name every pinned SHA. ⚠ **Never state a repo's file
+   count as a property of the repo** — it is a property of the INSTALLATION
+   (grammar pack, size limits, skip patterns), which is the whole point of the
+   .221 capability certificate. Say which commit, and let the count live in the
+   artifact beside the SHA that produced it.
+5. **Keep `Current State` to the 3 newest releases.** It is a pointer, not a second
    changelog. On each release, add the new entry and drop the 4th-oldest — the detail
    already lives in CHANGELOG.md. (2026-07-25: this section had grown to 157 entries /
    ~233k chars, loading ~58k est. tokens into every session under this directory.)

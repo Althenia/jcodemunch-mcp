@@ -11,7 +11,56 @@ from typing import Optional
 
 import httpx
 
-STARTER_PACK_API = "https://j.gravelle.us/jCodeMunch/starter-packs-system/api/index.php"
+# The packs are built by the jcodemunch-starter-packs CI job, which deploys to
+# jcodemunch.com. The legacy j.gravelle.us copy is no longer refreshed and served
+# an April build for months after the pipeline moved -- a stale artifact reads as
+# a working one, so the host that CI writes to is the only correct value here.
+STARTER_PACK_API = "https://jcodemunch.com/starter-packs-system/api/index.php"
+
+
+def _pack_api_headers(extra: Optional[dict] = None) -> dict:
+    """Headers for every starter-pack API request.
+
+    Identifies our traffic in the pack API's own logs, which is worth having on
+    its own: a request from this client is otherwise indistinguishable from any
+    other Python process.
+
+    ⚠ It also happens to be what gets the request past the CDN in front of
+    jcodemunch.com (#417, @MotoMato85). That edge answers httpx's exact default
+    header set — `Host, Accept, Accept-Encoding, Connection, User-Agent`,
+    Title-Case, in that order — with a 403 bot-challenge page, so `--list` and
+    any keyless download never reached `index.php` at all. The rule keys on the
+    header NAME SET, not on any value: replacing the `User-Agent` value does
+    nothing, while adding ANY sixth header clears it. That is also why a
+    licensed seat was rescued by accident — `X-JCM-License` perturbs the set.
+
+    ⚠⚠ This is a MITIGATION, not the fix, and it is worth knowing which is
+    which. The durable fix would be a bot-protection exception for the pack API
+    at the CDN edge; that rule is not in this repo and can change under us at
+    any time.
+
+    ⚠⚠ **That exception was considered and declined (2026-08-06), so this is
+    permanent by decision, not by neglect.** The reasoning: our own client is
+    fixed here, licensing (`validate.php`) and ordering (the Stripe webhook) are
+    POST and were never affected, and the residual exposure is third-party
+    fetchers of `/badge.php` and `/llms.txt`. Do NOT delete these headers
+    because "the 403 stopped happening" — that would be the mitigation working.
+    `X-JCM-Client` is the load-bearing one; it is sixth-header padding as much
+    as it is telemetry.
+
+    The tripwire is `install-pack --list` failing for everyone at once. If that
+    happens the rule has tightened and the CDN exception is back on the table; a
+    drafted support ticket with the measured variant table exists for that day.
+    """
+    from .. import __version__
+
+    headers = {
+        "User-Agent": f"jcodemunch-mcp/{__version__} (+https://jcodemunch.com)",
+        "X-JCM-Client": f"jcodemunch-mcp/{__version__}",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
 
 # ANSI helpers
 _BOLD = "\033[1m"
@@ -59,22 +108,6 @@ def resolve_effective_license_key(explicit: Optional[str]) -> Optional[str]:
         return None
 
 
-def _looks_like_missing_license_response(resp) -> bool:
-    """True only for the exact answer a pre-header backend gives a licensed-pack
-    request whose key rode the X-JCM-License header it doesn't read: the
-    no-license 403. A real key rejection says "Invalid or expired license."
-    and must NOT retry over the legacy query string."""
-    if "application/json" not in resp.headers.get("content-type", ""):
-        return False
-    try:
-        data = resp.json()
-    except Exception:
-        return False
-    if not isinstance(data, dict):
-        return False
-    return "requires a jcodemunch license" in (data.get("error") or "").lower()
-
-
 def _mask_license(key: str) -> str:
     """Mask a license key for display: first 4 + last 4 chars."""
     if len(key) <= 8:
@@ -84,18 +117,48 @@ def _mask_license(key: str) -> str:
 
 def _list_packs() -> int:
     """Fetch and display the starter pack catalog."""
+    # ⚠ No raise_for_status. It used to sit here, inside a `except httpx.HTTPError`
+    # — and HTTPStatusError is a SUBCLASS of HTTPError, so every non-2xx response
+    # was reported as "check your network connection" for a server that was up and
+    # answering (#417, @MotoMato85: that message sent him to DNS, his Pi-hole and
+    # his firewall before he looked at the response body). Only a transport failure
+    # means unreachable. `_install_pack` already had this right and its comment
+    # described this exact bug; the two paths now agree.
     try:
-        resp = httpx.get(f"{STARTER_PACK_API}?action=catalog", timeout=15)
-        resp.raise_for_status()
-    except httpx.HTTPError:
+        resp = httpx.get(
+            f"{STARTER_PACK_API}?action=catalog",
+            timeout=15,
+            headers=_pack_api_headers(),
+        )
+    except httpx.HTTPError as exc:
         print(
             f"  {_RED}{_CROSS} Could not reach the starter packs server. "
             f"Check your network connection.{_RESET}",
             file=sys.stderr,
         )
+        print(f"  {_DIM}({type(exc).__name__}: {exc}){_RESET}", file=sys.stderr)
         return 1
 
-    catalog = resp.json()
+    # Gate on "is this the catalog", not on a header guess. A content-type test
+    # would reject a server that labels correct JSON unusually; parseability is
+    # the property actually required two lines down.
+    try:
+        catalog = resp.json()
+    except ValueError:
+        content_type = str(resp.headers.get("content-type", "") or "")
+        print(
+            f"  {_RED}{_CROSS} The starter packs server answered "
+            f"{resp.status_code} ({content_type or 'no content-type'}) "
+            f"instead of the catalog.{_RESET}",
+            file=sys.stderr,
+        )
+        if "html" in content_type:
+            print(
+                f"  {_DIM}That is an HTML page from an edge/proxy, not the pack "
+                f"API. If it persists, please report it with this line.{_RESET}",
+                file=sys.stderr,
+            )
+        return 1
     packs = catalog.get("packs", [])
     if not packs:
         print("  No starter packs available yet.")
@@ -113,7 +176,12 @@ def _list_packs() -> int:
         symbols = pack.get("symbols", 0)
         size = pack.get("size", "")
         free = pack.get("free", False)
-        download_url = pack.get("download_url", "")
+        # Composed here, not taken from the catalog's own `download_url`. The
+        # server writes that field, and when the two disagree the printed line
+        # is the one a user copies -- which is how a stale host kept handing out
+        # its own address after the client had moved off it. This URL is the one
+        # `install-pack` will actually fetch, by construction.
+        download_url = f"{STARTER_PACK_API}?action=download&pack={pack_id}"
 
         tag = f"{_GREEN}  FREE  {_RESET}" if free else f"{_YELLOW} LICENSE {_RESET}"
         print(f"  {tag}  {pack_id:<20s}  {_BOLD}{name}{_RESET}")
@@ -126,13 +194,19 @@ def _list_packs() -> int:
             print(f"           {_DOT.join(details)}")
         if description:
             print(f"           {_DIM}{description}{_RESET}")
+        # A pack is somebody else's source, indexed. Name the terms before the
+        # download, not only in a file the user finds afterwards.
+        licenses = pack.get("licenses") or []
+        spdx = sorted({l.get("spdx", "") for l in licenses if l.get("spdx")})
+        if spdx:
+            print(f"           {_DIM}Upstream licence: {', '.join(spdx)}{_RESET}")
         print(f"           jcodemunch-mcp install-pack {pack_id}")
         if download_url:
             print(f"           {_DIM}{download_url}{_RESET}")
         print()
 
     print(f"  {_DIM}Free packs require no license. Licensed packs require a jCodeMunch license.{_RESET}")
-    print(f"  {_DIM}Get a license: https://j.gravelle.us/jCodeMunch/#pricing{_RESET}")
+    print(f"  {_DIM}Get a license: https://jcodemunch.com/#pricing{_RESET}")
     print()
     return 0
 
@@ -156,7 +230,9 @@ def _install_pack(
     # NEVER the URL query string, so it can't land in server/proxy access logs
     # (audit finding V12).
     url = f"{STARTER_PACK_API}?action=download&pack={pack_id}"
-    headers = {"X-JCM-License": license_key} if license_key else None
+    headers = _pack_api_headers(
+        {"X-JCM-License": license_key} if license_key else None
+    )
 
     print(f"  Downloading starter pack '{pack_id}'...", flush=True)
     # No raise_for_status: the API reports license/pack errors as 4xx + JSON
@@ -170,21 +246,6 @@ def _install_pack(
             f"Check your network connection.{_RESET}",
         )
         return 1
-
-    # Transitional: a backend that predates header support never saw the key
-    # and answers a licensed pack with its no-license 403. Retry ONCE over the
-    # legacy query-string transport so a paying customer isn't punished by a
-    # deploy-order gap. Remove once the deployed API is confirmed header-aware.
-    if license_key and _looks_like_missing_license_response(resp):
-        legacy_url = url + f"&license={license_key}"
-        try:
-            resp = httpx.get(legacy_url, timeout=120, follow_redirects=True)
-        except httpx.HTTPError:
-            print(
-                f"  {_RED}{_CROSS} Could not reach the starter packs server. "
-                f"Check your network connection.{_RESET}",
-            )
-            return 1
 
     content_type = resp.headers.get("content-type", "")
 
@@ -201,10 +262,30 @@ def _install_pack(
         if get_license:
             print(f"  Get a license: {get_license}")
         hint = data.get("hint")
-        if hint:
+        # ⚠ Suppress the server's hint when we ALREADY did what it advises.
+        # `action=download` refuses a key sent in `X-JCM-License` and answers
+        # "This pack requires a jCodeMunch license" with the hint "Use:
+        # install-pack <pack> --license YOUR-KEY" — advice the client has
+        # already followed, since --license lands in that same header. Relaying
+        # it tells a paying user their valid key was rejected (#418,
+        # @MotoMato85). Say what actually happened instead.
+        if hint and not license_key:
             print(f"  Hint: {hint}")
         if license_key:
-            print(f"  License: {_mask_license(license_key)}")
+            print(f"  License: {_mask_license(license_key)} (sent as X-JCM-License)")
+            print()
+            print(
+                f"  {_YELLOW}A license key WAS sent with this request and the "
+                f"server still reports the pack as unlicensed.{_RESET}"
+            )
+            print(
+                "  That is not a problem with your key — check it with: "
+                "jcodemunch-mcp license"
+            )
+            print(
+                "  If it validates, this is a known server-side gap: "
+                "https://github.com/jgravelle/jcodemunch-mcp/issues/418"
+            )
         return 1
 
     # Expect a zip
@@ -289,6 +370,17 @@ def _install_pack(
             repo_name = repo if isinstance(repo, str) else repo.get("repo", "")
             if repo_name:
                 print(f"    - {repo_name}")
+        print()
+
+    # The pack carries each upstream's licence verbatim. Say where it landed and
+    # under what terms, so the answer does not depend on the user going looking.
+    licenses = (manifest_data or {}).get("licenses") or []
+    if licenses:
+        print("  Upstream licences (shipped with the pack):")
+        for entry in licenses:
+            spdx = entry.get("spdx") or "see file"
+            print(f"    - {entry.get('repo', '?')}: {spdx}")
+        print(f"  {_DIM}Full text: {base / 'licenses'}{_RESET}")
         print()
 
     # Opt-in telemetry

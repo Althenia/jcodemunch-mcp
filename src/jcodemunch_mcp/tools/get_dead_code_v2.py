@@ -51,6 +51,15 @@ _ESM_REEXPORT_STAR_RE = re.compile(
     r"""export\s+\*(?:\s+as\s+\w+)?\s+from\s+['"]([^'"]+)['"]"""
 )
 # ES named re-export: `export { foo, bar } from './X'`
+# The three signals, in the order they are evaluated. Named once so the
+# instrument (#408) and the scorer cannot drift apart on spelling.
+_SIGNAL_NAMES = ("unreachable_file", "no_callers", "not_barrel_exported")
+
+# Identifier tokens in a file's module-level residue (#409). ``_IDENT_ONLY_RE``
+# decides whether a symbol name can be matched by token equality at all.
+_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+_IDENT_ONLY_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*")
+
 _ESM_REEXPORT_NAMED_RE = re.compile(
     r"""export\s*\{[^}]+\}\s*from\s+['"]([^'"]+)['"]"""
 )
@@ -262,6 +271,237 @@ def _package_json_entries(index, store, owner, repo_name) -> set[str]:
 # Main tool
 # ---------------------------------------------------------------------------
 
+# A signal firing on >= this share of analysed symbols (or <= 1 - this) is a
+# constant on that repository, not a discriminator, and gets no vote (#408).
+#
+# ⚠ Chosen from measurement, not taste. Sweeping the cutoff across 31 indexed
+# repositories (Python, Go, TypeScript, JavaScript, Rust): 0.90 is the LARGEST
+# value at which no repository reports more than 90% of its functions as dead.
+# 0.95 still leaves httpx at 93.1%, which is the exact failure mode this closes.
+# 0.80 over-suppresses — the median flag rate hits 0.0% and 17 of 31 repos go
+# empty. At 0.90 the corpus mean falls 57.3% -> 27.4%, the median 54.0% -> 26.3%,
+# and six repositories correctly return nothing.
+#
+# ⚠ It does NOT fire where all three signals discriminate: pylint, flask,
+# matplotlib, astropy, scikit-learn, xarray, sphinx and next keep their previous
+# answers exactly. This is not a blanket suppression.
+_DEGENERACY_CUTOFF = 0.90
+
+
+def _resolve_cutoff(value: Optional[float]) -> float:
+    """Validate a caller-supplied degeneracy cutoff.
+
+    Only ``0.5 < cutoff <= 1.0`` is coherent. The rule is
+    ``1 - cutoff < rate < cutoff``, so at 0.5 the bounds meet and at anything
+    below it they cross: every signal would be uninformative and the tool would
+    return nothing for every repository on earth. That is a silent, total
+    failure, so it is refused rather than clamped.
+
+    ``1.0`` is the documented escape hatch: it excludes only a signal that fires
+    on exactly every or exactly no symbol, which is close to the pre-v1.108.231
+    behaviour for callers who want the old volume back.
+    """
+    if value is None:
+        return _DEGENERACY_CUTOFF
+    try:
+        cutoff = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"degeneracy_cutoff must be a number between 0.5 (exclusive) and 1.0, got {value!r}"
+        )
+    if not (0.5 < cutoff <= 1.0):
+        raise ValueError(
+            f"degeneracy_cutoff must be >0.5 and <=1.0, got {cutoff}. Below 0.5 the "
+            "informative band inverts and every signal is excluded, which returns "
+            "nothing for every repository."
+        )
+    return cutoff
+
+
+def _informative_signals(
+    analysed: int,
+    fire_counts: dict[str, int],
+    cutoff: float = _DEGENERACY_CUTOFF,
+) -> set[str]:
+    """The signals that actually discriminate on this repository.
+
+    A signal that fires on nearly every symbol accuses everything; one that
+    fires on nearly none accuses nothing. Either way it moved no verdict
+    relative to its peers while still setting the scale they were divided by.
+
+    With no symbols analysed there is nothing to measure, so every signal is
+    treated as informative — refusing to score on an empty repository would be
+    inventing a verdict, not withholding one.
+    """
+    if not analysed:
+        return set(_SIGNAL_NAMES)
+    lo = 1.0 - cutoff
+    return {
+        s for s in _SIGNAL_NAMES
+        if lo < (fire_counts.get(s, 0) / analysed) < cutoff
+    }
+
+
+def _signal_diagnostics(
+    analysed: int,
+    fire_counts: dict[str, int],
+    cofire_counts: dict[str, int],
+    entry_point_count: int,
+    cutoff: float = _DEGENERACY_CUTOFF,
+) -> dict:
+    """Report what each signal actually measured on THIS repository (#408).
+
+    ``confidence`` is an unweighted vote: each of the three signals contributes
+    exactly one third, whatever it is worth here. Two facts decide what a vote
+    is worth, and neither was visible in the response before this:
+
+    * **fire_rate** — the fraction of analysed symbols the signal fired on. A
+      signal that fires on everything is a constant, not a discriminator, and it
+      still contributes its full third. This is the machine-readable form of the
+      ``framework_warning`` prose: when no entry point is found, Signal 1's rate
+      goes to 1.0 by construction.
+    * **cofire_rate** — how often a pair fired together. The docstring calls
+      these "three independent signals"; ``unreachable_file`` and
+      ``not_barrel_exported`` are in fact strongly correlated, so a 2-of-3
+      verdict built from that pair can be one underlying fact counted twice.
+
+    ⚠ **This is an instrument, not a fix.** It changes no verdict and no
+    confidence value. It exists so the weighting change that follows can be read
+    against a measured before, rather than argued from first principles — the
+    reason the two ship in separate releases.
+
+    ``uninformative`` names a signal whose rate is at the degenerate end (0.0 or
+    1.0). At 1.0 it accuses everything; at 0.0 it accuses nothing. Either way it
+    moved no verdict relative to the others while still setting the scale.
+    """
+    diag: dict = {
+        "analysed": analysed,
+        "entry_points_detected": entry_point_count,
+        "confidence_basis": "informative_signals_over_3",
+    }
+    if not analysed:
+        return diag
+    diag["fire_rate"] = {
+        s: round(fire_counts.get(s, 0) / analysed, 4) for s in _SIGNAL_NAMES
+    }
+    diag["cofire_rate"] = {
+        k: round(v / analysed, 4) for k, v in sorted(cofire_counts.items())
+    }
+    informative = _informative_signals(analysed, fire_counts, cutoff)
+    diag["informative"] = sorted(informative)
+    # ⚠ Semantics tightened in v1.108.231. In .230 this meant "rate is exactly
+    # 0.0 or 1.0", a placeholder written before there was a measurement. It now
+    # means "does not get a vote", which is the thing a caller actually needs to
+    # know. seaborn's not_barrel_exported at 0.995 was excluded under the old
+    # definition and is a constant by any useful reading.
+    diag["uninformative"] = sorted(set(_SIGNAL_NAMES) - informative)
+    diag["degeneracy_cutoff"] = cutoff
+    # The ceiling, not a score: with fewer than three voting signals nothing in
+    # this repository can reach 1.0, and a caller comparing against the default
+    # min_confidence=0.5 deserves to see why the result set is small or empty.
+    diag["max_achievable_confidence"] = round(len(informative) / 3.0, 2)
+    if entry_point_count == 0:
+        diag["degraded"] = {"unreachable_file": "no_entry_points_detected"}
+    return diag
+
+
+def _sweep_module_level_callers(
+    index,
+    store,
+    owner: str,
+    name: str,
+    rev: dict[str, list[str]],
+    callee_has_caller: set[str],
+) -> None:
+    """Add callers that the per-symbol AST call index cannot record.
+
+    ``CodeIndex.get_callers_by_name`` is built by walking each symbol's
+    ``call_references``, so code at module level — which belongs to no symbol —
+    contributes nothing to it. This scans exactly that residue: each file's text
+    with every symbol body removed. That is both the precise blind spot and a
+    small fraction of the file, and it is consulted only for symbols the AST
+    pass left without a caller, so a repo whose callers all resolve reads no
+    file contents at all.
+
+    Mutates ``callee_has_caller`` in place. Only ever adds.
+
+    ⚠ Disclosed residual: this matches text, not calls, so a bare mention of the
+    name at module level (an ``__all__`` entry, a decorator line above a
+    neighbouring symbol) counts as a caller. That is the same trade the text
+    fallback below already makes, and it is the safe direction for a signal that
+    feeds deletion decisions: it can only fail to report something dead, never
+    report live code as dead.
+    """
+    symbols_by_file = build_symbols_by_file(index)
+    # Per-file: the identifier tokens appearing in that file's module-level
+    # residue. Tokenising each file ONCE and testing set membership per symbol
+    # is what makes this affordable — scanning the residue text per (symbol,
+    # importer) pair instead measured 12x slower than the whole tool on a
+    # 9.7k-function repo. This mirrors ``called_names_by_file`` above, which is
+    # the same shape for the same reason.
+    residue_names_cache: dict[str, set[str]] = {}
+    # Names that are not plain identifiers (Erlang ``add/2``, PHP FQNs) cannot
+    # be found by token equality, so they keep the regex path against the
+    # residue text. Rare, so the text is cached only when one shows up.
+    residue_text_cache: dict[str, str] = {}
+
+    def _residue_text(file_path: str) -> str:
+        """File text with every symbol's line span removed."""
+        if file_path in residue_text_cache:
+            return residue_text_cache[file_path]
+        content = store.get_file_content(owner, name, file_path) or ""
+        if content:
+            lines = content.splitlines()
+            covered = bytearray(len(lines))
+            for s in symbols_by_file.get(file_path, ()):
+                line = s.get("line") or 0
+                if line <= 0:
+                    # No usable span, so there is nothing to subtract. Leaving
+                    # the body in can only find a caller, never invent one's
+                    # absence — the safe direction, same call as .226's
+                    # unspanned_files.
+                    continue
+                start = max(0, line - 1)
+                end = min(len(lines), s.get("end_line") or line)
+                if end > start:
+                    covered[start:end] = b"\x01" * (end - start)
+            content = "\n".join(
+                ln for i, ln in enumerate(lines) if not covered[i]
+            )
+        residue_text_cache[file_path] = content
+        return content
+
+    def _residue_names(file_path: str) -> set[str]:
+        if file_path not in residue_names_cache:
+            residue_names_cache[file_path] = set(
+                _IDENT_RE.findall(_residue_text(file_path))
+            )
+        return residue_names_cache[file_path]
+
+    for sym in index.symbols:
+        if sym.get("kind") not in ("function", "method"):
+            continue
+        sid = sym.get("id", "")
+        if not sid or sid in callee_has_caller:
+            continue
+        sym_file = sym.get("file", "")
+        sym_name = sym.get("name", "")
+        if not sym_name or not sym_file:
+            continue
+        plain = _IDENT_ONLY_RE.fullmatch(sym_name) is not None
+        # Own file first (module-level call in the same module), then any file
+        # that imports it. Same search order as the fast path above.
+        for caller_file in (sym_file, *rev.get(sym_file, ())):
+            if plain:
+                hit = sym_name in _residue_names(caller_file)
+            else:
+                residue = _residue_text(caller_file)
+                hit = bool(residue) and _word_match(residue, sym_name)
+            if hit:
+                callee_has_caller.add(sid)
+                break
+
+
 def get_dead_code_v2(
     repo: str,
     min_confidence: float = 0.5,
@@ -269,6 +509,7 @@ def get_dead_code_v2(
     max_results: int = 100,
     file_pattern: Optional[str] = None,
     storage_path: Optional[str] = None,
+    degeneracy_cutoff: Optional[float] = None,
 ) -> dict:
     """Find likely-dead functions and methods using three independent signals.
 
@@ -295,6 +536,10 @@ def get_dead_code_v2(
     """
     import fnmatch
     t0 = time.monotonic()
+    try:
+        cutoff = _resolve_cutoff(degeneracy_cutoff)
+    except ValueError as e:
+        return {"error": str(e)}
     try:
         owner, name = _resolve_repo(repo, storage_path)
     except ValueError as e:
@@ -368,6 +613,20 @@ def get_dead_code_v2(
                 if sym_name in called_names_by_file.get(caller_file, set()):
                     callee_has_caller.add(sym["id"])
                     break
+        # Sweep what the AST index structurally cannot see (#409).
+        # ``call_references`` are recorded PER SYMBOL, so a call written at
+        # module level belongs to no symbol and never enters ``callers_by_name``
+        # — CLI wiring, route tables, framework registration and ``__main__``
+        # blocks all live there. Worse, which path ran was decided by
+        # ``if callers_by_name:``, a repo-wide property: a tree where no symbol
+        # called another fell through to the text heuristic below and got these
+        # right, and adding a single intra-file call anywhere flipped the whole
+        # repo onto a path that could not. Both now run. The fast path keeps its
+        # precision because the sweep only ever ADDS callers, and only for
+        # symbols the fast path left unresolved.
+        _sweep_module_level_callers(
+            index, store, owner, name, rev, callee_has_caller
+        )
     else:
         # Fallback: text heuristic with file content caching
         symbols_by_file = build_symbols_by_file(index)
@@ -407,10 +666,22 @@ def get_dead_code_v2(
 
     dead_symbols: list[dict] = []
     seen_ids: set[str] = set()
+    # Signal instrumentation (#408). Counted over every ANALYSED symbol, not
+    # just the returned ones, so the rates do not move when a caller changes
+    # ``min_confidence`` — an instrument whose reading depends on the threshold
+    # it is meant to inform is not an instrument.
+    analysed_count = 0
+    fire_counts: dict[str, int] = {s: 0 for s in _SIGNAL_NAMES}
+    cofire_counts: dict[str, int] = {}
+    # Pass 1 collects; pass 2 scores (v1.108.231). Which signals are worth a
+    # vote is a property of the whole repository, so it cannot be known until
+    # every symbol has been seen. Scoring inline was what made a signal that
+    # fires on everything still worth a full third.
+    scored: list[tuple[dict, list[str]]] = []
 
     for sym in index.symbols:
         sid = sym.get("id", "")
-        if not sid or sid in seen_ids:
+        if not sid:
             continue
         if sym.get("kind") not in ("function", "method"):
             continue
@@ -427,9 +698,14 @@ def get_dead_code_v2(
         if not include_tests and _is_test_file(sym_file):
             continue
 
-        # Optional file-pattern scope filter.
-        if file_pattern and not fnmatch.fnmatch(sym_file, file_pattern):
-            continue
+        # ⚠ `file_pattern` is deliberately NOT applied here (v1.108.231). It is
+        # the caller's view of the results, not a definition of the population
+        # the signals are measured against. Filtering first made the fire rates
+        # a property of the filter: scoping to a single file drove every rate to
+        # 1.0, no signal discriminated, and the tool returned nothing for a
+        # question it could answer perfectly well. Whether a signal separates
+        # live from dead code is a fact about the codebase. The filter is
+        # applied in pass 2, on what gets returned.
 
         # Skip symbols with entry-point decorators
         if any(ENTRY_POINT_DECORATOR_RE.search(str(d)) for d in (sym.get("decorators") or [])):
@@ -449,18 +725,49 @@ def get_dead_code_v2(
         if sym_name not in barrel_names:
             signals.append("not_barrel_exported")
 
-        confidence = len(signals) / 3.0
+        analysed_count += 1
+        for s in signals:
+            fire_counts[s] += 1
+        for i, a in enumerate(signals):
+            for b in signals[i + 1:]:
+                cofire_counts[f"{a}+{b}"] = cofire_counts.get(f"{a}+{b}", 0) + 1
+
+        scored.append((sym, signals))
+
+    # Pass 2: only signals that discriminate on THIS repository get a vote.
+    informative = _informative_signals(analysed_count, fire_counts, cutoff)
+    for sym, signals in scored:
+        sid = sym["id"]
+        if sid in seen_ids:
+            continue
+        # Caller's scope filter, applied to the OUTPUT only. See pass 1.
+        if file_pattern and not fnmatch.fnmatch(sym.get("file", ""), file_pattern):
+            continue
+        counted = [s for s in signals if s in informative]
+        # ⚠ Denominator stays 3, deliberately. Dividing by the number of
+        # informative signals would scale a lone survivor back up to 1.0 and
+        # report maximum confidence off one signal — the opposite of the fix.
+        # Holding the denominator is what makes the ceiling fall instead, so a
+        # repository where nothing discriminates returns nothing through the
+        # caller's existing ``min_confidence`` rather than through a second,
+        # invisible suppression rule.
+        confidence = len(counted) / 3.0
         if confidence >= min_confidence:
             seen_ids.add(sid)
-            dead_symbols.append({
+            entry = {
                 "id": sid,
-                "name": sym_name,
+                "name": sym.get("name", ""),
                 "kind": sym.get("kind", ""),
-                "file": sym_file,
+                "file": sym.get("file", ""),
                 "line": sym.get("line", 0),
                 "confidence": round(confidence, 2),
                 "signals": signals,
-            })
+            }
+            if len(counted) != len(signals):
+                # Which of the fired signals actually carried the verdict. Only
+                # emitted when it differs, so the common case costs no tokens.
+                entry["counted_signals"] = counted
+            dead_symbols.append(entry)
 
     dead_symbols.sort(key=lambda x: (-x["confidence"], x["file"], x["line"]))
 
@@ -485,12 +792,37 @@ def get_dead_code_v2(
             "confidence_level": "medium",
             "total_matches": total_matches,
             "truncated": truncated,
+            "signal_diagnostics": _signal_diagnostics(
+                analysed_count, fire_counts, cofire_counts, entry_point_count, cutoff
+            ),
         },
     }
     if file_pattern:
         result["_meta"]["file_pattern"] = file_pattern
     if pkg_entries:
         result["_meta"]["package_json_entries"] = sorted(pkg_entries)
+    diag = result["_meta"]["signal_diagnostics"]
+    excluded = diag.get("uninformative") or []
+    if excluded:
+        # An empty or unexpectedly small result set is a finding, not a
+        # malfunction, and it has to say so or it reads as one.
+        ceiling = diag.get("max_achievable_confidence", 0.0)
+        result["signal_warning"] = (
+            f"{len(excluded)} of 3 signals do not discriminate on this repository and "
+            f"were not counted: {', '.join(excluded)}. Each fired on more than "
+            f"{int(cutoff * 100)}% or fewer than "
+            f"{int((1 - cutoff) * 100)}% of analysed symbols, so it "
+            f"accuses everything or nothing. Maximum reachable confidence here is "
+            f"{ceiling}"
+            + (
+                f", which is below your min_confidence of {min_confidence} — nothing "
+                "can be returned. This is a limit of the evidence, not a claim that "
+                "the repository has no dead code."
+                if ceiling < min_confidence else "."
+            )
+            + " Pass entry_point_patterns to make unreachable_file discriminate, or "
+            "lower min_confidence to see the weaker verdicts."
+        )
     if entry_point_count == 0:
         result["framework_warning"] = (
             "No standard entry points detected (e.g. main.py, app.py, __main__.py). "

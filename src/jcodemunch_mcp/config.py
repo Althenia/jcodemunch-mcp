@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 _GLOBAL_CONFIG: dict[str, Any] = {}
 _PROJECT_CONFIGS: dict[str, dict[str, Any]] = {}
 _PROJECT_CONFIG_HASHES: dict[str, str] = {}
+# Repo keys whose _PROJECT_CONFIGS entry is a MIRROR of global that WE wrote
+# because the repo has no `.jcodemunch.jsonc` (v1.108.197). Only these may be
+# refreshed from global — an entry installed by anyone else is theirs, and
+# overwriting it is data loss, not cache maintenance.
+_PROJECT_CONFIG_MIRRORS: set[str] = set()
 _DEPRECATED_ENV_VARS_LOGGED: set[str] = set()
 _CONFIG_LOCK = threading.Lock()
 _REPO_PATH_CACHE: dict[str, str] = {}
@@ -23,6 +28,7 @@ ENV_VAR_MAPPING = {
     "JCODEMUNCH_USE_AI_SUMMARIES": "use_ai_summaries",
     "JCODEMUNCH_TRUSTED_FOLDERS": "trusted_folders",
     "JCODEMUNCH_TRUSTED_FOLDERS_WHITELIST_MODE": "trusted_folders_whitelist_mode",
+    "JCODEMUNCH_MAX_FILE_SIZE": "max_file_size",
     "JCODEMUNCH_MAX_FOLDER_FILES": "max_folder_files",
     "JCODEMUNCH_MAX_INDEX_FILES": "max_index_files",
     "JCODEMUNCH_STALENESS_DAYS": "staleness_days",
@@ -198,6 +204,7 @@ def invalidate_project_config_cache(source_root: str) -> None:
     with _CONFIG_LOCK:
         _PROJECT_CONFIGS.pop(resolved, None)
         _PROJECT_CONFIG_HASHES.pop(resolved, None)
+        _PROJECT_CONFIG_MIRRORS.discard(resolved)
 
 
 def _check_raw_local_adaptive(local_path: Path) -> tuple[bool, str]:
@@ -325,6 +332,7 @@ DEFAULTS = {
     "use_ai_summaries": "auto",
     "trusted_folders": [],
     "trusted_folders_whitelist_mode": True,
+    "max_file_size": 512000,
     "max_folder_files": 2000,
     "max_index_files": 10000,
     "staleness_days": 7,
@@ -401,6 +409,7 @@ DEFAULTS = {
     },
     "adaptive_tiering": False,
     "compact_schemas": False,
+    "skill_advisor_mode": "off",  # "off" | "advise"
     "server_output": "adaptive",  # "raw", "encoded", or "adaptive"
     "server_output_threshold": 0.15,  # Minimum savings ratio for adaptive mode
     "disabled_tools": ["test_summarizer"],
@@ -480,6 +489,7 @@ CONFIG_TYPES = {
     "use_ai_summaries": (bool, str),
     "trusted_folders": list,
     "trusted_folders_whitelist_mode": bool,
+    "max_file_size": int,
     "max_folder_files": int,
     "max_index_files": int,
     "staleness_days": int,
@@ -500,6 +510,7 @@ CONFIG_TYPES = {
     "model_tier_map": dict,
     "adaptive_tiering": bool,
     "compact_schemas": bool,
+    "skill_advisor_mode": str,
     "server_output": str,
     "server_output_threshold": float,
     "disabled_tools": list,
@@ -1146,14 +1157,34 @@ def load_project_config(source_root: str) -> None:
                             )
                 _PROJECT_CONFIGS[repo_key] = merged
                 _PROJECT_CONFIG_HASHES[repo_key] = content_hash
+                # File-backed, so no longer a mirror of global.
+                _PROJECT_CONFIG_MIRRORS.discard(repo_key)
         except Exception as e:
             logger.warning("Failed to load project config: %s", e)
             with _CONFIG_LOCK:
+                # A file exists but did not parse. The fallback is global, but
+                # this is NOT a mirror: the next call must retry the file.
                 _PROJECT_CONFIGS[repo_key] = deepcopy(_GLOBAL_CONFIG)
+                _PROJECT_CONFIG_MIRRORS.discard(repo_key)
     else:
         with _CONFIG_LOCK:
-            if repo_key not in _PROJECT_CONFIGS:
+            # ⚠ v1.108.197: REFRESH, don't seed-once. A repo with no
+            # `.jcodemunch.jsonc` has nothing of its own to say, so its entry is
+            # a mirror of global — and a mirror that is only ever written on
+            # first sight stops being one the moment global changes. The old
+            # `if repo_key not in _PROJECT_CONFIGS` guard froze the snapshot
+            # taken at first index, so a later global change was invisible to
+            # every `get(..., repo=...)` read for that repo. Harmless while
+            # repo-scoped reads were rare; not harmless now that the three limit
+            # resolvers take `repo=` (#390).
+            #
+            # ⚠ Refresh ONLY entries this branch wrote (`_PROJECT_CONFIG_MIRRORS`).
+            # An entry installed by anyone else — a caller configuring a repo in
+            # memory with no file on disk — is theirs. Overwriting it is data
+            # loss wearing a cache-maintenance costume, and it is silent.
+            if repo_key not in _PROJECT_CONFIGS or repo_key in _PROJECT_CONFIG_MIRRORS:
                 _PROJECT_CONFIGS[repo_key] = deepcopy(_GLOBAL_CONFIG)
+                _PROJECT_CONFIG_MIRRORS.add(repo_key)
             _PROJECT_CONFIG_HASHES.pop(repo_key, None)
 
 
@@ -1921,6 +1952,13 @@ def generate_template() -> str:
   //   true = only trust folders in trusted_folders list (default, secure).
   //   false = trust all folders EXCEPT those in trusted_folders (blocklist mode).
 
+  // "max_file_size": 512000,
+  //   Per-file byte cap for indexing. A file larger than this is skipped with
+  //   reason `too_large`, and a search over a corpus that skipped one cannot
+  //   prove absence -- the file is real, current and wanted, it just never
+  //   entered the index. The default is deliberately conservative; raise it if
+  //   your repo has large legitimate source files, and re-index.
+
   // "max_folder_files": 2000,
   //   Maximum number of files to index when indexing a local folder.
   //   Prevents accidental massive indexing jobs. Monorepos often exceed this;
@@ -2044,6 +2082,16 @@ def generate_template() -> str:
   // fuzzy_*, etc.) from tool schemas. The server still accepts them — they're just
   // hidden from the LLM to save tokens. Saves ~1-2k tokens on top of any profile.
   // "compact_schemas": false,
+
+  // === Skill Advisor ===
+  // "advise" makes audit_agent_config / suggest_corrections flag always-resident
+  // config sections whose symbol and path references resolve into a single
+  // subtree of the repo — content that costs tokens on every turn but only
+  // matters when you are working in that subtree. The suggestion is to move the
+  // prose into a skill and leave a pointer; nothing is rewritten or generated.
+  // Advisory only, and it does NOT measure whether a section went unused —
+  // only what it costs and where it points.
+  // "skill_advisor_mode": "off",
 
   // === Server Output ===
   // Controls how tool responses are emitted:

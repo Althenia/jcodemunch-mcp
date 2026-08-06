@@ -18,6 +18,10 @@ from pathlib import Path
 from typing import Optional
 
 from ..storage import token_tracker as _tt
+from ..retrieval.ledger_trust import (
+    identity_label_is_trustworthy as _identity_label_is_trustworthy,
+    semantic_label_is_trustworthy as _semantic_label_is_trustworthy,
+)
 
 
 _DEFAULT_TOP = 20
@@ -78,16 +82,30 @@ def _ledger_summary(rows: list[tuple], top: int) -> dict:
             "stale_events": 0,
             "identity_hits": 0,
             "semantic_used": 0,
+            # v1.108.186. Rows whose semantic_used column is not evidence — see
+            # retrieval.ledger_trust. Counted separately so `semantic_used` stays a
+            # count of rows that mean it, and reported (rather than dropped) because
+            # a shrunken count with no explanation reads as a usage change.
+            "semantic_label_unknown": 0,
+            # v1.108.187. Rows that recorded no ledger features at all, so their
+            # identity_hit and top-score columns are defaults rather than
+            # measurements. `identity_hits` must not count a default as a miss.
+            "no_ledger_features": 0,
         })
         rb["events"] += 1
+        row = (ts, repo, tool, qh, query, returned_ids, top1, top2, conf, sem, ident, stale)
         if conf is not None:
             rb["_conf_total"] += float(conf)
             rb["_conf_count"] += 1
         if stale:
             rb["stale_events"] += 1
-        if ident:
+        if not _identity_label_is_trustworthy(row):
+            rb["no_ledger_features"] += 1
+        elif ident:
             rb["identity_hits"] += 1
-        if sem:
+        if not _semantic_label_is_trustworthy(row):
+            rb["semantic_label_unknown"] += 1
+        elif sem:
             rb["semantic_used"] += 1
         tb = by_tool.setdefault(tool, {"events": 0})
         tb["events"] += 1
@@ -95,6 +113,13 @@ def _ledger_summary(rows: list[tuple], top: int) -> dict:
         ct = rb.pop("_conf_count", 0)
         total = rb.pop("_conf_total", 0.0)
         rb["avg_confidence"] = round(total / ct, 3) if ct else 0.0
+        # v1.108.186. Present only when there is something to disclose, so a caller
+        # whose ledger holds no mislabelled row sees the byte-identical shape it saw
+        # before. Compatibility here is pinned by a test, not asserted.
+        if not rb.get("semantic_label_unknown"):
+            rb.pop("semantic_label_unknown", None)
+        if not rb.get("no_ledger_features"):
+            rb.pop("no_ledger_features", None)
     repo_ranked = sorted(by_repo.items(), key=lambda kv: kv[1]["events"], reverse=True)[:top]
     tool_ranked = sorted(by_tool.items(), key=lambda kv: kv[1]["events"], reverse=True)
     return {

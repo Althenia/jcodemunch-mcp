@@ -79,6 +79,15 @@ def _working_tree_reading(source_root: Optional[str]) -> Optional[tuple[str, tup
     command failed) and must never be compared as equality with a real reading —
     unknown is not unchanged. TTL-cached so a burst of searches shares one
     subprocess.
+
+    ``stdin=subprocess.DEVNULL`` is load-bearing, not tidiness (jcm#392,
+    @rknighton). This probe runs inside the MCP server process, whose stdin IS
+    the live JSON-RPC channel. Without it Git for Windows inherits that stdin,
+    and the wrapper's child can outlive the ``timeout=`` that kills the
+    immediate process — leaving the captured stdout/stderr pipes open and Python
+    blocked in the follow-up ``communicate()`` long past the deadline (observed:
+    225-300s on a zero-result ``search_text``). Every other in-server git probe
+    already passes it; this one was added later and missed the convention.
     """
     if not source_root:
         return None
@@ -94,6 +103,7 @@ def _working_tree_reading(source_root: Optional[str]) -> Optional[tuple[str, tup
             capture_output=True,
             timeout=10,
             check=False,
+            stdin=subprocess.DEVNULL,
         )
         if out.returncode == 0:
             reading = (
@@ -117,15 +127,15 @@ def capture(index, *, include_tree: bool = False, fresh_head: bool = False) -> d
     state: dict = {}
     try:
         source_root = getattr(index, "source_root", "") or None
-        state["generation"] = getattr(index, "indexed_at", "") or None
-        state["index_sha"] = getattr(index, "git_head", None)
-        try:
-            from ..storage.sqlite_store import _db_mtime_ns
+        # #398 Arc 1: one contract answers "which index is this", so this
+        # surface and `evidence.producers._snapshot` cannot disagree about
+        # whether an index with no stored revision reports "" or None.
+        from ..storage.generation import describe
 
-            db_path = getattr(index, "_db_path", None)
-            state["db_mtime_ns"] = _db_mtime_ns(Path(db_path)) if db_path else None
-        except Exception:
-            state["db_mtime_ns"] = None
+        gen = describe(index)
+        state["generation"] = gen.generation
+        state["index_sha"] = gen.indexed_revision
+        state["db_mtime_ns"] = gen.db_mtime_ns
         live = None
         if source_root:
             try:

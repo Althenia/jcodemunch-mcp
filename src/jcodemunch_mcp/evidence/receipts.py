@@ -46,6 +46,7 @@ unavoidable, and reporting the wrong reason would be worse than reporting none.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -128,18 +129,37 @@ def evidence_id(subject: dict, effective_search: dict, snapshot: dict) -> str:
     return f"{_ID_ALGO}:{digest}"
 
 
-def coverage_fingerprint(coverage: Optional[dict]) -> Optional[str]:
-    """Opaque digest of the coverage block backing this receipt.
+def coverage_fingerprint(coverage: Optional[dict], index=None) -> Optional[str]:
+    """Opaque digest of the corpus backing this receipt.
 
-    Deliberately opaque and deliberately NOT a corpus manifest: source-universe
-    identity, per-file parse outcomes and parser capability fingerprints are
-    Phase 5 (#385). This is the extension point, and filling it in is that
-    issue's job. What it does buy today is that two otherwise-identical scans
-    over corpora with different coverage cannot share an evidence id.
+    Deliberately opaque and deliberately NOT a corpus manifest. What it buys is
+    that two otherwise-identical scans over different corpora cannot share an
+    evidence id.
+
+    ⚠ **v1.108.221 widened what "different corpora" means.** Until now this
+    hashed the coverage block alone — what the SCAN did not see. Coverage is
+    computed by reconciling a walk against the policy that produced it, so two
+    installs with different grammar packs, file-size limits or ignore patterns
+    index the same commit differently and BOTH report ``complete: true``. Their
+    receipts then shared a fingerprint while describing different corpora.
+
+    When ``index`` is supplied the digest also binds the capability certificate
+    (parser registry + grammar-pack versions, eligibility policy, evidence
+    channel generations). ``index=None`` keeps the pre-.221 digest byte-for-byte
+    so an existing receipt's id does not move.
     """
-    if not coverage:
+    if not coverage and index is None:
         return None
-    return hashlib.sha256(_canonical(coverage).encode("utf-8")).hexdigest()[:32]
+    payload: dict = {"coverage": coverage} if index is not None else coverage
+    if index is not None:
+        try:
+            from .capability import build_certificate
+
+            payload["capability"] = build_certificate(index, coverage)
+        except Exception:
+            logger.debug("Capability certificate unavailable for a receipt",
+                         exc_info=True)
+    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()[:32]
 
 
 def build_envelope(
@@ -154,8 +174,19 @@ def build_envelope(
     capabilities: Optional[dict] = None,
     limitations: Optional[list] = None,
     absence_ref: Optional[str] = None,
+    absence_record: Optional[dict] = None,
 ) -> Optional[dict]:
-    """Assemble one receipt. Returns None on an undeclarable proof kind."""
+    """Assemble one receipt. Returns None on an undeclarable proof kind.
+
+    ``absence_record`` is a deep copy of the recorded scan this receipt was
+    minted from (#377 P3, v1.108.192). The ``absence_ref`` alone is NOT
+    snapshot-bound: its key is ``sha256(tool, repo, query, scope)[:12]`` with no
+    snapshot in it, so re-running the same query over a different tree
+    overwrites the record at the same key. A receipt that resolved through that
+    key would be validated against a scan it was never minted from. The ref is
+    still carried, for provenance and for the live-response path, but it is no
+    longer what the receipt STANDS on.
+    """
     if proof_kind not in PROOF_KINDS:
         logger.debug("Refusing to build a receipt for unknown proof kind %r", proof_kind)
         return None
@@ -182,6 +213,11 @@ def build_envelope(
     }
     if absence_ref:
         envelope["absence_ref"] = absence_ref
+    if absence_record is not None:
+        # Deep copy: the live record is a mutable dict in another module's map,
+        # and a shared nested `channels` dict would let a later scan reach into
+        # a minted receipt.
+        envelope["absence_record"] = copy.deepcopy(absence_record)
     return envelope
 
 

@@ -130,6 +130,12 @@ class _State:
         # which is the shape that actually costs.
         self._delivered: OrderedDict = OrderedDict()
         self._redelivered_tokens: int = 0
+        # One id per PROCESS, so the session_yield sink can upsert a single row
+        # per session instead of appending a partial row on every flush. Random
+        # and never transmitted; it exists only to identify the row to update.
+        self._session_uid: str = uuid.uuid4().hex
+        self._session_started: float = time.time()
+        self._delivery_base_path: Optional[str] = None
         # Estimate-vs-actual calibration (v1.108.148; process lifetime only).
         # plan_turn opens an estimate; the next plan_turn closes it against
         # the response tokens actually served in between.
@@ -366,7 +372,7 @@ class _State:
             for sid in [s for s in self._delivered if _touched(s)]:
                 del self._delivered[sid]
 
-    def note_delivered(self, entries) -> list:
+    def note_delivered(self, entries, base_path: Optional[str] = None) -> list:
         """Record symbol deliveries; return the ids already delivered before now.
 
         `entries` yields ``(symbol_id, est_tokens, full_source)``. The returned
@@ -380,6 +386,21 @@ class _State:
         """
         repeats: list = []
         with self._lock:
+            # v1.108.202. Route the session_yield row to the store the CALLER
+            # named, the same correction v1.108.188 made for ranking_events and
+            # tool_calls: every reader takes a base path, so a writer that passes
+            # none lands in ~/.code-index no matter what storage_path the tool was
+            # handed, and the row is written to one database while measure.py
+            # reads another.
+            #
+            # Last explicit base wins. The ledger itself stays session-global
+            # because redelivery is a property of the SESSION, and partitioning it
+            # per store would change the shipped v1.108.167 already_delivered
+            # advisory. A process serving two stores therefore files its one row
+            # under the most recent one; that is disclosed rather than silently
+            # split.
+            if base_path:
+                self._delivery_base_path = base_path
             for sid, tokens, full_source in entries:
                 if not sid:
                     continue
@@ -485,8 +506,15 @@ class _State:
         duration_ms: float,
         ok: bool = True,
         repo: Optional[str] = None,
+        base_path: Optional[str] = None,
     ) -> None:
-        """Record a tool-call duration. Called from server.call_tool."""
+        """Record a tool-call duration. Called from server.call_tool.
+
+        ``base_path`` routes the persisted row to the store the CALL named, the same
+        fix the ranking ledger gets in v1.108.188 — ``analyze_perf`` reads BOTH
+        tables through one base path, so latency rows had the same write-here /
+        read-there split.
+        """
         try:
             with self._lock:
                 ring = self._tool_latencies.get(tool_name)
@@ -497,7 +525,7 @@ class _State:
                 if not ok:
                     self._tool_errors[tool_name] = self._tool_errors.get(tool_name, 0) + 1
                 if _config.get("perf_telemetry_enabled", False):
-                    self._persist_perf_locked(tool_name, duration_ms, ok, repo)
+                    self._persist_perf_locked(tool_name, duration_ms, ok, repo, base_path)
         except Exception:
             logger.debug("record_latency failed for %s", tool_name, exc_info=True)
 
@@ -529,7 +557,26 @@ class _State:
         with self._lock:
             return self._latency_stats_locked()
 
-    def _perf_db_path(self) -> Optional[Path]:
+    def _perf_db_path(self, base_path: Optional[str] = None) -> Optional[Path]:
+        """Resolve the perf db path, preferring an explicitly supplied base.
+
+        ⚠ v1.108.188. ``self._base_path`` is whatever the FIRST caller of
+        ``_ensure_loaded`` happened to pass, and most savings writes pass nothing —
+        so it is usually ``None`` and this resolved to ``~/.code-index`` even for a
+        tool that was handed a ``storage_path``. The read side
+        (``ranking_db_query(base_path=)``, ``analyze_perf(storage_path=)``) has
+        always been parameterised, so writes and reads could disagree about which
+        database they meant. An explicit ``base_path`` wins and is NOT cached: it
+        belongs to one call, not to the process.
+        """
+        if base_path is not None:
+            try:
+                root = Path(base_path)
+                root.mkdir(parents=True, exist_ok=True)
+                return root / _PERF_DB_FILE
+            except Exception:
+                logger.debug("Failed to resolve perf db path at %s", base_path, exc_info=True)
+                return None
         if self._perf_db_path_cached is not None:
             return self._perf_db_path_cached
         try:
@@ -542,11 +589,11 @@ class _State:
             logger.debug("Failed to resolve perf db path", exc_info=True)
             return None
 
-    def _ensure_perf_db_locked(self) -> Optional[sqlite3.Connection]:
+    def _ensure_perf_db_locked(self, base_path: Optional[str] = None) -> Optional[sqlite3.Connection]:
         """Open the perf SQLite db (create schema on first use)."""
         if self._perf_db_failed:
             return None
-        path = self._perf_db_path()
+        path = self._perf_db_path(base_path)
         if path is None:
             return None
         try:
@@ -565,6 +612,18 @@ class _State:
             conn.execute("CREATE INDEX IF NOT EXISTS ix_tool_calls_ts   ON tool_calls(ts)")
             # v1.78.0 — ranking ledger (data-collection only; consumed by
             # the online weight tuner in v1.79.0).
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS session_yield (
+                    session_uid            TEXT PRIMARY KEY,
+                    started_at             REAL NOT NULL,
+                    updated_at             REAL NOT NULL,
+                    deliveries             INTEGER NOT NULL,
+                    distinct_symbols       INTEGER NOT NULL,
+                    redelivered_symbols    INTEGER NOT NULL,
+                    redelivered_tokens_est INTEGER NOT NULL,
+                    full_source_symbols    INTEGER NOT NULL
+                )
+            """)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS ranking_events (
                     ts             REAL NOT NULL,
@@ -587,8 +646,74 @@ class _State:
             return conn
         except Exception:
             logger.debug("Failed to open perf db at %s", path, exc_info=True)
-            self._perf_db_failed = True
+            # v1.108.188. The kill-switch covers the DEFAULT db only. One unwritable
+            # caller-supplied path must not disable telemetry for every other store
+            # in the process — the flag was written when there was only one path it
+            # could ever mean.
+            if base_path is None:
+                self._perf_db_failed = True
             return None
+
+    def _persist_session_yield_locked(self, base_path: Optional[str] = None) -> None:
+        """Upsert this session's delivery counts into the perf db. Lock held.
+
+        Why RAW COUNTS and not just the rate: a representative redelivery figure
+        pools numerators and denominators across sessions. Averaging per-session
+        rates would weight a 3-delivery session the same as a 300-delivery one
+        and is simply the wrong statistic, so the aggregate must be recomputable
+        from these columns.
+
+        One row per process, upserted on every flush rather than appended once at
+        exit: a SIGKILL'd server still leaves its latest counts behind, and no
+        session is ever represented twice.
+        """
+        if not _config.get("perf_telemetry_enabled", False):
+            return
+        if not self._delivered:
+            return
+        try:
+            conn = self._ensure_perf_db_locked(base_path)
+            if conn is None:
+                return
+            try:
+                deliveries = sum(r["count"] for r in self._delivered.values())
+                distinct = len(self._delivered)
+                redelivered = sum(
+                    1 for r in self._delivered.values() if r["count"] > 1
+                )
+                full_source = sum(
+                    1 for r in self._delivered.values() if r.get("full_source")
+                )
+                conn.execute(
+                    "INSERT INTO session_yield (session_uid, started_at, updated_at,"
+                    " deliveries, distinct_symbols, redelivered_symbols,"
+                    " redelivered_tokens_est, full_source_symbols)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    " ON CONFLICT(session_uid) DO UPDATE SET"
+                    "   updated_at=excluded.updated_at,"
+                    "   deliveries=excluded.deliveries,"
+                    "   distinct_symbols=excluded.distinct_symbols,"
+                    "   redelivered_symbols=excluded.redelivered_symbols,"
+                    "   redelivered_tokens_est=excluded.redelivered_tokens_est,"
+                    "   full_source_symbols=excluded.full_source_symbols",
+                    (
+                        self._session_uid,
+                        self._session_started,
+                        time.time(),
+                        deliveries,
+                        distinct,
+                        redelivered,
+                        int(self._redelivered_tokens),
+                        full_source,
+                    ),
+                )
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("session_yield persist failed", exc_info=True)
 
     def record_ranking_event(
         self,
@@ -603,16 +728,24 @@ class _State:
         semantic_used: bool = False,
         identity_hit: bool = False,
         repo_is_stale: bool = False,
+        base_path: Optional[str] = None,
     ) -> None:
         """Append a ranking event to the perf db (no-op when disabled).
 
         v1.79.0 will use these rows to tune per-repo BM25/semantic weights.
+
+        ⚠ v1.108.188. ``base_path`` is the store the CALLER was told to use. Without
+        it these rows landed in ``~/.code-index`` whatever ``storage_path`` the tool
+        was handed, while every reader (``ranking_db_query``, ``WeightTuner``,
+        ``analyze_perf``) took a base path — so a non-default store wrote to one
+        database and read from another, and the tuner learned from a ledger the
+        searches had never written to.
         """
         if not _config.get("perf_telemetry_enabled", False):
             return
         try:
             with self._lock:
-                conn = self._ensure_perf_db_locked()
+                conn = self._ensure_perf_db_locked(base_path)
                 if conn is None:
                     return
                 try:
@@ -654,8 +787,9 @@ class _State:
         duration_ms: float,
         ok: bool,
         repo: Optional[str],
+        base_path: Optional[str] = None,
     ) -> None:
-        conn = self._ensure_perf_db_locked()
+        conn = self._ensure_perf_db_locked(base_path)
         if conn is None:
             return
         try:
@@ -766,6 +900,8 @@ class _State:
         self._unflushed = 0
         self._call_count = 0
         self._write_session_stats_locked(self._build_stats_locked())
+        # Opt-in and local-only; no-ops entirely unless perf telemetry is on.
+        self._persist_session_yield_locked(self._delivery_base_path)
 
     def flush(self) -> None:
         """Public flush — called at atexit."""
@@ -996,7 +1132,13 @@ def _runtime_signal_summary(base_path: Optional[str] = None) -> dict:
             if db_path.name in non_repo:
                 continue
             try:
-                conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                # #398 Arc 1: this loop touches EVERY index in ~/.code-index,
+                # so a plain `mode=ro` created a -wal beside each one and moved
+                # every repo's mtime at once — the v1.108.185 `rebuilding`
+                # defect at fleet scale.
+                from .generation import connect_readonly
+
+                conn = connect_readonly(db_path, isolation_level="")
                 conn.row_factory = _sqlite3.Row
                 # Skip dbs that don't have the runtime_calls table yet
                 row = conn.execute(
@@ -1051,9 +1193,10 @@ def record_tool_latency(
     duration_ms: float,
     ok: bool = True,
     repo: Optional[str] = None,
+    base_path: Optional[str] = None,
 ) -> None:
     """Record a tool-call duration for the current session (and optional perf db)."""
-    _state.record_latency(tool_name, duration_ms, ok=ok, repo=repo)
+    _state.record_latency(tool_name, duration_ms, ok=ok, repo=repo, base_path=base_path)
 
 
 def latency_stats() -> dict:
@@ -1072,7 +1215,11 @@ def record_ranking_event(**kwargs) -> None:
     """Append a ranking event to telemetry.db (no-op when telemetry disabled).
 
     Keyword args: tool, repo, query, returned_ids, top1_score, top2_score,
-    confidence, semantic_used, identity_hit, repo_is_stale.
+    confidence, semantic_used, identity_hit, repo_is_stale, base_path.
+
+    ⚠ Pass ``base_path`` whenever the caller was given a ``storage_path``, or the
+    row lands in the default store while the readers look in the named one
+    (v1.108.188).
     """
     _state.record_ranking_event(**kwargs)
 
@@ -1214,9 +1361,9 @@ def note_edited_files(file_paths) -> None:
     _state.note_edited_files(file_paths)
 
 
-def note_delivered(entries) -> list:
+def note_delivered(entries, base_path: Optional[str] = None) -> list:
     """Record symbol deliveries; return ids already delivered this session."""
-    return _state.note_delivered(entries)
+    return _state.note_delivered(entries, base_path=base_path)
 
 
 def note_call_signature(tool_name: str, args_hash: str) -> None:

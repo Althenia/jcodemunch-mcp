@@ -13,7 +13,12 @@ logger = logging.getLogger(__name__)
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ..parser.imports import resolve_specifier
-from ._utils import resolve_repo, resolve_fqn, index_status_to_tool_error
+from ._utils import (
+    resolve_repo,
+    resolve_fqn,
+    index_status_to_tool_error,
+    ledger_base_path as _ledger_base_path,
+)
 
 BYTES_PER_TOKEN = 4
 
@@ -101,6 +106,18 @@ def _result_cache_get(key: tuple) -> Optional[dict]:
                 _v = result["_meta"].get("verdict")
                 if isinstance(_v, dict):
                     result["_meta"]["verdict"] = dict(_v)
+            # The ROWS need the same treatment, and for the same reason
+            # (v1.108.225, @rknighton #404). Annotators downstream of this
+            # return — `_freshness`, `_runtime_confidence` — write per-row IN
+            # PLACE. With a shared list of shared dicts those writes land in the
+            # stored entry and replay to every later hit: the `evidence_ref`
+            # leak of #377 item 3, one level down. Re-annotating a cache hit
+            # without this copy would reintroduce it.
+            _rows = result.get("results")
+            if isinstance(_rows, list):
+                result["results"] = [
+                    dict(_r) if isinstance(_r, dict) else _r for _r in _rows
+                ]
             return result
     return None
 
@@ -716,6 +733,35 @@ def search_symbols(
                 _why = _subject.changed(_cached_state, _now_state)
                 if _why:
                     _subject.revalidate_verdict(_cv, _why)
+                    # The verdict now discloses that the subject moved — but the
+                    # rows still carry the `_freshness` computed when this entry
+                    # was FILLED, and `_meta.freshness` still summarises that
+                    # pass. Left alone, one payload asserts both
+                    # `revalidated.stale_cache: true` and `_freshness: "fresh"`,
+                    # and the field an agent reads to decide whether to trust the
+                    # content is the one that is wrong (@rknighton #404).
+                    #
+                    # ⚠ This is NOT a reversal of the v1.108.178 cached-positive
+                    # policy: the results really were in the index at that
+                    # generation and they keep serving. The defect is that the
+                    # disclosure reached `verdict` and stopped. Re-annotating
+                    # costs the same few stats that policy already accepts and
+                    # does not re-run the search.
+                    #
+                    # Safe to annotate in place: `_result_cache_get` copies the
+                    # rows, so this cannot write through to the stored entry.
+                    from ..retrieval.freshness import FreshnessProbe as _RevalFP
+                    _reval_rows = _cached.get("results") or []
+                    _reval_probe = _RevalFP(
+                        source_root=getattr(index, "source_root", "") or None,
+                        indexed_at=getattr(index, "indexed_at", ""),
+                        index_sha=getattr(index, "git_head", None),
+                        file_mtimes=getattr(index, "file_mtimes", None),
+                    )
+                    _reval_probe.annotate(_reval_rows)
+                    _cached.setdefault("_meta", {})["freshness"] = (
+                        _reval_probe.summary(_reval_rows)
+                    )
             except Exception:
                 logger.debug("Cached-result revalidation failed", exc_info=True)
             # Cache hit — return immediately with fresh timing.
@@ -1127,6 +1173,9 @@ def search_symbols(
     _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
     _feat = _ledger_feats(_conf_input)
     _record_ranking_event(
+        # v1.108.188: the store this call was told to use, not whichever one the
+        # first savings write of the process happened to pin.
+        base_path=_ledger_base_path(store),
         tool="search_symbols",
         repo=f"{owner}/{name}",
         query=query,
@@ -1290,11 +1339,18 @@ def _search_symbols_semantic(
         return {"error": f"Failed to embed query: {exc}"}
 
     # ── Load / lazily compute symbol embeddings ────────────────────────────
+    # v1.108.223 (#399, @vondecron): the matrix is decoded and L2-normalised
+    # ONCE per (repo, store-stamp) and cached in process, instead of re-reading
+    # and re-parsing every stored vector on every semantic query. It also
+    # replaces `get_all()` with a read-only load, so this path no longer bumps
+    # the .db mtime as a side effect of reading it (same defect class as .185).
     db_path = store._sqlite._db_path(owner, name)
     emb_store = EmbeddingStore(db_path)
-    all_emb: dict[str, list[float]] = emb_store.get_all()
+    from ..storage import embedding_matrix as _embed_matrix
+    matrix = _embed_matrix.get_matrix(db_path)
+    embedded_ids = matrix.id_set if matrix is not None else set()
 
-    missing = [s for s in index.symbols if s["id"] not in all_emb]
+    missing = [s for s in index.symbols if s["id"] not in embedded_ids]
     if missing:
         new_emb: dict[str, list[float]] = {}
         for bi in range(0, len(missing), EMBED_BATCH_SIZE):
@@ -1314,7 +1370,14 @@ def _search_symbols_semantic(
                 emb_store.set_dimension(dim, model)
                 emb_store.set_task_type(doc_task_type or "")
             emb_store.set_many(new_emb)
-            all_emb.update(new_emb)
+
+    # Cosine for every embedded symbol, in one vectorised pass. `matrix` was
+    # loaded before the top-up above, so vectors embedded just now are scored
+    # individually rather than forcing a full re-decode for a handful of rows.
+    cos_by_id: dict[str, float] = matrix.score_all(query_vec) if matrix is not None else {}
+    if missing and new_emb:
+        for _sid, _vec in new_emb.items():
+            cos_by_id[_sid] = _cosine_similarity(query_vec, _vec)
 
     # ── Two-pass scoring ───────────────────────────────────────────────────
     # Pass 1: collect lexical BM25 (identity EXCLUDED), the identity signal, and
@@ -1355,8 +1418,7 @@ def _search_symbols_semantic(
         if lex + idn > max_bm25:
             max_bm25 = lex + idn
 
-        sym_vec = all_emb.get(sym["id"])
-        cos = _cosine_similarity(query_vec, sym_vec) if sym_vec else 0.0
+        cos = cos_by_id.get(sym["id"], 0.0)
         if cos > max_cos:
             max_cos = cos
 
@@ -1378,7 +1440,26 @@ def _search_symbols_semantic(
             continue
         scored.append((score, sym))
 
-    scored.sort(key=lambda x: x[0], reverse=True)
+    # ⚠⚠ `(-score, symbol_id)`, not score alone (v1.108.228, #398 Arc 4 / #403).
+    # A stable sort on score breaks ties on INSERTION ORDER — deterministic, but
+    # arbitrary: it is the order SQLite handed the rows back. A ranking must not
+    # depend on that.
+    #
+    # This became urgent rather than merely correct in v1.108.223. That release
+    # gave the semantic scorer two lanes — a numpy float32 matmul and a
+    # pure-Python float64 fallback — and their scores differ by ~1e-7. Measured
+    # on a deliberately near-tied 4,000-vector corpus, they disagreed at RANK 0:
+    # two installs of the SAME version ranked differently based only on whether
+    # numpy was importable. A total order on (score, id) does not remove the
+    # float difference, but it removes insertion order as a second, invisible
+    # source of divergence — and it collapses the exact-tie bucket that #403's
+    # certification breadth measures.
+    #
+    # ⚠ On real embeddings @rknighton measured ZERO float32/float64 boundary
+    # disagreements across Django, FastAPI and jcm. The 4,000-vector corpus above
+    # is synthetic and maximally homogeneous — it shows the hazard is real in
+    # principle, NOT that it fires in practice. Both facts belong together.
+    scored.sort(key=lambda x: (-x[0], x[1]["id"]))
     top = scored[:effective_limit]
     # Real ranking scores (top-first) for confidence/ledger (V6).
     _conf_scores = [s for s, _ in top]
@@ -1494,6 +1575,9 @@ def _search_symbols_semantic(
     _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
     _feat = _ledger_feats(_conf_input)
     _record_ranking_event(
+        # v1.108.188: the store this call was told to use, not whichever one the
+        # first savings write of the process happened to pin.
+        base_path=_ledger_base_path(store),
         tool="search_symbols",
         repo=f"{owner}/{name}",
         query=query,
@@ -1709,23 +1793,28 @@ def _search_symbols_fusion(
     #  _embed_texts forms all raised and were swallowed, so this channel never ran.)
     similarity_used = False
     try:
-        from ..storage.embedding_store import EmbeddingStore
-        emb_store = EmbeddingStore(store._sqlite._db_path(owner, name))
         # v1.108.185: read-only, because the plain read wrote. `_connect` runs a
         # WAL pragma and a CREATE-TABLE script on every connection, so probing for
         # embeddings here moved the .db mtime mid-scan and made this exit report
         # `rebuilding` + `moved_during_scan` on the first fusion search of any
         # process — which downgraded the verdict and put `absent` out of reach for
         # an entirely self-inflicted reason.
-        all_embeddings = emb_store.get_all_readonly()
-        if all_embeddings:
+        # v1.108.223 (#399): still read-only, and now decoded once per store
+        # stamp rather than once per query.
+        from ..storage import embedding_matrix as _embed_matrix
+        matrix = _embed_matrix.get_matrix(store._sqlite._db_path(owner, name))
+        if matrix is not None:
             from .embed_repo import _detect_provider, embed_texts
             provider = _detect_provider()
             if provider:
                 q_emb = embed_texts([query], provider[0], provider[1])
                 if q_emb and q_emb[0]:
-                    from ..retrieval.signal_fusion import build_similarity_channel
-                    sim_ch = build_similarity_channel(q_emb[0], all_embeddings)
+                    from ..retrieval.signal_fusion import (
+                        build_similarity_channel_from_scores,
+                    )
+                    sim_ch = build_similarity_channel_from_scores(
+                        matrix.score_all(q_emb[0])
+                    )
                     channels.append(sim_ch)
                     similarity_used = True
     except Exception:
@@ -1861,10 +1950,27 @@ def _search_symbols_fusion(
     )
     if _runtime_summary:
         meta["runtime_freshness"] = _runtime_summary
+    # v1.108.187. `_ledger_feats` reads `identity`/`identity_match` off these rows and
+    # this input carried neither, so `identity_hit` was recorded False on every fusion
+    # row regardless of what the identity channel found. Unlike the non-fusion paths,
+    # whose rows carry `identity` from `_identity_score`, the fused rows never get
+    # that key. The channel's own `raw_scores` is the answer, and it admits only
+    # symbols scoring above zero.
+    #
+    # ⚠ Fed to the LEDGER only, not to `attach_confidence`. `compute_confidence`
+    # sniffs the same key when no `has_identity_match` is passed and scores it 1.0
+    # known-true / 0.7 unknown / 0.6 known-false, so sharing one input would move the
+    # confidence of every fusion search. That is its own change with its own
+    # justification, not a side effect of recording a column.
     _conf_input = [{"score": s} for s in _conf_scores]
     _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
-    _feat = _ledger_feats(_conf_input)
+    _id_raw = getattr(id_ch, "raw_scores", None) or {}
+    _feat = _ledger_feats([
+        {"score": fr.score, "identity": _id_raw.get(fr.symbol_id, 0.0)}
+        for fr in fused[:effective_limit]
+    ])
     _record_ranking_event(
+        base_path=_ledger_base_path(store),
         tool="search_symbols_fusion",
         repo=f"{owner}/{name}",
         query=query,

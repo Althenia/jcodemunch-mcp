@@ -26,6 +26,10 @@ from typing import Any, Optional
 
 from ..storage import token_tracker as _tt
 from .. import config as _config
+from .ledger_trust import (
+    identity_label_is_trustworthy as _identity_label_is_trustworthy,
+    semantic_label_is_trustworthy as _semantic_label_is_trustworthy,
+)
 
 # Column indices into a ranking_events row tuple.
 _TS, _REPO, _TOOL, _QH, _QUERY, _RETURNED = 0, 1, 2, 3, 4, 5
@@ -133,7 +137,20 @@ def _detect_thin_result(by_qh: "dict[str, list[tuple]]") -> list[dict]:
         for r in rows:
             ids = _decode_ids(r[_RETURNED])
             top1 = r[_TOP1]
-            if not ids or (len(ids) <= 1 and (top1 is None or top1 < THIN_TOP1_FLOOR)):
+            if not ids:
+                hits.append(r)
+                continue
+            if len(ids) > 1:
+                continue
+            # v1.108.187. A single result with no recorded `top1_score` counts as
+            # thin, which reads a MISSING measurement as a weak one. That is fine
+            # where the score was genuinely absent, but pre-v1.108.187 fusion rows
+            # from get_ranked_context recorded NO features at all, so those were
+            # clustered as thin on the strength of a default. Only those rows are
+            # skipped; every other producer's behaviour is unchanged.
+            if not _identity_label_is_trustworthy(r):
+                continue
+            if top1 is None or top1 < THIN_TOP1_FLOOR:
                 hits.append(r)
         if len(hits) >= 2:
             out.append(_cluster(
@@ -177,11 +194,29 @@ def _detect_stale_at_query(events: list[tuple]) -> list[dict]:
 
 def _detect_vocabulary_gap(by_qh: "dict[str, list[tuple]]") -> list[dict]:
     """Identity miss rescued by semantic search => the agent's term doesn't
-    match a symbol name but means one. The strongest novelty signal."""
+    match a symbol name but means one. The strongest novelty signal.
+
+    ⚠ v1.108.186. This signal is the conjunction ``not identity_hit and
+    semantic_used``, which made every pre-fix ``get_ranked_context_fusion`` row a
+    textbook match: that exit hardcoded ``semantic_used=1`` and passed no ledger
+    features at all, so ``identity_hit`` defaulted to 0 while the identity channel
+    was in fact one of the three it built. A confident fusion call therefore
+    reported "the agent's term doesn't match a symbol name" on a call where
+    identity matching ran, and ``suggest_corrections`` turns these clusters into
+    config patches shown to the user. Rows whose semantic label is not evidence
+    cannot support this signal, so they are dropped from it.
+    """
     out = []
     for qh, rows in by_qh.items():
+        # ⚠ v1.108.187 checked `identity_label_is_trustworthy` here too and it was
+        # UNREACHABLE: this signal requires `r[_SEM]`, and a
+        # get_ranked_context_fusion row with semantic_used=1 is already refused by
+        # the v1.108.186 semantic rule. An unreachable guard reads like protection
+        # and is not, so it is not here. The featureless rows are excluded from the
+        # signals that CAN see them (thin_result) and disclosed on the result.
         hits = [r for r in rows
-                if not r[_IDHIT] and r[_SEM]
+                if _semantic_label_is_trustworthy(r)
+                and not r[_IDHIT] and r[_SEM]
                 and r[_CONF] is not None and r[_CONF] >= VOCAB_CONF_FLOOR]
         if len(hits) >= VOCAB_RECUR:
             out.append(_cluster(
@@ -229,6 +264,18 @@ def analyze_regret(
             "the window. Run some searches, or widen the window with all_time."
         )
         return base
+
+    # v1.108.186. Disclosed rather than silently dropped: the vocabulary_gap signal
+    # ignores these rows, and a reader comparing `events_analyzed` against the
+    # clusters found deserves to know some rows could not support one of the six.
+    _untrusted = sum(1 for r in events if not _semantic_label_is_trustworthy(r))
+    if _untrusted:
+        base["events_semantic_label_unknown"] = _untrusted
+    # v1.108.187. Rows that recorded no ledger features at all: three of the six
+    # signals read those columns, so say how many rows could not support them.
+    _featureless = sum(1 for r in events if not _identity_label_is_trustworthy(r))
+    if _featureless:
+        base["events_without_ledger_features"] = _featureless
 
     by_qh = _by_query_hash(events)
     clusters: list[dict] = []

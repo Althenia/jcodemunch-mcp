@@ -95,6 +95,13 @@ def index_coverage_meta(index) -> Optional[dict]:
         out["dropped_after_discovery"] = cov["dropped_after_discovery"]
     if cov.get("unaccounted"):
         out["unaccounted"] = cov["unaccounted"]
+    # v1.108.193: surfaced separately from `excluded` because it answers a
+    # different question. `excluded` says what this corpus is not about; a
+    # binary or a gitignored tree was never a candidate. `withheld` says a real,
+    # current, wanted source file was refused by one of OUR limits, which is the
+    # one exclusion reason a reader must not read as "the file is not there".
+    if cov.get("withheld"):
+        out["withheld"] = cov["withheld"]
     return out
 
 
@@ -337,11 +344,11 @@ def build_verdict(
             # above `fresh`: a known lag is worse than an unestablished one, and
             # both are worse than proven currency. `fresh` now means only what
             # it says.
-            "index": (
-                "rebuilding" if index_changed
-                else "partial" if coverage_is_incomplete(coverage)
-                else "stale" if index_stale
-                else freshness
+            "index": index_channel(
+                index_changed=index_changed,
+                coverage=coverage,
+                index_stale=index_stale,
+                freshness=freshness,
             ),
         },
         "scorer": SCORER_VERSION,
@@ -617,6 +624,7 @@ def build_file_verdict(
     index_stale: bool = False,
     empty_symbols: bool = False,
     index_changed: bool = False,
+    freshness: Optional[str] = None,
 ) -> dict:
     """`_meta.verdict` for the file-read tools.
 
@@ -655,8 +663,11 @@ def build_file_verdict(
     verdict = {
         "state": state,
         "channels": {
-            "index": "rebuilding" if index_changed
-            else ("stale" if index_stale else "fresh")
+            "index": index_channel(
+                index_changed=index_changed,
+                index_stale=index_stale,
+                freshness=freshness,
+            )
         },
         "note": note,
     }
@@ -670,6 +681,7 @@ def symbol_verdict_for_index(
     *,
     found_count: int,
     requested_id: Optional[str] = None,
+    unavailable_source_count: int = 0,
 ) -> dict:
     """Index-aware wrapper over :func:`build_symbol_verdict`."""
     verdict = build_symbol_verdict(
@@ -678,6 +690,8 @@ def symbol_verdict_for_index(
         symbols=getattr(index, "symbols", None) if found_count == 0 else None,
         index_stale=_index_is_stale(index),
         index_changed=index_changed_since_load(index),
+        unavailable_source_count=unavailable_source_count,
+        freshness=_index_freshness(index),
     )
     _attach_coverage(verdict, index_coverage_meta(index))
     return verdict
@@ -708,17 +722,71 @@ def index_changed_since_load(index) -> bool:
     a hand-built CodeIndex) returns False rather than degrading every verdict.
     """
     try:
-        from pathlib import Path
+        from ..storage.generation import describe
 
-        from ..storage.sqlite_store import _db_mtime_ns
-
-        db_path = getattr(index, "_db_path", None)
-        loaded_at = getattr(index, "_loaded_mtime_ns", None)
-        if not db_path or loaded_at is None:
-            return False
-        return _db_mtime_ns(Path(db_path)) != int(loaded_at)
+        return describe(index).rewritten_since_load
     except Exception:
         return False
+
+
+def index_channel(
+    *,
+    index_changed: bool = False,
+    coverage: Optional[dict] = None,
+    index_stale: bool = False,
+    freshness: Optional[str] = None,
+) -> str:
+    """The single expression that renders ``verdict.channels.index``.
+
+    Extracted because there were THREE copies of it and they had drifted:
+    :func:`build_verdict` honoured the #377 item 4 tri-state while
+    :func:`build_file_verdict` and :func:`build_symbol_verdict` still carried
+    the two-state ``"stale" if index_stale else "fresh"``. On an index whose
+    freshness cannot be established, ``get_symbol_source`` /
+    ``get_file_content`` / ``get_file_outline`` therefore reported
+    ``channels.index: "fresh"`` in the same payload whose ``_meta.freshness``
+    correctly said ``unknown`` — measured against ``django/django``, whose
+    index carries an empty ``source_root``.
+
+    Ordering is by how badly each condition undermines the answer: a rebuild in
+    flight beats a known coverage gap beats a known lag. ``unknown`` and
+    ``not_tracked`` sit below ``stale`` and above ``fresh``: a known lag is
+    worse than an unestablished one, and both are worse than proven currency.
+
+    ``freshness`` of ``None`` keeps a caller that supplies only the Boolean on
+    exactly its previous two-state behaviour, so adding the parameter changes
+    no existing result.
+    """
+    if index_changed:
+        return "rebuilding"
+    if coverage is not None and coverage_is_incomplete(coverage):
+        return "partial"
+    if index_stale:
+        return "stale"
+    if freshness in ("fresh", "stale", "unknown", "not_tracked"):
+        return freshness
+    return "fresh"
+
+
+def _index_freshness(index) -> str:
+    """Tri-state repo freshness for *index* (never raises).
+
+    ⚠ Failure returns ``unknown``, NOT ``fresh``. The whole point of the
+    tri-state is that "we could not find out" must not render as proof of
+    currency, and an exception here is precisely that case.
+    """
+    try:
+        from .freshness import FreshnessProbe
+
+        probe = FreshnessProbe(
+            source_root=getattr(index, "source_root", "") or None,
+            indexed_at=getattr(index, "indexed_at", ""),
+            index_sha=getattr(index, "git_head", None),
+            file_mtimes=getattr(index, "file_mtimes", None),
+        )
+        return probe.repo_freshness
+    except Exception:
+        return "unknown"
 
 
 def _index_is_stale(index) -> bool:
@@ -752,6 +820,7 @@ def file_verdict_for_index(
         index_stale=_index_is_stale(index),
         empty_symbols=empty_symbols,
         index_changed=index_changed_since_load(index),
+        freshness=_index_freshness(index),
     )
     _attach_coverage(verdict, index_coverage_meta(index))
     return verdict
@@ -764,12 +833,22 @@ def build_symbol_verdict(
     symbols: Optional[Sequence[dict]] = None,
     index_stale: bool = False,
     index_changed: bool = False,
+    unavailable_source_count: int = 0,
+    freshness: Optional[str] = None,
 ) -> dict:
     """`_meta.verdict` for ``get_symbol_source``.
 
     ``found_count == 0`` yields ``absent`` plus ``did_you_mean`` symbol ids that
     share the requested name; any resolved symbol yields ``ok`` (a partial batch
     is still a hit).
+
+    ``unavailable_source_count`` is the number of resolved symbols whose body
+    could not be read back. Resolving a symbol and producing its source are two
+    different successes, and an index can do the first without the second: the
+    row lives in the ``.db`` while the bytes live in a separate content
+    directory. When that directory is absent the tool used to return the row
+    with ``source: ""`` under ``state: ok``, which asserts an answer it does not
+    have. A body it cannot produce makes the result degraded.
     """
     if found_count == 0 and index_changed:
         # jdoc/jcm #93 class: a rebuild deletes and reinserts rows, so a
@@ -782,6 +861,17 @@ def build_symbol_verdict(
         state = STATE_ABSENT
         note = "Symbol id is not in the index. " + _NOTES[STATE_ABSENT]
         suggestions = suggest_symbol_ids(requested_id, symbols)
+    elif unavailable_source_count > 0:
+        state = STATE_DEGRADED
+        plural = "s" if unavailable_source_count != 1 else ""
+        note = (
+            f"{unavailable_source_count} symbol{plural} resolved but the body could not "
+            "be read: the cached file content is missing for that path. Signatures, "
+            "docstrings and line ranges are accurate; `source` is empty because it is "
+            "unavailable, NOT because the symbol is empty. Re-index the repo to "
+            "rebuild the content cache."
+        )
+        suggestions = []
     else:
         state = STATE_OK
         note = _NOTES[STATE_OK]
@@ -789,11 +879,17 @@ def build_symbol_verdict(
     verdict = {
         "state": state,
         "channels": {
-            "index": "rebuilding" if index_changed
-            else ("stale" if index_stale else "fresh")
+            "index": index_channel(
+                index_changed=index_changed,
+                index_stale=index_stale,
+                freshness=freshness,
+            )
         },
         "note": note,
     }
+    if unavailable_source_count > 0:
+        verdict["channels"]["content_cache"] = "missing"
+        verdict["unavailable_source_count"] = unavailable_source_count
     if suggestions:
         verdict["did_you_mean"] = suggestions
     return verdict

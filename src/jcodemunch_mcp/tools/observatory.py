@@ -1,6 +1,6 @@
 """``observatory`` — public OSS code-health observatory pipeline.
 
-todo.md item #7. Periodically clones a curated list of OSS repos,
+Shipped v1.90.0. Periodically clones a curated list of OSS repos,
 indexes each one, runs ``get_repo_health``, and writes static HTML +
 JSON artifacts that an external host (Mac Mini, fly.io, GitHub Pages,
 S3, anywhere) can serve as ``/report/<repo>``.
@@ -104,7 +104,7 @@ def _run_git(args: list[str], cwd: Path, *, timeout: int = 60) -> tuple[int, str
             ["git", *args],
             cwd=str(cwd),
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )

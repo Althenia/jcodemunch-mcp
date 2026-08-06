@@ -167,6 +167,18 @@ _SKIP_DIRECTORY_NAMES: list[str] = [
     "dist", "build", ".git", ".tox", ".mypy_cache", "target",
     ".gradle", "test_data", "testdata", "fixtures", "snapshots",
     "migrations", "generated", "proto", "DerivedData", ".build",
+    # v1.108.234: duplicate source trees. A `backup/`, `old/` or `archive/`
+    # directory holding real source files indexes the SAME symbols twice, and
+    # the copies then compete with the originals in ranking. Reported by a user
+    # who indexed a project root (1,824 files, ~40% sources) and got diluted
+    # results plus some empty queries; scoping to the crate fixed it.
+    #
+    # ⚠ These are ordinary English words and CAN name a real package. That is
+    # why `exclude_skip_directories` exists — a project that ships an
+    # `archive/` module removes it there per-project. Every skip is also
+    # counted in `discovery_skip_counts`, so a surprised user can see which
+    # rule dropped what rather than guessing.
+    "backup", "old", "archive",
 ]
 
 # Glob-style patterns — matched by regex in index_folder, by suffix in index_repo.
@@ -357,12 +369,67 @@ MAX_INDEX_FILES_ENV_VAR = "JCODEMUNCH_MAX_INDEX_FILES"
 DEFAULT_MAX_FOLDER_FILES = 2_000
 MAX_FOLDER_FILES_ENV_VAR = "JCODEMUNCH_MAX_FOLDER_FILES"
 
+# The size cap was the only one of these three with no way to move it
+# (reported by @dkiaulakis, v1.108.193). Its two neighbours each had a
+# resolver reading config; this one was passed as a hardcoded constant from
+# index_folder.py and appeared in none of the 79 JCODEMUNCH_* variables.
+#
+# The default is NOT raised. 500KB stays, because it protects the common case
+# from a parse that costs more than the file is worth. What changes is that a
+# caller who knows their own corpus can move it, the same way they can already
+# move both file-count limits three lines up.
+MAX_FILE_SIZE_ENV_VAR = "JCODEMUNCH_MAX_FILE_SIZE"
 
-def get_max_index_files(max_files: Optional[int] = None) -> int:
+
+def get_max_file_size(
+    max_size: Optional[int] = None,
+    repo: Optional[str] = None,
+) -> int:
+    """Resolve the per-file byte cap from arg or config.
+
+    Parity with ``get_max_index_files`` / ``get_max_folder_files``, which is the
+    whole point: the size cap was the one limit of the three that could not be
+    moved by any route (v1.108.193).
+
+    Args:
+        max_size: Explicit override. Must be a positive integer when provided.
+        repo: Repo identifier (absolute path or display name). When supplied,
+            the merged project config (``.jcodemunch.jsonc``) is consulted
+            before global config — see the note above ``get_max_index_files``.
+
+    Returns:
+        Positive byte limit. Falls back to the default if config is unset or
+        invalid, matching the siblings rather than failing the index.
+    """
+    if max_size is not None:
+        if max_size <= 0:
+            raise ValueError("max_size must be a positive integer")
+        return max_size
+
+    value = _config.get("max_file_size", DEFAULT_MAX_FILE_SIZE, repo=repo)
+    if isinstance(value, int) and value > 0:
+        return value
+    return DEFAULT_MAX_FILE_SIZE
+
+
+# All three limit resolvers below take `repo`. A limit documented in the config
+# template is a limit a user will set in `.jcodemunch.jsonc`, and a per-project
+# corpus is exactly the case that justifies moving one — the monorepo with the
+# 800KB generated client, not the whole machine. Reading global config only made
+# that setting land in a file the resolver never opened, so it failed silently:
+# no warning, no unknown-key error, just the default (#390 @lazy-geeek reported
+# the global-config half, fixed in .194; #391 @amarakramali carried the repro
+# that exposed this project-config half).
+def get_max_index_files(
+    max_files: Optional[int] = None,
+    repo: Optional[str] = None,
+) -> int:
     """Resolve the maximum indexed file count from arg or config.
 
     Args:
         max_files: Explicit override. Must be a positive integer when provided.
+        repo: Repo identifier. When supplied, the merged project config
+            (``.jcodemunch.jsonc``) is consulted before global config.
 
     Returns:
         Positive file-count limit. Falls back to the default if config
@@ -373,13 +440,16 @@ def get_max_index_files(max_files: Optional[int] = None) -> int:
             raise ValueError("max_files must be a positive integer")
         return max_files
 
-    value = _config.get("max_index_files", DEFAULT_MAX_INDEX_FILES)
+    value = _config.get("max_index_files", DEFAULT_MAX_INDEX_FILES, repo=repo)
     if isinstance(value, int) and value > 0:
         return value
     return DEFAULT_MAX_INDEX_FILES
 
 
-def get_max_folder_files(max_files: Optional[int] = None) -> int:
+def get_max_folder_files(
+    max_files: Optional[int] = None,
+    repo: Optional[str] = None,
+) -> int:
     """Resolve the maximum indexed file count for local folder indexing.
 
     The default (2,000) is intentionally lower than the GitHub repo default (10,000)
@@ -388,6 +458,8 @@ def get_max_folder_files(max_files: Optional[int] = None) -> int:
 
     Args:
         max_files: Explicit override. Must be a positive integer when provided.
+        repo: Repo identifier. When supplied, the merged project config
+            (``.jcodemunch.jsonc``) is consulted before global config.
 
     Returns:
         Positive file-count limit.
@@ -397,7 +469,7 @@ def get_max_folder_files(max_files: Optional[int] = None) -> int:
             raise ValueError("max_files must be a positive integer")
         return max_files
 
-    value = _config.get("max_folder_files")
+    value = _config.get("max_folder_files", repo=repo)
     if isinstance(value, int) and value > 0:
         return value
     return DEFAULT_MAX_FOLDER_FILES

@@ -5,6 +5,7 @@ import time
 from typing import Optional
 
 from ..storage import IndexStore, result_cache_get, result_cache_put
+from ..storage.generation import connect_readonly
 from ._utils import index_status_to_tool_error, resolve_repo
 
 
@@ -144,6 +145,15 @@ def _find_references_single(
     results = [{"file": f, "matches": m} for f, m in file_matches.items()]
     results.sort(key=lambda r: r["file"])
 
+    # Slice BEFORE enrichment, not in the return statement (#394, @rknighton).
+    # The sort above fully determines which rows ship, so every file read below
+    # for a row past `max_results` was work whose product got thrown away —
+    # 1,525 of 1,575 reads on a `django/django` query, 3.5s -> 0.95s. The
+    # response is byte-identical because `reference_count` and `_meta.truncated`
+    # are still computed from the FULL `results`, which is why the two lists must
+    # stay separate: `visible` is what we serve, `results` is what we found.
+    visible = results[:max_results]
+
     # Enrich each match with the line number of its import statement so
     # downstream consumers (regex harvesters, IDE deeplinks, code review
     # bots) can jump straight to the import site instead of opening the
@@ -151,7 +161,7 @@ def _find_references_single(
     # appears quoted. Skipped silently when file content is unavailable
     # (remote-only indexes); existing callers see additive `line` field.
     if store is not None:
-        for ref in results:
+        for ref in visible:
             try:
                 content = store.get_file_content(owner, name, ref["file"])
             except Exception:
@@ -165,7 +175,7 @@ def _find_references_single(
 
     # Optional: enrich each reference with which symbols in that file call the identifier
     if include_call_chain and store is not None:
-        for ref in results:
+        for ref in visible:
             ref["calling_symbols"] = _calling_symbols_in_file(
                 index, store, owner, name, ref["file"], identifier
             )
@@ -175,7 +185,7 @@ def _find_references_single(
         "repo": f"{owner}/{name}",
         "identifier": identifier,
         "reference_count": len(results),
-        "references": results[:max_results],
+        "references": visible,
         "_meta": {
             "timing_ms": round(elapsed, 1),
             "truncated": len(results) > max_results,
@@ -288,7 +298,7 @@ def _attach_scip_to_response(response: dict, store, owner: str, name: str) -> di
 
     db_path = store._sqlite._db_path(owner, name)
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = connect_readonly(db_path, isolation_level="")
     except sqlite3.Error:
         return response
     conn.row_factory = sqlite3.Row

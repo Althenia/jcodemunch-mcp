@@ -248,14 +248,16 @@ _META_KEYS = [
 # None = not yet loaded; any accidental read before _ensure_index_store_deps()
 # fires raises TypeError("'>' not supported between 'NoneType' and 'int'").
 _INDEX_VERSION: Optional[int] = None
+_PARSER_GENERATION: Optional[int] = None
 _file_hash: Callable[[str], str] = lambda x: ""
 
 
 def _ensure_index_store_deps() -> None:
-    global _INDEX_VERSION, _file_hash
+    global _INDEX_VERSION, _PARSER_GENERATION, _file_hash
     if _INDEX_VERSION is None:
-        from .index_store import INDEX_VERSION, _file_hash as _fh
+        from .index_store import INDEX_VERSION, PARSER_GENERATION, _file_hash as _fh
         _INDEX_VERSION = INDEX_VERSION
+        _PARSER_GENERATION = PARSER_GENERATION
         _file_hash = _fh
 
 
@@ -1236,6 +1238,7 @@ class SQLiteIndexStore:
             languages=lang_counts,
             symbols=composed_symbols,
             index_version=base_index.index_version,
+            parser_generation=getattr(base_index, "parser_generation", 0),
             file_hashes=composed_hashes,
             git_head=delta.get("git_head", base_index.git_head),
             file_summaries=composed_summaries,
@@ -1350,6 +1353,7 @@ class SQLiteIndexStore:
             languages=languages or {},
             symbols=serialized_symbols,
             index_version=cast(int, _INDEX_VERSION),
+            parser_generation=cast(int, _PARSER_GENERATION),
             file_hashes=file_hashes,
             git_head=git_head,
             file_summaries=file_summaries or {},
@@ -1573,6 +1577,140 @@ class SQLiteIndexStore:
                 post_mtime_ns = 0
             _cache_put(owner, safe_name, post_mtime_ns, index, branch)
             return _stamp_load_provenance(index, db_path, post_mtime_ns)
+
+    # ── Selective read path (#398 Arc 2) ─────────────────────────────
+
+    #: Chunk size for `id IN (...)`. SQLITE_MAX_VARIABLE_NUMBER is 32766 on
+    #: modern builds and 999 on older ones; 900 clears the floor with headroom.
+    _SELECT_CHUNK = 900
+
+    def open_selective(
+        self,
+        owner: str,
+        name: str,
+        *,
+        symbol_ids: Optional[list] = None,
+        files: Optional[list] = None,
+        branch: str = "",
+    ):
+        """One read transaction: repo + file metadata, plus only named symbols.
+
+        Returns a ``SelectiveIndexView`` or ``None``. ``None`` means *use
+        ``load_index``* — it is never an absence claim about the repository, and
+        every caller must treat it as "take the ordinary path".
+
+        ⚠ **A non-empty branch always returns None.** A branch view is
+        ``load_index`` composed with a delta, including the staleness warning
+        when the base moved underneath it. Reproducing that against a partial row
+        set would change branch behaviour, which the close condition forbids.
+        Promotion is the honest answer, and it is one line rather than a second
+        implementation of delta composition.
+
+        ⚠ No read here uses ``immutable=1``; see ``storage/selective.py``.
+        """
+        _ensure_index_store_deps()
+        if branch:
+            return None
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(owner, safe_name)
+        if not db_path.exists():
+            return None
+
+        # A cached full index already answers everything, exactly, for free.
+        # Paying for a second (narrower) read would be strictly worse.
+        try:
+            mtime_ns = _db_mtime_ns(db_path)
+        except OSError:
+            return None
+        cached = _cache_get(owner, safe_name, mtime_ns, branch)
+        if cached is not None:
+            return _stamp_load_provenance(cached, db_path, mtime_ns)
+
+        from .generation import connect_readonly
+        from .selective import SelectiveIndexView
+
+        try:
+            conn = connect_readonly(db_path)
+        except Exception:
+            logger.debug("Selective open failed for %s", db_path, exc_info=True)
+            return None
+        conn.row_factory = sqlite3.Row
+        try:
+            # One read transaction, so the meta, files and symbols rows all
+            # describe the same generation (Arc 1's consistency guarantee).
+            conn.execute("BEGIN")
+            try:
+                meta = self._read_meta(conn)
+                if not meta:
+                    return None
+                try:
+                    stored_version = int(meta.get("index_version", "0"))
+                except (TypeError, ValueError):
+                    return None
+                if stored_version > cast(int, _INDEX_VERSION):
+                    return None
+
+                file_rows = conn.execute("SELECT * FROM files").fetchall()
+
+                symbol_rows: list = []
+                if symbol_ids:
+                    ids = [s for s in dict.fromkeys(symbol_ids) if s]
+                    for start in range(0, len(ids), self._SELECT_CHUNK):
+                        chunk = ids[start:start + self._SELECT_CHUNK]
+                        marks = ",".join("?" * len(chunk))
+                        symbol_rows.extend(
+                            conn.execute(
+                                f"SELECT * FROM symbols WHERE id IN ({marks})", chunk
+                            ).fetchall()
+                        )
+                if files:
+                    paths = [f for f in dict.fromkeys(files) if f]
+                    for start in range(0, len(paths), self._SELECT_CHUNK):
+                        chunk = paths[start:start + self._SELECT_CHUNK]
+                        marks = ",".join("?" * len(chunk))
+                        symbol_rows.extend(
+                            conn.execute(
+                                f"SELECT * FROM symbols WHERE file IN ({marks})", chunk
+                            ).fetchall()
+                        )
+                partial = self._build_index_from_rows(
+                    meta, symbol_rows, file_rows, owner, name
+                )
+            finally:
+                conn.rollback()
+        except sqlite3.DatabaseError:
+            logger.debug("Corrupt SQLite index at %s during selective open",
+                         db_path, exc_info=True)
+            return None
+        finally:
+            conn.close()
+
+        view = SelectiveIndexView(
+            partial,
+            promote=lambda: self.load_index(owner, name, branch),
+            fetch_symbol=lambda sid: self._fetch_symbol_row(db_path, sid),
+            generation=meta.get("indexed_at") or None,
+        )
+        return _stamp_load_provenance(view, db_path, mtime_ns)
+
+    def _fetch_symbol_row(self, db_path: Path, symbol_id: str) -> Optional[dict]:
+        """One symbol row, read-only. Raises so the caller can promote.
+
+        Deliberately NOT ``get_symbol_by_id``: that opens through ``_connect``,
+        which runs PRAGMA and CREATE-TABLE on every connection and therefore
+        moves the database mtime on a pure read — the v1.108.185 defect.
+        """
+        from .generation import connect_readonly
+
+        conn = connect_readonly(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT * FROM symbols WHERE id = ?", (symbol_id,)
+            ).fetchone()
+            return self._row_to_symbol_dict(row) if row is not None else None
+        finally:
+            conn.close()
 
     def inspect_index(self, owner: str, name: str, branch: str = ""):
         """Check SQLite index presence and compatibility without loading rows."""
@@ -2732,6 +2870,7 @@ class SQLiteIndexStore:
             languages=computed_langs,
             symbols=patched_symbols,
             index_version=old.index_version,
+            parser_generation=getattr(old, "parser_generation", 0),
             file_hashes=new_file_hashes,
             git_head=meta.get("git_head", old.git_head),
             file_summaries=new_file_summaries,
@@ -2830,6 +2969,7 @@ class SQLiteIndexStore:
             languages=languages,
             symbols=symbols,
             index_version=int(meta.get("index_version", "0")),
+            parser_generation=int(meta.get("parser_generation", "0") or 0),
             file_hashes=file_hashes,
             git_head=meta.get("git_head", ""),
             file_summaries=file_summaries,
@@ -2857,6 +2997,7 @@ class SQLiteIndexStore:
             "name": index.name,
             "indexed_at": index.indexed_at,
             "index_version": str(index.index_version),
+            "parser_generation": str(getattr(index, "parser_generation", 0)),
             "git_head": index.git_head,
             "source_root": index.source_root,
             "git_root": getattr(index, "git_root", "") or "",
@@ -3054,6 +3195,9 @@ class SQLiteIndexStore:
                 "name": data.get("name", name),
                 "indexed_at": data["indexed_at"],
                 "index_version": str(data.get("index_version", _INDEX_VERSION)),
+                # A JSON index predates the generation stamp; 0 makes the
+                # migrated copy re-parse once rather than inherit a claim.
+                "parser_generation": str(data.get("parser_generation", 0) or 0),
                 "git_head": data.get("git_head", ""),
                 "source_root": data.get("source_root", ""),
                 "git_root": data.get("git_root", ""),

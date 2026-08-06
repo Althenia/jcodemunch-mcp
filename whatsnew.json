@@ -1,23 +1,23 @@
 {
-  "current": "1.108.170",
+  "current": "1.108.239",
   "entries": [
     {
-      "version": "1.108.170",
-      "date": "2026-07-25",
-      "title": "the file and symbol tools can see a rebuild too",
-      "summary": "- **`get_file_content`, `get_file_outline` and `get_symbol_source` could mint absence evidence over an index being rewritten.** v1.108.168 added the 5th refusal rule to `build_verdict`, and v1.108.169 wired the last search tool into it \u2014 but the file and symbol tools do not use `build_verdict`. They go"
+      "version": "1.108.239",
+      "date": "2026-08-04",
+      "title": "a YAML key keeps its own name",
+      "summary": "PyYAML implements YAML 1.1, which resolves `on` / `off` / `yes` / `no` to booleans **as mapping keys**. A GitHub workflow's `on:` therefore arrived as the key `True`, and every workflow this tool indexed carried a symbol literally named `True`, pointing at no line."
     },
     {
-      "version": "1.108.169",
-      "date": "2026-07-25",
-      "title": "the retrieval verdict survives compaction",
-      "summary": "- **Every compact encoder silently dropped `_meta.verdict`.** `schema_driven.encode` filters `_meta` through a strict allowlist (`for k in meta_keys: if k in meta`), and `verdict` appeared in **none of the 15** schema files. Under MUNCH encoding the whole retrieval-verdict contract was invisible: `state`, `channels`,"
+      "version": "1.108.238",
+      "date": "2026-08-04",
+      "title": "a YAML symbol is located at its own key's line, or refuses",
+      "summary": "Line numbers for YAML symbols came from a forward text scan with three compounding defects. Measured against `.github/workflows/health-radar-comment.yml`, a five-key step block resolved to lines 31 / 32 / 33 / 34 / 35 and only the last was right:"
     },
     {
-      "version": "1.108.168",
-      "date": "2026-07-24",
-      "title": "a rebuild underneath a scan cannot prove absence (5th refusal rule)",
-      "summary": "- **Absence evidence could be minted over an index that was being rewritten.** v1.108.166 shipped four refusal rules for absence proofs \u2014 only `absent` proves absence; `low_confidence`/`degraded` do not; a stale index does not; a truncated index does not. None of them covered an index being **rewritten"
+      "version": "1.108.237",
+      "date": "2026-08-04",
+      "title": "a YAML symbol's byte extent describes real source, not a reconstruction",
+      "summary": "`_append_virtual_symbol` took `byte_offset` from the file and `byte_length` from `len(signature)`. The signature is **rebuilt** from parsed data, never quoted from the source, so the two came from different coordinate systems and their product was a slice of arbitrary bytes."
     }
   ]
 }

@@ -234,7 +234,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset({"set_tool_tier", "announce_mo
 _UNDISABLEABLE_TOOLS: frozenset[str] = frozenset({"set_tool_tier", "announce_model"})
 
 # --- The Counter: adaptive tool surface (front door) ----------------------- #
-# order/menu/route collapse the ~83-tool surface to a 3-tool front door without
+# order/menu/route collapse the whole tool surface to a 3-tool front door without
 # removing any capability. See docs/prd-adaptive-tool-surface.md + counter.py.
 from . import counter as _counter
 
@@ -286,7 +286,7 @@ def _counter_front_door_tools() -> list:
         Tool(
             name="menu",
             description=(
-                "Discover catalog actions without keeping all ~83 tool schemas "
+                "Discover catalog actions without keeping the full tool catalog "
                 "resident: menu(query?). Returns compact rows (action, summary, "
                 "required args, state_changing). With no query, lists the catalog. "
                 "Pair with 'order' to dispatch the chosen action."
@@ -707,7 +707,26 @@ _COMPACT_STRIP_PARAMS: dict[str, set[str]] = {
     "get_symbol_source": {
         "source_start_line", "source_end_line", "max_source_lines",
         "max_source_bytes", "max_total_source_bytes", "receipt",
+        # v1.108.227: `verify_against` joins them, same rule and same reason.
+        # Externally-attested verification is an audit workflow, not a core
+        # retrieval path — `verify` alone stays visible, and the tool still
+        # honours `verify_against` when passed.
+        #
+        # ⚠ Measured while adding #402's `git_sha_rev`: core_compact had **4
+        # tokens** of headroom, so ANY core-tier description gaining a clause
+        # broke the ceiling. Shaving words to fit is the wrong instinct — it
+        # makes the next person shave again. Removing an advanced param from
+        # the minimal surface is the fix the budget was designed to take.
+        "verify_against",
     },
+    # v1.108.231: `degeneracy_cutoff` is an escape hatch for callers who want the
+    # pre-.231 volume back, not a core retrieval control. get_dead_code_v2 is a
+    # core-tier tool and core_compact sits at 3996 of 4000, so a new property on
+    # its schema does not fit there at any description length — the same
+    # measurement that moved `verify_against` here for #402. The handler honours
+    # it regardless, and `_DECLARED_ARG_KEYS` is snapshotted before this strip
+    # runs, so a hidden-but-honoured param is never reported as an ignored arg.
+    "get_dead_code_v2": {"degeneracy_cutoff"},
     "get_context_bundle": {"budget_strategy"},
     "get_ranked_context": {"detail_level", "compress", "receipt"},
     "search_text": {"receipt"},
@@ -1604,7 +1623,7 @@ def _build_tools_list() -> list[Tool]:
                     "verify_against": {
                         "type": "string",
                         "enum": ["cache", "git_sha"],
-                        "description": "Where to source the comparison target when verify=True. 'cache' (default) compares against the content_hash stored in the index — self-referential, only catches incoherent tamper of ~/.code-index/. 'git_sha' additionally compares the cached source against the file slice at the working-tree git HEAD — externally attested, catches divergence between the cache and the upstream source. Adds a git_sha_verification field to the response.",
+                        "description": "Where to source the comparison target when verify=True. 'cache' (default) compares against the content_hash stored in the index — self-referential, only catches incoherent tamper of ~/.code-index/. 'git_sha' additionally compares the cached source against the file slice at the commit the index was built at — externally attested, catches divergence between the cache and the upstream source. Adds git_sha_verification and git_sha_rev fields to the response.",
                         "default": "cache"
                     },
                     "context_lines": {
@@ -3045,7 +3064,14 @@ def _build_tools_list() -> list[Tool]:
                     },
                     "file_pattern": {
                         "type": "string",
-                        "description": "Optional glob (e.g. `src/**`, `*.py`) — only analyse symbols whose file matches.",
+                        "description": "Optional glob (e.g. `src/**`, `*.py`) — only scopes the RESULTS, not the population the signals are measured over.",
+                    },
+                    "degeneracy_cutoff": {
+                        "type": "number",
+                        "description": "Advanced. Fire rate at or above which a signal is treated as a constant and gets no vote (default 0.90; must be >0.5 and <=1.0). Pass 1.0 for pre-1.108.231 volume.",
+                        "default": 0.90,
+                        "exclusiveMinimum": 0.5,
+                        "maximum": 1.0,
                     },
                 },
                 "required": ["repo"],
@@ -4228,8 +4254,9 @@ def _build_tools_list() -> list[Tool]:
                 "--generate`. Lets an agent keep a one-line CLAUDE.md (e.g. \"Call "
                 "jcodemunch_guide and strictly follow its instructions.\") instead of "
                 "pasting a static snippet that drifts from the installed version. "
-                "Idempotent, no repo context required. Honors disabled_tools and tier "
-                "filtering — list 'jcodemunch_guide' in disabled_tools to hide it."
+                "Idempotent, no repo context required. Matches the active tool "
+                "surface, tier and disabled_tools — list 'jcodemunch_guide' in "
+                "disabled_tools to hide it."
             ),
             inputSchema={
                 "type": "object",
@@ -4608,6 +4635,23 @@ _AUTO_WATCH_EXCLUDED = frozenset({
     "check_embedding_drift",
 })
 
+# Tools that index their own `path` argument, so the pre-dispatch hook must not
+# index it too (#384, fixed v1.108.189). These are DEFERRED, not excluded: the
+# folder is still registered for watching, just AFTER the tool runs and without
+# a second indexing pass.
+#
+# Excluding them outright was the obvious alternative and was rejected — it
+# silently removes auto-start-watching from the single most natural way a user
+# would ask for a folder to be watched, which is a behaviour removal under the
+# 1.x zero-surprise contract. Dropping only the redundant `ensure_indexed` was
+# rejected too: the watch task's own initial index would then race the tool's
+# index on the same `indexwrite` lock (60s waits), which is plausibly worse than
+# the duplicate work it replaces. Deferring avoids both — by the time the watch
+# task starts, the tool's index is on disk and there is nothing left to race.
+_AUTO_WATCH_DEFERRED = frozenset({
+    "index_folder",
+})
+
 
 def _get_source_root(repo: str, storage_path: Optional[str]) -> Optional[str]:
     """Resolve repo ID to folder path using IndexStore public API.
@@ -4629,23 +4673,29 @@ def _get_source_root(repo: str, storage_path: Optional[str]) -> Optional[str]:
         return None
 
 
-async def _auto_watch_if_needed(name: str, arguments: dict, storage_path: Optional[str]) -> None:
+async def _auto_watch_if_needed(
+    name: str, arguments: dict, storage_path: Optional[str]
+) -> Optional[str]:
     """Auto-watch hook: ensure unwatched repos are indexed before tool execution.
 
     Hook fires BEFORE tool dispatch to ensure the tool runs against fresh data.
+
+    Returns a folder path when the registration has been DEFERRED to after the
+    tool runs (#384) — the caller must hand it to ``_auto_watch_after_tool``.
+    Returns None in every other case, including every pre-v1.108.189 path.
     """
     global _watcher_manager
 
     # Check if watcher is running and auto-watch is enabled
     if _watcher_manager is None:
-        return
+        return None
 
     if not config_module.get("watch", False):
-        return
+        return None
 
     # Check if tool is excluded
     if name in _AUTO_WATCH_EXCLUDED:
-        return
+        return None
 
     # Extract folder from arguments
     folder: Optional[str] = None
@@ -4664,27 +4714,96 @@ async def _auto_watch_if_needed(name: str, arguments: dict, storage_path: Option
             folder = _get_source_root(repo, storage_path)
 
     if not folder:
-        return
+        return None
 
     # Check if already watched
     if _watcher_manager.is_watched(folder):
-        return
+        return None
 
-    # Opportunistic standby takeover before indexing
-    maybe_takeover = getattr(_watcher_manager, "maybe_takeover", None)
-    if maybe_takeover is not None:
-        result = await maybe_takeover(folder)
-        if result.get("status") in {"started", "already_watched"}:
-            await _watcher_manager.ensure_indexed(folder)
-            return
+    # The tool about to run indexes this exact folder itself. Do nothing now;
+    # register the watch afterwards, against the index the tool produces (#384).
+    if name in _AUTO_WATCH_DEFERRED:
+        return folder
 
-    # Race-safe reindex, then start watching
+    # Index ONCE, then adopt that index (v1.108.191).
+    #
+    # Both arms of this used to index twice. The takeover arm started a watch
+    # task (whose own initial index runs as a concurrent asyncio task) and THEN
+    # awaited ensure_indexed on the same folder, putting two writers on the
+    # `indexwrite` lock where every acquire waits up to 60s. The fall-through
+    # arm awaited ensure_indexed and then called add_folder, whose watch task
+    # walked the same tree a second time -- serialized, so not a race, but a
+    # redundant full walk on EVERY eager auto-watch, not just index_folder.
+    #
+    # ensure_indexed is the one to keep: it is awaited (so the tool runs against
+    # fresh data, which is this hook's whole purpose) and it is race-safe via
+    # the manager's _pending coordination. The watch tasks' initial index is the
+    # redundant one, so it is skipped and the caller's index is adopted.
+    #
+    # Ordering matters: ensure_indexed must complete BEFORE any watch task
+    # starts, or the task builds its hash cache from an index that is about to
+    # be rewritten underneath it.
     try:
         await _watcher_manager.ensure_indexed(folder)
-        await _watcher_manager.add_folder(folder)
+
+        # record_index_ready stays False on this path: ensure_indexed already
+        # wrote the real reindex record, and the watch task must not overwrite
+        # it with a synthetic one.
+        maybe_takeover = getattr(_watcher_manager, "maybe_takeover", None)
+        if maybe_takeover is not None:
+            result = await maybe_takeover(folder, skip_initial_index=True)
+            if result.get("status") in {"started", "already_watched"}:
+                logger.debug("Auto-watch: indexed, took over %s", folder)
+                return None
+
+        await _watcher_manager.add_folder(folder, skip_initial_index=True)
         logger.debug("Auto-watch: indexed and watching %s", folder)
     except Exception:
         logger.debug("Auto-watch failed for %s", folder, exc_info=True)
+    return None
+
+
+async def _auto_watch_after_tool(folder: str) -> None:
+    """Register a deferred auto-watch after the indexing tool has run (#384).
+
+    Runs no index of its own: the tool that just completed is what made the
+    index current, so a second pass here would be the exact duplication this
+    deferral exists to remove.
+    """
+    global _watcher_manager
+
+    if _watcher_manager is None:
+        return
+    if _watcher_manager.is_watched(folder):
+        return
+
+    try:
+        # Standby takeover still applies — another process may hold the lock.
+        # Unlike the eager path this does NOT call ensure_indexed afterwards.
+        #
+        # v1.108.190 (#388, @Bortlesboat): the takeover branch has to skip the
+        # initial index too. v1.108.189 covered add_folder and left this path
+        # doing a full pass over the tree the tool had just indexed, so the
+        # double index survived for exactly the case where another process had
+        # been watching the folder. Caught by their independent fix for #384.
+        maybe_takeover = getattr(_watcher_manager, "maybe_takeover", None)
+        if maybe_takeover is not None:
+            result = await maybe_takeover(
+                folder, skip_initial_index=True, record_index_ready=True,
+            )
+            if result.get("status") in {"started", "already_watched"}:
+                logger.debug("Auto-watch (deferred): took over %s", folder)
+                return
+
+        # record_index_ready=True: the index_folder tool indexes but writes no
+        # reindex record, so get_watch_status learns nothing unless the watcher
+        # records readiness on its behalf.
+        await _watcher_manager.add_folder(
+            folder, skip_initial_index=True, record_index_ready=True,
+        )
+        logger.debug("Auto-watch (deferred): watching %s without reindex", folder)
+    except Exception:
+        logger.debug("Deferred auto-watch failed for %s", folder, exc_info=True)
 
 
 # --- Turn-economy steering (v1.108.158) --------------------------------------
@@ -5013,6 +5132,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
     _t0_call = time.perf_counter()
     _call_ok = True
     _reporter_ref = None  # progress reporter; drained in finally (#359)
+    _deferred_watch = None  # folder to start watching AFTER dispatch (#384)
     try:   # main handler try starts here, before coerce
         # Extract cross-cutting args that are not part of any tool's schema.
         # `format` controls compact-output encoding (see .encoding package).
@@ -5100,7 +5220,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
 
         # Auto-watch: ensure unwatched repos are indexed before tool execution
         try:
-            await _auto_watch_if_needed(name, arguments, storage_path)
+            _deferred_watch = await _auto_watch_if_needed(name, arguments, storage_path)
         except Exception:
             logger.debug("Auto-watch check failed", exc_info=True)
 
@@ -5108,14 +5228,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         _progress_cb = None
         if name in ("index_repo", "index_folder", "index_file", "embed_repo"):
             try:
-                from .progress import make_progress_notify, ProgressReporter
+                from .progress import (
+                    make_progress_notify, ProgressReporter, HeartbeatReporter,
+                )
+                _label = {"index_repo": "Index", "index_folder": "Index",
+                          "index_file": "Index", "embed_repo": "Embed"}[name]
                 _progress_notify = make_progress_notify(server)
                 if _progress_notify:
-                    _label = {"index_repo": "Index", "index_folder": "Index",
-                              "index_file": "Index", "embed_repo": "Embed"}[name]
                     _reporter = ProgressReporter(_progress_notify, _label)
                     _progress_cb = _reporter.update
                     _reporter_ref = _reporter  # drained in finally (#359)
+                else:
+                    # v1.108.189 (#383): the client sent no progressToken, so
+                    # the spec forbids progress notifications. Fall back to an
+                    # elapsed-time heartbeat on the log channel instead of
+                    # running silently — silence is what made a healthy long
+                    # index indistinguishable from a hang in #375.
+                    _heartbeat = HeartbeatReporter(_label)
+                    if _heartbeat.enabled:
+                        _heartbeat.start()
+                        _progress_cb = _heartbeat.update
+                        _reporter_ref = _heartbeat  # finished + closed in finally
             except Exception:
                 logger.debug("Progress setup failed", exc_info=True)
 
@@ -5841,6 +5974,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     max_results=arguments.get("max_results", 100),
                     file_pattern=arguments.get("file_pattern"),
                     storage_path=storage_path,
+                    degeneracy_cutoff=arguments.get("degeneracy_cutoff"),
                 )
             )
         elif name == "get_extraction_candidates":
@@ -6310,8 +6444,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 tb = get_turn_budget()
                 # Reconfigure if config changed (thread-safe)
                 tb.configure(budget_tokens, config_module.get("turn_gap_seconds", 30.0))
-                # Auto-compact: downgrade detail_level before dispatch would be ideal,
-                # but result is already computed. Inject warning + flag instead.
+                # Advisory only: the result is already computed, so the reader —
+                # not this dispatcher — decides what to do about budget pressure.
+                # Deliberately does NOT shorten the payload. Discarding context
+                # here, before the caller has revealed which parts it needs, is
+                # the failure mode that eager compaction is known for.
                 result_bytes = len(json.dumps(result, default=str))
                 token_count = result_bytes // 4  # ~4 bytes per token
                 budget_info = tb.record_output(token_count)
@@ -6320,8 +6457,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     meta["budget_warning"] = budget_info["budget_warning"]
                     meta["turn_tokens_used"] = budget_info["turn_tokens_used"]
                     meta["turn_budget_remaining"] = budget_info["turn_budget_remaining"]
-                    if tb.should_compact():
-                        meta["auto_compacted"] = True
                     # Also promote to top-level for visibility
                     result["budget_warning"] = budget_info["budget_warning"]
             elif budget_tokens > 0:
@@ -6408,10 +6543,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 _v = (result.get("_meta") or {}).get("verdict")
                 if isinstance(_v, dict):
                     from . import handoff as _handoff_abs
+                    # #415. The subject of a scan is not always spelled `query`.
+                    # `note_absence` requires a non-empty string and returns
+                    # (None, None) without one, so a verdict-emitting tool keyed on
+                    # `symbol` recorded nothing and re-attached no carrier — and on
+                    # the shipped default (`meta_fields: []`) the verdict itself is
+                    # filtered out, so its refusal reached the caller as a bare
+                    # empty response. The guard is emitting a verdict at all, which
+                    # is a tool opting into the honesty contract; the fallback only
+                    # names what that tool called its subject.
+                    _subject = arguments.get("query") or arguments.get("symbol")
                     _ref, _why = _handoff_abs.note_absence(
                         name,
                         repo_arg,
-                        arguments.get("query"),
+                        _subject,
                         _v,
                         arguments=arguments,
                         truncated=bool((result.get("_meta") or {}).get("index_truncated")),
@@ -6465,6 +6610,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 )
         except Exception:
             logger.debug("Evidence-receipt minting failed", exc_info=True)
+
+        # `content_hash` is a 64-hex SHA-256 the caller was never offered a use
+        # for: `verify` answers the drift question as a boolean, and a receipt
+        # carries the digest out of band. Shipped on every row it cost ~83
+        # characters per symbol on the hottest read path, so it is now emitted
+        # only when something in the request actually consumes it.
+        #
+        # Stripped HERE, not at the emission site in tools/get_symbol.py, and
+        # deliberately AFTER the mint block: `_row_subject` reads the digest
+        # from the SERVED ROW and never re-reads the index, so a tool-side gate
+        # would silently downgrade every receipt's `hash_source` from
+        # `index_content_hash` to `served_bytes`. Running after mint makes the
+        # receipt immune to this by construction rather than by remembering to
+        # thread a flag. Same ordering rule as the filtering below: a
+        # presentation choice must not decide what a scan proved.
+        if (
+            name == "get_symbol_source"
+            and isinstance(result, dict)
+            and not arguments.get("verify")
+            and arguments.get("receipt") is not True
+        ):
+            result.pop("content_hash", None)
+            for _sym in result.get("symbols", []):
+                if isinstance(_sym, dict):
+                    _sym.pop("content_hash", None)
 
         if isinstance(result, dict):
             meta_fields = config_module.get("meta_fields")
@@ -6538,7 +6708,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 # handed bytes it already bought this session. Advisory only —
                 # the response body is unchanged (P1 of
                 # docs/prd-cue-anchored-delivery.md).
-                _repeats = _budget_tracker.note_delivered(_delivery_entries(name, result))
+                _repeats = _budget_tracker.note_delivered(
+                    _delivery_entries(name, result),
+                    base_path=arguments.get("storage_path"),
+                )
                 if _repeats:
                     result.setdefault("_meta", {})["already_delivered"] = {
                         "count": len(_repeats),
@@ -6662,15 +6835,38 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
         # stdio connection / loses the tool result (#359).
         if _reporter_ref is not None:
             try:
-                from .progress import drain_reporter
+                from .progress import drain_reporter, HeartbeatReporter
+                # A heartbeat that already spoke closes the loop (#383) — an
+                # operator told "still working after 120s" needs the line that
+                # says it ended. ProgressReporter is deliberately NOT finished
+                # here: its 100% send is the tool's to make, and synthesising
+                # one would put a notification after the work it describes.
+                if isinstance(_reporter_ref, HeartbeatReporter):
+                    _reporter_ref.finish("ok" if _call_ok else "failed")
                 await drain_reporter(_reporter_ref)
             except Exception:
                 logger.debug("Progress drain failed for %s", name, exc_info=True)
+        # Deferred auto-watch (#384): the tool has now indexed this folder, so
+        # the watch task can start without repeating that work. Runs even when
+        # the tool failed — add_folder is cheap and the watcher's own change
+        # handling is what recovers a partial index.
+        if _deferred_watch is not None:
+            try:
+                await _auto_watch_after_tool(_deferred_watch)
+            except Exception:
+                logger.debug("Deferred auto-watch failed", exc_info=True)
         try:
             from .storage.token_tracker import record_tool_latency
             duration_ms = (time.perf_counter() - _t0_call) * 1000.0
             _repo_arg = arguments.get("repo") if isinstance(arguments, dict) else None
-            record_tool_latency(name, duration_ms, ok=_call_ok, repo=_repo_arg)
+            # v1.108.188: persist against the store the CALL named. analyze_perf
+            # reads tool_calls and ranking_events through one base path, so a row
+            # written to the default while the reader looks in a named store is
+            # invisible to the only thing that consumes it.
+            _store_arg = arguments.get("storage_path") if isinstance(arguments, dict) else None
+            record_tool_latency(
+                name, duration_ms, ok=_call_ok, repo=_repo_arg, base_path=_store_arg,
+            )
         except Exception:
             logger.debug("Latency recording failed for %s", name, exc_info=True)
 
@@ -7349,6 +7545,18 @@ def _generate_claude_md_snippet(missing_only: bool = False) -> str:
         # Fall through to full generation if CLAUDE.md doesn't exist yet
 
     # Group tools by category for readability (single source: module constant).
+    # Under the front door the server advertises order/menu/route, so a snippet
+    # naming ~90 tools directly describes calls the client never offers the
+    # model (#397). The catalogue is still reachable, via `menu` and via this
+    # guide's own listing, but the WORKFLOW an agent should follow is different,
+    # and the workflow is what a policy snippet exists to convey.
+    if not missing_only and _effective_surface() == "counter":
+        try:
+            from .cli.init import _CLAUDE_MD_POLICY_COUNTER
+            return _CLAUDE_MD_POLICY_COUNTER
+        except Exception:
+            logger.debug("front-door snippet unavailable; using the full one", exc_info=True)
+
     categories = _SNIPPET_TOOL_CATEGORIES
     from . import __version__ as _ver
     lines = [
@@ -7563,6 +7771,12 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
             return f"[{len(v)} items]" if len(v) > 3 else str(v)
         return str(v)
 
+    # max_file_size is reported alongside its two siblings. v1.108.193 gave the
+    # per-file cap a config key and an env var but no window: `config` listed the
+    # other two limits and not this one, so the only way to read its effective
+    # value was to call the resolver by hand — which is exactly what the reporter
+    # exists to spare people (#375, @dkiaulakis).
+    row("max_file_size", _cfg.get("max_file_size", 512000), _detect_source("max_file_size", 512000))
     row("max_folder_files", _cfg.get("max_folder_files", 2000), _detect_source("max_folder_files", 2000))
     row("max_index_files", _cfg.get("max_index_files", 10000), _detect_source("max_index_files", 10000))
     row("staleness_days", _cfg.get("staleness_days", 7), _detect_source("staleness_days", 7))
@@ -7636,15 +7850,54 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
 
     # ── AI Summarizer ─────────────────────────────────────────────────────
     section("AI Summarizer")
-    use_ai_raw, use_ai_d = env("JCODEMUNCH_USE_AI_SUMMARIES", "true")
-    use_ai = use_ai_raw.lower() not in ("false", "0", "no", "off")
-    row("use_ai_summaries", str(use_ai).lower(), "env" if not use_ai_d else _detect_source("use_ai_summaries", True))
-    provider, provider_d = env("JCODEMUNCH_SUMMARIZER_PROVIDER", "")
+    # These two rows read the LOADED config, not the raw environment (#393,
+    # @rknighton). They used to call env() with hardcoded "true"/"" defaults, so
+    # a config.jsonc setting `use_ai_summaries: false` was reported as `true`,
+    # and `summarizer_provider: "none"` as `(auto-detect)` — while _detect_source
+    # correctly tagged the row `[config]`. A wrong value wearing an authoritative
+    # source tag is worse than no row at all: it says "this is what your file
+    # says" about a number the file never contained. Runtime behaviour was always
+    # correct; only the diagnostic lied. `summarizer_model` two rows down was
+    # already fixed this way for the same reason (#300/#304, @slazarov) — the
+    # neighbours were left behind.
+    #
+    # env-var fallback is already folded into _cfg at load time (config file wins
+    # over env), so _cfg.get() IS the effective value and _detect_source() names
+    # where it came from. Do not reintroduce a second, parallel resolution here.
+    _use_ai_raw = _cfg.get("use_ai_summaries", "auto")
+    # Tri-state: True / False / "auto". Render the configured value, then the
+    # resolved gate when "auto" hides which way it landed.
+    if isinstance(_use_ai_raw, bool):
+        _use_ai_display = str(_use_ai_raw).lower()
+    else:
+        _use_ai_display = str(_use_ai_raw).strip().lower()
+        if _use_ai_display == "auto":
+            _use_ai_display = f"auto {dim('(resolves to ' + str(_default_use_ai_summaries()).lower() + ')')}"
+    row("use_ai_summaries", _use_ai_display, _detect_source("use_ai_summaries", "auto"))
+    # The gate the rest of this section branches on — same resolver the server
+    # itself uses. Previously the env-only read, which is why a config-disabled
+    # summarizer ALSO skipped the "AI summaries disabled" banner below and
+    # printed an Active provider line instead.
+    use_ai = _default_use_ai_summaries()
+    provider = (_cfg.get("summarizer_provider", "") or "").strip()
+    _provider_src = _detect_source("summarizer_provider", "")
     row(
         "summarizer_provider",
         provider if provider else dim("(auto-detect)"),
-        "env" if not provider_d else "default",
+        _provider_src,
     )
+
+    def _provider_pinned_by(name: str) -> str:
+        """Explain WHERE an explicit provider pin came from.
+
+        `provider` now reads the merged config, so the old hardcoded
+        `JCODEMUNCH_SUMMARIZER_PROVIDER=<x>` suffix would name the env var for a
+        pin that actually came from config.jsonc — the same misattribution #393
+        is about, one line further down.
+        """
+        if _provider_src == "env":
+            return f"JCODEMUNCH_SUMMARIZER_PROVIDER={name}"
+        return f"summarizer_provider={name} [{_provider_src}]"
 
     # summarizer_model display (surfaced by @slazarov on #300, runtime fix #304).
     # As of v1.108.18, batch_summarize.py threads `repo=` through every
@@ -7664,7 +7917,7 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
     if not use_ai:
         print(f"  {yellow('AI summaries disabled')} — signature fallback active")
     elif provider_name == "anthropic":
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=anthropic" if provider == "anthropic" else "ANTHROPIC_API_KEY set"
+        suffix = _provider_pinned_by("anthropic") if provider == "anthropic" else "ANTHROPIC_API_KEY set"
         print(f"  Active provider:  {green('Anthropic')}  ({suffix})")
         # Runtime: summarizer_model (config; project-aware as of #304) > ANTHROPIC_MODEL env > default
         if _sm_effective:
@@ -7673,7 +7926,7 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
             model, d = env("ANTHROPIC_MODEL", "claude-haiku-*")
             row("  ANTHROPIC_MODEL", model, "env" if not d else "default")
     elif provider_name == "gemini":
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=gemini" if provider == "gemini" else "GOOGLE_API_KEY set"
+        suffix = _provider_pinned_by("gemini") if provider == "gemini" else "GOOGLE_API_KEY set"
         print(f"  Active provider:  {green('Google Gemini')}  ({suffix})")
         if _sm_effective:
             row("  GOOGLE_MODEL", _sm_effective, _detect_source("summarizer_model", ""))
@@ -7682,7 +7935,7 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
             row("  GOOGLE_MODEL", model, "env" if not d else "default")
     elif provider_name == "openai":
         base_label = openai_base or "https://api.openai.com/v1"
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=openai" if provider == "openai" else "OPENAI_API_BASE set"
+        suffix = _provider_pinned_by("openai") if provider == "openai" else "OPENAI_API_BASE set"
         print(f"  Active provider:  {green('OpenAI-compatible')}  ({suffix})")
         row("  OPENAI_API_BASE", base_label, "env" if openai_base else "default")
         if _sm_effective:
@@ -7700,17 +7953,17 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
         v, d = env("OPENAI_MAX_TOKENS", "500")
         row("  OPENAI_MAX_TOKENS", v, "env" if not d else "default")
     elif provider_name == "minimax":
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=minimax" if provider == "minimax" else "MINIMAX_API_KEY set"
+        suffix = _provider_pinned_by("minimax") if provider == "minimax" else "MINIMAX_API_KEY set"
         print(f"  Active provider:  {green('MiniMax')}  ({suffix})")
         row("  OPENAI_API_BASE", "https://api.minimax.io/v1", "default")
         row("  OPENAI_MODEL", _sm_effective or "minimax-m2.7", _detect_source("summarizer_model", "") if _sm_effective else "default")
     elif provider_name == "glm":
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=glm" if provider == "glm" else "ZHIPUAI_API_KEY set"
+        suffix = _provider_pinned_by("glm") if provider == "glm" else "ZHIPUAI_API_KEY set"
         print(f"  Active provider:  {green('GLM-5')}  ({suffix})")
         row("  OPENAI_API_BASE", "https://api.z.ai/api/paas/v4/", "default")
         row("  OPENAI_MODEL", _sm_effective or "glm-5", _detect_source("summarizer_model", "") if _sm_effective else "default")
     elif provider_name == "openrouter":
-        suffix = "JCODEMUNCH_SUMMARIZER_PROVIDER=openrouter" if provider == "openrouter" else "OPENROUTER_API_KEY set"
+        suffix = _provider_pinned_by("openrouter") if provider == "openrouter" else "OPENROUTER_API_KEY set"
         print(f"  Active provider:  {green('OpenRouter')}  ({suffix})")
         row("  OPENAI_API_BASE", "https://openrouter.ai/api/v1", "default")
         row("  OPENAI_MODEL", _sm_effective or "meta-llama/llama-3.3-70b-instruct:free", _detect_source("summarizer_model", "") if _sm_effective else "default")
@@ -8411,6 +8664,7 @@ def main(argv: Optional[list[str]] = None):
     init_parser.add_argument(
         "--hooks",
         action="store_true",
+        default=None,
         help="Install worktree lifecycle hooks into ~/.claude/settings.json",
     )
     init_parser.add_argument(
@@ -9251,6 +9505,9 @@ def main(argv: Optional[list[str]] = None):
             clients=args.client,
             claude_md=args.claude_md,
             hooks=args.hooks,
+            # `--hooks` parses with default=None, so True here means a human
+            # typed it. That is what survives `--minimal` (#397).
+            hooks_explicit=(args.hooks is True),
             copilot_hooks=getattr(args, "copilot_hooks", False),
             index=args.index,
             audit=args.audit,
@@ -9879,6 +10136,19 @@ def main(argv: Optional[list[str]] = None):
             atexit.register(_unregister_process)
         except Exception:
             logger.debug("process registry: register failed", exc_info=True)
+
+        # Import the native embedding backend here, on the main thread, before
+        # any event loop starts. Deferring it to the first embed call runs it
+        # inside an asyncio.to_thread worker while the main thread services the
+        # transport, which deadlocks on the Windows loader lock and hangs the
+        # call forever (jdatamunch-mcp#3, reproduced here). Above both dispatch
+        # branches so every transport is covered once; no-op unless a native
+        # provider (local_onnx / sentence-transformers) is configured.
+        try:
+            from .tools.embed_repo import warm_up_embedding_backend
+            warm_up_embedding_backend()
+        except Exception:
+            logger.debug("embedding warm-up failed", exc_info=True)
 
         if watcher_enabled:
             # Watcher params: CLI flag > config > default

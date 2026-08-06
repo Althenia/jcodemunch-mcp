@@ -29,6 +29,7 @@ from ..security import (
     is_secret_file,
     is_binary_file,
     DEFAULT_MAX_FILE_SIZE,
+    get_max_file_size,
     get_max_folder_files,
     get_extra_ignore_patterns,
     get_skip_directories,
@@ -41,7 +42,13 @@ from ..storage.git_root import (
     is_linked_worktree,
     resolve_index_identity,
 )
-from ..storage.index_store import _file_hash, _file_hash_bytes, _get_git_head, _get_git_branch
+from ..storage.index_store import (
+    PARSER_GENERATION,
+    _file_hash,
+    _file_hash_bytes,
+    _get_git_head,
+    _get_git_branch,
+)
 from ..summarizer import summarize_symbols
 from ..reindex_state import WatcherChange
 from ..path_map import parse_path_map, remap
@@ -86,6 +93,25 @@ def _attach_cap_report(result: dict, cap: Optional[dict]) -> None:
         f"from the index. Raise max_folder_files in config.jsonc (or set "
         f"JCODEMUNCH_MAX_FOLDER_FILES) and re-index, or narrow the path."
     )
+
+#: Skip reasons where the file is REAL, CURRENT and WANTED, and we refused it
+#: anyway (v1.108.193, reported by @dkiaulakis). Every other reason describes a
+#: file that was never a candidate for this corpus: a `.png` is `binary`, a
+#: vendored tree is `gitignore`, a `.lock` is `wrong_extension`. Excluding
+#: those is the corpus being defined, and a search over it can still prove
+#: absence.
+#:
+#: These are different in kind. The file is source, it is current, an agent
+#: asked about it by name, and it is missing because of OUR limit rather than
+#: the caller's intent. A zero-result over a corpus that withheld one cannot
+#: prove absence: "I never learned that file" and "that file does not exist"
+#: are exactly the two things this whole contract exists to keep apart.
+WITHHELD_SKIP_REASONS = frozenset({
+    "too_large",     # over max_file_size, which until v1.108.193 could not be raised
+    "file_limit",    # over max_folder_files / max_index_files
+    "unreadable",    # a permission or IO failure, NOT a statement about the file
+})
+
 
 def _coverage_report(
     skip_counts: dict, files_indexed: int, no_symbols_count: int,
@@ -148,7 +174,16 @@ def _coverage_report(
     unaccounted = int(files_accepted) - int(files_indexed) - sum(drops.values())
     if unaccounted > 0:
         report["unaccounted"] = unaccounted
-    report["complete"] = (int(files_indexed) == int(files_accepted)) and not drops
+    # v1.108.193: withheld files never reach `files_accepted` (they are refused
+    # during discovery), so the reconciliation below balances perfectly while a
+    # real, wanted source file sits outside the corpus. Counting them keeps
+    # `complete` honest about the tree rather than only about the walk.
+    withheld = {k: v for k, v in skips.items() if k in WITHHELD_SKIP_REASONS}
+    if withheld:
+        report["withheld"] = withheld
+    report["complete"] = (
+        int(files_indexed) == int(files_accepted) and not drops and not withheld
+    )
     return report
 
 
@@ -514,7 +549,12 @@ def _should_index_file(
         size = file_path.stat().st_size
     except OSError:
         return False, "unreadable", rel_path, None
-    if size > cfg.max_size and resolved_str not in cfg.forced_paths:
+    # ⚠ normcase, not the raw string: on Windows the SAME file resolves to
+    # strings that differ by drive-letter case or 8.3 short form, and a raw
+    # `in` test silently voids the #25 size-cap exemption. The gitignore check
+    # a few lines up already normalises for exactly this reason; this one did
+    # not, and CI on windows-latest caught it where a local Windows run did not.
+    if size > cfg.max_size and resolved_norm not in cfg.forced_paths:
         return False, "too_large", rel_path, None
 
     # 13. Binary detection (opt-out for callers that read the file separately)
@@ -680,6 +720,12 @@ from ._indexing_pipeline import (
     parse_and_prepare_incremental,
     parse_immediate,
 )
+from ._utils import (
+    PARSER_UPGRADE_WARNING,
+    describe_unloadable_index,
+    needs_parser_upgrade as _needs_parser_upgrade,
+    stamp_incremental_outcome as _stamp_incremental_outcome,
+)
 from .package_registry import extract_package_names as _extract_package_names
 
 
@@ -754,6 +800,43 @@ def _fast_path_providers(folder_path: Path, context_providers: bool) -> list:
     return providers
 
 
+def _rel_to_root(abs_path: Path, root: Path) -> Optional[str]:
+    """Root-relative posix path for a watcher change, or None if genuinely outside.
+
+    ⚠ The naive `abs_path.relative_to(root)` raises ValueError whenever the two
+    spell the same location differently, and the call sites answered that with a
+    bare `continue` — so the change was **silently dropped, with no warning and
+    no skip counter**. On Windows that is not hypothetical: a path can arrive in
+    8.3 short form (`C:\\Users\\RUNNER~1\\...`) while the root is the long form
+    (`C:\\Users\\runneradmin\\...`), or differ only by drive-letter case. A
+    watcher emitting either would stop reindexing and say nothing.
+
+    Tries the literal comparison first (cheap, and the overwhelmingly common
+    case), then falls back to resolved + normcased forms before concluding the
+    path is actually outside the root.
+    """
+    try:
+        return abs_path.relative_to(root).as_posix()
+    except ValueError:
+        pass
+    try:
+        resolved = abs_path.resolve()
+        root_resolved = root.resolve()
+        try:
+            return resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            pass
+        # Last resort: normcase both (Windows drive-letter/short-name casing).
+        r_norm = os.path.normcase(str(root_resolved))
+        p_norm = os.path.normcase(str(resolved))
+        prefix = r_norm if r_norm.endswith(os.sep) else r_norm + os.sep
+        if p_norm.startswith(prefix):
+            return str(resolved)[len(prefix):].replace("\\", "/")
+    except OSError:
+        pass
+    return None
+
+
 def _scan_package_json_forced_paths(folder_path: Path) -> set[str]:
     """Pre-scan ``package.json`` files under ``folder_path`` to collect the
     absolute paths of files referenced by ``main``/``module``/``exports``/
@@ -812,19 +895,19 @@ def _scan_package_json_forced_paths(folder_path: Path) -> set[str]:
                 # If extension-less, try common JS/TS extensions and index
                 # variants so we resolve to a concrete file on disk.
                 if target.is_file():
-                    forced.add(str(target))
+                    forced.add(os.path.normcase(str(target)))
                     continue
                 for ext in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
                     trial = pkg_dir / f"{cand}{ext}"
                     if trial.is_file():
-                        forced.add(str(trial.resolve()))
+                        forced.add(os.path.normcase(str(trial.resolve())))
                         break
                 else:
                     for sub in ("/index.js", "/index.ts", "/index.mjs",
                                 "/index.cjs"):
                         trial = pkg_dir / f"{cand}{sub}"
                         if trial.is_file():
-                            forced.add(str(trial.resolve()))
+                            forced.add(os.path.normcase(str(trial.resolve())))
                             break
     except OSError:
         pass
@@ -871,7 +954,7 @@ def resolve_explicit_paths(
     walk_root: Path,
     paths: list,
     max_files: Optional[int],
-    max_size: int = DEFAULT_MAX_FILE_SIZE,
+    max_size: Optional[int] = None,
     follow_symlinks: bool = False,
 ) -> tuple[list[Path], list[str], dict[str, int], list[str]]:
     """Materialise a caller-supplied list of paths into the (files, warnings,
@@ -899,6 +982,11 @@ def resolve_explicit_paths(
     files they already know about (git-diff list, edited-files list,
     rg-matched list) without paying the cost of a full directory walk.
     """
+    # Same resolve-on-entry rule as discover_local_files: the explicit-paths
+    # route is a second walk entry point, and a cap that applies to one and not
+    # the other is the defect v1.108.194 exists to close. `repo=` is what makes
+    # the walked root, not the ambient process, decide the cap (#390).
+    max_size = get_max_file_size(max_size, repo=str(Path(walk_root).resolve()))
     files: list[Path] = []
     warnings: list[str] = []
     skip_counts: dict[str, int] = {}
@@ -1009,7 +1097,7 @@ def resolve_explicit_paths(
 def discover_local_files(
     folder_path: Path,
     max_files: Optional[int] = None,
-    max_size: int = DEFAULT_MAX_FILE_SIZE,
+    max_size: Optional[int] = None,
     extra_ignore_patterns: Optional[list[str]] = None,
     follow_symlinks: bool = False,
 ) -> tuple[list[Path], list[str], dict[str, int]]:
@@ -1027,10 +1115,25 @@ def discover_local_files(
     Returns:
         Tuple of (list of Path objects for source files, list of warning strings).
     """
-    max_files = get_max_folder_files(max_files)
+    # ⚠ v1.108.194: resolve the size cap HERE, not at each call site. v1.108.193
+    # gave the cap a config key and an env var, but `index_folder` called this
+    # function without `max_size=`, so the walk kept the hardcoded default and
+    # the new route reached only the watcher fast path. Resolving on entry makes
+    # every caller correct by default, including ones not yet written — the
+    # same shape as `max_files` on the line above (@dkiaulakis, #375).
+    #
+    # ⚠ v1.108.197: pass `repo=` too. Resolving on entry fixed WHERE the cap is
+    # read; it did not fix WHICH config is read. Without a repo the resolver sees
+    # global config only, so a cap set in the project's own `.jcodemunch.jsonc`
+    # was parsed, cached, and then never consulted (#390 / #391 @amarakramali). The key
+    # is the walked root because that is what `load_project_config` was called
+    # with, before the git-root retarget moves `folder_path` (line ~1319).
+    root = folder_path.resolve()
+    _repo_key = str(root)
+    max_size = get_max_file_size(max_size, repo=_repo_key)
+    max_files = get_max_folder_files(max_files, repo=_repo_key)
     files = []
     warnings = []
-    root = folder_path.resolve()
 
     skip_counts: dict[str, int] = {
         "skip_dir": 0,
@@ -1236,6 +1339,12 @@ def index_folder(
     _config.load_project_config(str(folder_path))
 
     warnings = []
+    # What the caller ASKED for, pinned before anything downstream can flip
+    # `incremental` (#413). Every non-error return stamps requested vs
+    # performed, so a caller never has to grep `warnings[]` for a sentence to
+    # learn that the operation it requested was substituted for another one.
+    _requested_incremental = incremental
+    rebuild_reason: Optional[str] = None
     trusted_folders = _config.get("trusted_folders", [], repo=str(folder_path))
     whitelist_mode = _config.get(
         "trusted_folders_whitelist_mode", True, repo=str(folder_path)
@@ -1373,7 +1482,18 @@ def index_folder(
     else:
         walk_prefix = walk_root.relative_to(folder_path).as_posix()
 
-    max_files = get_max_folder_files()
+    # ⚠ v1.108.247: pass `repo=`. Resolving here WITHOUT a repo key was not a
+    # missing route — it was a route that OVERRODE the correct one. `max_files`
+    # is handed to `discover_local_files`/`resolve_explicit_paths` below, and
+    # `_discover_source_files` treats a non-None `max_files` as an explicit
+    # caller override, short-circuiting its own repo-aware resolution (line
+    # ~1134). So the global value resolved here silently won on EVERY path, full
+    # walk included — `.jcodemunch.jsonc` was parsed, reported by
+    # `config --check`, and then never consulted (#416 @domis86). The key is
+    # `walk_root`, matching both `load_project_config` above and the key
+    # `_discover_source_files` builds, and it is read BEFORE the git-root
+    # retarget moves `folder_path`.
+    max_files = get_max_folder_files(repo=str(walk_root.resolve()))
 
     try:
         t0 = time.monotonic()
@@ -1484,12 +1604,40 @@ def index_folder(
             except Exception:
                 pass
 
+            # ── forced_paths on the fast path (@dkiaulakis, 2026-07-27) ──
+            # The full walk exempts package.json entry points from the size cap
+            # (#25). This path passed an EMPTY set, so the same oversize file was
+            # indexed by a full walk and dropped as `too_large` by an incremental
+            # one — it appeared, then silently vanished on the next edit.
+            #
+            # Scanning is NOT unconditional: _scan_package_json_forced_paths
+            # walks the tree, and this path exists to avoid exactly that per
+            # event. The exemption can only change an outcome for a file that is
+            # actually over the cap, so the scan is paid only when the change set
+            # contains one — the common case still walks nothing.
+            # `repo=` for the same reason the two walks below take it: this is a
+            # third discovery entry point, and a cap the project sets must reach
+            # all three or the file appears on one route and vanishes on another.
+            _fast_max_size = get_max_file_size(repo=str(Path(walk_root).resolve()))
+
+            def _fast_forced_paths() -> set:
+                for _c in changed_paths:
+                    _p = _c[1] if isinstance(_c, (tuple, WatcherChange)) else _c
+                    try:
+                        if Path(_p).stat().st_size > _fast_max_size:
+                            return _scan_package_json_forced_paths(
+                                folder_path.resolve()
+                            )
+                    except OSError:
+                        continue
+                return set()
+
             _fast_filter_cfg = _build_index_filters(
                 root=folder_path.resolve(),
                 follow_symlinks=follow_symlinks,
-                max_size=DEFAULT_MAX_FILE_SIZE,
+                max_size=_fast_max_size,
                 extra_spec=_fast_extra_spec,
-                forced_paths=set(),
+                forced_paths=_fast_forced_paths(),
                 skip_dirs_regex=_build_skip_dirs_regex(),
                 check_binary=False,
                 check_filename=True,
@@ -1531,11 +1679,19 @@ def index_folder(
                     abs_path_str = wc[1]
                     old_hash = wc[2]
                     abs_path = Path(abs_path_str)
-                    try:
-                        rel_path = abs_path.relative_to(folder_path).as_posix()
-                    except ValueError:
+                    rel_path = _rel_to_root(abs_path, folder_path)
+                    if rel_path is None:
                         continue
                     _old_hash_map[rel_path] = old_hash
+
+            # An index whose symbols predate the current extraction semantics
+            # cannot be repaired by a delta: the files carrying the bad symbols
+            # are UNCHANGED, so a change-set-driven pass never re-parses them
+            # (#414). Disarm the fast path and let the full walk below take the
+            # upgrade branch, which is the only thing that rewrites every row.
+            if _needs_parser_upgrade(_fast_base_index):
+                existing_index = None
+                use_memory_hash_cache = False
 
             if existing_index is not None or use_memory_hash_cache:
                 # Reuse the providers discovered by the initial full index so a
@@ -1566,9 +1722,8 @@ def index_folder(
                         old_hash = wc_item[2] if len(wc_item) > 2 else ""
 
                     abs_path = Path(abs_path_str)
-                    try:
-                        rel_path = abs_path.relative_to(folder_path).as_posix()
-                    except ValueError:
+                    rel_path = _rel_to_root(abs_path, folder_path)
+                    if rel_path is None:
                         continue
 
                     # Apply the shared filter bundle (#306). Deletions bypass
@@ -1611,7 +1766,7 @@ def index_folder(
                         store, owner, repo_name, folder_path,
                         existing_index.git_head if existing_index else None,
                     )
-                    return {
+                    _fast_no_change = {
                         "success": True,
                         "message": "No changes detected",
                         "repo": f"{owner}/{repo_name}",
@@ -1619,6 +1774,10 @@ def index_folder(
                         "changed": 0, "new": 0, "deleted": 0,
                         "duration_seconds": round(time.monotonic() - t0, 2),
                     }
+                    _stamp_incremental_outcome(
+                        _fast_no_change, _requested_incremental, True
+                    )
+                    return _fast_no_change
 
                 # Read and hash only the changed/new files.
                 # For "modified" files, compare hash against stored hash —
@@ -1688,7 +1847,7 @@ def index_folder(
                             file_mtimes=mtime_only_updates,
                             git_head=_new_head if _head_advanced else "",
                         )
-                    return {
+                    _fast_mtime_only = {
                         "success": True,
                         "message": "No changes detected",
                         "repo": f"{owner}/{repo_name}",
@@ -1697,6 +1856,10 @@ def index_folder(
                         "changed": 0, "new": 0, "deleted": 0,
                         "duration_seconds": round(time.monotonic() - t0, 2),
                     }
+                    _stamp_incremental_outcome(
+                        _fast_mtime_only, _requested_incremental, True
+                    )
+                    return _fast_mtime_only
 
                 files_to_parse = set(changed_files) | set(new_files)
                 # Split pipeline: parse immediately (no AI), fire summarization thread.
@@ -1799,6 +1962,7 @@ def index_folder(
                     )
                 if fast_warnings:
                     result["warnings"] = fast_warnings
+                _stamp_incremental_outcome(result, _requested_incremental, True)
                 _maybe_apply_adaptive(folder_path, result)
                 return result
 
@@ -1999,16 +2163,27 @@ def index_folder(
                 )
 
         if existing_index is None and store.has_index(owner, repo_name):
+            rebuild_reason, _rebuild_message = describe_unloadable_index(
+                store, owner, repo_name
+            )
             logger.warning(
-                "index_folder version_mismatch — %s/%s: on-disk index is a newer version; full re-index required",
+                "index_folder unloadable_index — %s/%s: %s; full re-index required",
+                owner, repo_name, rebuild_reason,
+            )
+            warnings.append(_rebuild_message)
+        elif _needs_parser_upgrade(existing_index):
+            # One-off full re-parse after an extraction-semantics bump (#414).
+            # Reported through the same fields a caller already reads for an
+            # unreadable index, so a substituted rebuild always has a reason.
+            incremental = False
+            rebuild_reason = "parser_generation_upgrade"
+            logger.warning(
+                "index_folder parser_generation_upgrade — %s/%s: stored=%s current=%s; "
+                "re-parsing every file once",
                 owner, repo_name,
+                getattr(existing_index, "parser_generation", 0), PARSER_GENERATION,
             )
-            warnings.append(
-                "Existing index was created by a newer version of jcodemunch-mcp "
-                "and cannot be read — performing a full re-index. "
-                "If you downgraded the package, delete ~/.code-index/ (or your "
-                "CODE_INDEX_PATH directory) to remove the stale index."
-            )
+            warnings.append(PARSER_UPGRADE_WARNING)
 
         # Discovery pass — resolve rel_paths and collect mtimes without
         # reading file contents (P2-5: avoids 200MB-1GB allocation
@@ -2141,6 +2316,9 @@ def index_folder(
                     "changed": 0, "new": 0, "deleted": 0,
                     "duration_seconds": round(time.monotonic() - t0, 2),
                 }
+                _stamp_incremental_outcome(
+                    _no_change_result, _requested_incremental, True
+                )
                 # This ran a full discovery walk, so a still-truncated index
                 # stays loud even when nothing changed (#366).
                 _attach_cap_report(_no_change_result, _cap_status)
@@ -2284,6 +2462,7 @@ def index_folder(
                 result["branch_delta"] = True
             if warnings:
                 result["warnings"] = warnings
+            _stamp_incremental_outcome(result, _requested_incremental, True)
             _attach_cap_report(result, _cap_status)
             _attach_provider_skips(result, folder_path)
             _maybe_apply_adaptive(folder_path, result)
@@ -2640,6 +2819,11 @@ def index_folder(
         if warnings:
             result["warnings"] = warnings
 
+        # This path rebuilt the whole corpus. When the caller asked for an
+        # incremental, that substitution is now a field, not a sentence (#413).
+        _stamp_incremental_outcome(
+            result, _requested_incremental, False, rebuild_reason
+        )
         _attach_cap_report(result, _cap_status)
         _attach_provider_skips(result, folder_path)
 

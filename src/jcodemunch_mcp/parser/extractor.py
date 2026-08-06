@@ -1,6 +1,7 @@
 """Generic AST symbol extractor using tree-sitter."""
 
 import bisect
+import logging
 import re
 from typing import Any, Optional
 from tree_sitter_language_pack import get_parser
@@ -14,6 +15,60 @@ from .template_shared import (
     mask_template_keep_offsets,
 )
 from .complexity import compute_complexity
+
+logger = logging.getLogger(__name__)
+
+
+class ByteSlicedSource:
+    """A text view indexed by BYTE offsets, not character offsets.
+
+    tree-sitter reports ``node.start_byte`` / ``node.end_byte`` as offsets into
+    the UTF-8 encoding of the source. Slicing a decoded ``str`` with them is
+    correct only while the file is pure ASCII: every earlier non-ASCII
+    character shifts the window forward by (bytes - characters), so the
+    extracted text becomes an unrelated run of source further down the file.
+    The window keeps its byte width, so an ASCII identifier still comes back
+    with the right LENGTH -- which is why the corruption reads as a plausible
+    fragment rather than obvious garbage (#414, @MotoMato85).
+
+    Assigning this in place of the decoded string keeps the offsets and the
+    text in one coordinate system, leaving the slice expressions themselves
+    untouched.
+
+    ⚠ Not for the regex-based extractors. ``_parse_cobol_symbols`` and friends
+    slice ``source`` with CHARACTER offsets from ``re`` matches and call
+    ``.count()`` / ``.splitlines()`` on it; they are already correct and this
+    view would break them.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def __getitem__(self, key) -> str:
+        chunk = self._data[key] if isinstance(key, slice) else self._data[key:key + 1]
+        try:
+            return chunk.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            # A byte-capped slice (the 120-byte signature truncations) can land
+            # mid-character. Drop that trailing partial rather than emit U+FFFD.
+            # ⚠ Only when the bad run reaches the END of the chunk: retrying on
+            # a shorter prefix for a bad byte anywhere else would silently DROP
+            # the rest of the text, which is worse than the mangling it avoids.
+            # Genuinely undecodable bytes keep the old errors="replace" result.
+            if exc.end == len(chunk) and exc.start >= len(chunk) - 3:
+                try:
+                    return chunk[:exc.start].decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+            return chunk.decode("utf-8", errors="replace")
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __str__(self) -> str:
+        return self._data.decode("utf-8", errors="replace")
 
 
 # Node types that represent function/call expressions per language.
@@ -543,6 +598,32 @@ def _walk_tree(
         if const_symbol:
             symbols.append(const_symbol)
 
+    # A JS/TS class field INITIALIZER is not the class body. Everything the
+    # initializer contains is attributed to the field, never to the class.
+    #
+    # `class Host { handlers = { onDone(){} } }` puts a `method_definition`
+    # under `Host` -- the grammar uses that node type for object-literal
+    # shorthand as well as for real methods, and the only discriminator is the
+    # parent. Left alone it yields `Host.onDone`, a member `Host` does not
+    # declare. A free `function_declaration` in an arrow initializer has the
+    # same symptom by a different route: a field initializer is not a scope
+    # boundary, so `parent_is_container` survives into it and promotes the
+    # function to a method.
+    #
+    # A real class method is a DIRECT child of `class_body` and never reaches
+    # here, so declared members are untouched. Object literals inside a
+    # FUNCTION are also untouched: `pluginCreator.prepare` is ordinary lexical
+    # nesting, the same shape Python already emits for `Host.real.inner`.
+    if (
+        language in ("javascript", "typescript", "tsx")
+        and node.type in _JS_CLASS_FIELD_NODE_TYPES
+        and parent_symbol is not None
+    ):
+        field_scope = _js_field_scope(node, parent_symbol, source_bytes, language)
+        if field_scope is not None:
+            next_parent = field_scope
+            next_is_container = False
+
     # Recurse into children
     for child in node.children:
         _walk_tree(
@@ -559,6 +640,52 @@ def _walk_tree(
             calls,
             next_is_container,
         )
+
+
+# Class field declarations in the JS grammar (`field_definition`) and the
+# TS/TSX grammars (`public_field_definition`). Both hold the initializer whose
+# contents must not be attributed to the enclosing class.
+_JS_CLASS_FIELD_NODE_TYPES = frozenset({"field_definition", "public_field_definition"})
+
+
+def _js_field_scope(node, parent_symbol: Symbol, source_bytes: bytes, language: str):
+    """A naming scope for the inside of a class field initializer.
+
+    Returns a ``Symbol`` used ONLY as a `parent_symbol` while walking the
+    initializer -- it is never appended to the symbol list, so this adds no
+    symbol and changes no count. `parent` still points at the class, keeping
+    the graph edge from the class to whatever the field holds.
+
+    ⚠ The two grammars disagree on the field name's field name: JS exposes it
+    as ``property``, TS/TSX as ``name``. Reading only one silently leaves the
+    other language unfixed -- which it did, until a TSX case caught it.
+
+    A computed key (`[expr] = ...`) keeps its brackets verbatim, matching how
+    a computed METHOD name is already stored. It is not a resolvable
+    identifier either way, and blocking the class attribution still matters.
+    Returns ``None`` only when no key node exists at all.
+    """
+    name_node = node.child_by_field_name("property") or node.child_by_field_name("name")
+    if name_node is None or name_node.type not in (
+        "property_identifier",
+        "private_property_identifier",
+        "computed_property_name",
+    ):
+        return None
+    field_name = source_bytes[name_node.start_byte:name_node.end_byte].decode(
+        "utf-8", errors="replace"
+    ).strip()
+    if not field_name:
+        return None
+    return Symbol(
+        id=parent_symbol.id,
+        file=parent_symbol.file,
+        name=field_name,
+        qualified_name=f"{parent_symbol.qualified_name}.{field_name}",
+        kind="constant",
+        language=language,
+        signature="",
+    )
 
 
 def _detect_interface_keywords(node, language: str) -> list[str]:
@@ -5867,7 +5994,7 @@ def _parse_objc_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     CLASS_NODE_TYPES = {
@@ -5996,7 +6123,7 @@ def _parse_proto_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     NODE_MAP = {
@@ -6066,7 +6193,7 @@ def _parse_hcl_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     BLOCK_KINDS = {
@@ -6149,7 +6276,7 @@ def _parse_graphql_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     NODE_KINDS = {
@@ -6400,6 +6527,37 @@ def _parse_toml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
             return [p for p in parts if p]
         return []
 
+    def _end_line(node) -> int:
+        """Last line the node actually occupies, 1-based.
+
+        A tree-sitter node that ends at column 0 stops at a line BOUNDARY: it
+        holds no text on that row, so the row belongs to whatever comes next.
+        The plain ``end_point[0] + 1`` therefore overshoots by one.
+
+        It bites here because tree-sitter-toml runs a table to the start of the
+        following table. Measured against ``fastapi`` at ``a64dfbbd``,
+        ``[build-system]`` (lines 1-3, blank at 4) reported ``end_line=5``,
+        which is the line holding ``[project]``, a different symbol entirely.
+        ``byte_length`` was right throughout, so the two disagreed and only the
+        line number was wrong.
+
+        ⚠ Guarded against collapsing a single-line node: a node that starts and
+        ends on the same row keeps that row whatever its end column.
+
+        ⚠ **Deliberately scoped to TOML, and NOT applied to the other ~70
+        ``end_point[0] + 1`` sites in this module.** Sampled across two corpora,
+        python / go / typescript / javascript / json / css showed zero
+        disagreement, because their symbol nodes end at the last token rather
+        than at a boundary. Sweeping all of them would move line numbers for
+        languages with no demonstrated defect. YAML DOES disagree, in the
+        opposite direction (end_line UNDERSHOOTS by 1-2), which is a separate
+        cause and must not be folded in here on this evidence.
+        """
+        row, col = node.end_point[0], node.end_point[1]
+        if col == 0 and row > node.start_point[0]:
+            return row
+        return row + 1
+
     def _walk_node(node, parent_path: list[str] = None):
         """Walk the AST and extract symbols."""
         if parent_path is None:
@@ -6420,7 +6578,7 @@ def _parse_toml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
                         language="toml",
                         signature=f"[{full_path}]",
                         line=node.start_point[0] + 1,
-                        end_line=node.end_point[0] + 1,
+                        end_line=_end_line(node),
                         byte_offset=node.start_byte,
                         byte_length=node.end_byte - node.start_byte,
                         content_hash=compute_content_hash(source_bytes[node.start_byte:node.end_byte]),
@@ -6445,7 +6603,7 @@ def _parse_toml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
                         language="toml",
                         signature=f"[[{full_path}]]",
                         line=node.start_point[0] + 1,
-                        end_line=node.end_point[0] + 1,
+                        end_line=_end_line(node),
                         byte_offset=node.start_byte,
                         byte_length=node.end_byte - node.start_byte,
                         content_hash=compute_content_hash(source_bytes[node.start_byte:node.end_byte]),
@@ -6478,7 +6636,7 @@ def _parse_toml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
                         language="toml",
                         signature=sig,
                         line=node.start_point[0] + 1,
-                        end_line=node.end_point[0] + 1,
+                        end_line=_end_line(node),
                         byte_offset=node.start_byte,
                         byte_length=node.end_byte - node.start_byte,
                         content_hash=compute_content_hash(source_bytes[node.start_byte:node.end_byte]),
@@ -6601,7 +6759,7 @@ def _parse_julia_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _func_name(node) -> Optional[str]:
@@ -6702,7 +6860,7 @@ def _parse_groovy_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     CONTAINER_KEYWORDS = {"class", "interface", "enum", "trait", "record"}
@@ -7024,7 +7182,7 @@ def _parse_xml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
     root_extracted = False
 
@@ -7221,18 +7379,80 @@ def _parse_xml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
     return symbols
 
 
+_KEY_TEXT_LOADER = None
+
+
+def _key_text_loader():
+    """A SafeLoader whose mapping KEYS keep their source text.
+
+    ⚠⚠ PyYAML implements YAML 1.1, which resolves ``on`` / ``off`` / ``yes`` /
+    ``no`` to booleans **as keys**. A GitHub workflow's ``on:`` therefore
+    arrived as the key ``True``, and every workflow we index carried a symbol
+    literally named ``True``.
+
+    ⚠ **The naming was the visible half. The silent half is key LOSS.** ``on``
+    and ``yes`` both resolve to ``True``, and ``off`` and ``no`` both to
+    ``False``, so four distinct keys collapse into two and the later one
+    overwrites the earlier without a word. Measured on a document with all
+    four: ``safe_load`` returned 6 keys where the source had 8.
+
+    Only keys are affected. Values keep ordinary YAML semantics, so
+    ``strict: true`` is still the boolean ``True`` and ``count: 42`` is still
+    ``42``. Merge keys (``<<:``) still resolve, because ``flatten_mapping`` runs
+    first exactly as it does in the stock constructor.
+    """
+    global _KEY_TEXT_LOADER
+    if _KEY_TEXT_LOADER is not None:
+        return _KEY_TEXT_LOADER
+
+    import yaml as _yaml
+
+    class _KeyTextLoader(_yaml.SafeLoader):
+        pass
+
+    def _construct_mapping(loader, node, deep=False):
+        loader.flatten_mapping(node)
+        mapping = {}
+        for key_node, value_node in node.value:
+            if isinstance(key_node, _yaml.ScalarNode):
+                key = key_node.value  # raw source text, no 1.1 coercion
+            else:
+                key = loader.construct_object(key_node, deep=deep)
+                if isinstance(key, list):
+                    key = tuple(key)
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    _KeyTextLoader.add_constructor(
+        _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping
+    )
+    _KEY_TEXT_LOADER = _KeyTextLoader
+    return _KEY_TEXT_LOADER
+
+
 def _load_yaml_data(source: str):
-    """Load YAML content, returning None on parser/import failure."""
+    """Load YAML content, returning None on parser/import failure.
+
+    Mapping keys keep their source text; see :func:`_key_text_loader`.
+    """
     try:
         import yaml as _yaml
-        docs = [doc for doc in _yaml.safe_load_all(source) if doc is not None]
-        if not docs:
-            return None
-        if len(docs) == 1:
-            return docs[0]
-        return docs
-    except Exception:
+    except ImportError:
         return None
+    try:
+        docs = [
+            doc
+            for doc in _yaml.load_all(source, Loader=_key_text_loader())
+            if doc is not None
+        ]
+    except Exception:
+        logger.debug("YAML load failed", exc_info=True)
+        return None
+    if not docs:
+        return None
+    if len(docs) == 1:
+        return docs[0]
+    return docs
 
 
 def _build_line_offsets(source: str) -> tuple[list[str], list[int]]:
@@ -7245,7 +7465,14 @@ def _build_line_offsets(source: str) -> tuple[list[str], list[int]]:
 
 
 def _find_line(lines: list[str], text: str, after: int = 0) -> int:
-    """Find the first 1-based line containing text after a starting index."""
+    """Find the first 1-based line containing text after a starting index.
+
+    ⚠ Substring matching, and a not-found result that returns ``after + 1``
+    rather than admitting failure. Both are load-bearing for the callers that
+    still use it (Ansible task/role names are free text, not keys, so they have
+    no anchor to match on). New key-shaped lookups should use
+    :func:`_find_key_line`, which is exact and honest about missing.
+    """
     needle = str(text).strip().lower()
     if not needle:
         return max(after + 1, 1)
@@ -7255,10 +7482,66 @@ def _find_line(lines: list[str], text: str, after: int = 0) -> int:
     return max(after + 1, 1)
 
 
+#: Returned by :func:`_find_key_line` when the key is not on any candidate line.
+KEY_NOT_FOUND = 0
+
+
+def _find_key_line(lines: list[str], key: str, after: int = 0) -> int:
+    """1-based line where ``key`` appears as a mapping key, or :data:`KEY_NOT_FOUND`.
+
+    Replaces three compounding defects in the ``_find_line`` path, all measured
+    2026-08-04 against `.github/workflows/health-radar-comment.yml`, where a
+    five-key step block resolved to lines 31 / 32 / 33 / 34 / 35 and only the
+    last was right:
+
+    1. **Substring matching.** ``needle in line`` let ``id:`` match ``run-id:``.
+       The key is now anchored to the start of the line's content, after
+       indentation and an optional ``- `` list marker, and must be followed by
+       a colon. ``run-id:`` can no longer answer for ``id``.
+    2. **Silent fabricated fallback.** Not-found returned ``after + 1``, which
+       is simply the next line dressed up as a located match. Two of the five
+       keys above were fabricated that way. This returns
+       :data:`KEY_NOT_FOUND`, and the caller routes that to a zero byte extent
+       so the symbol yields nothing rather than somebody else's text.
+    3. (The third, a cursor that starts past the item's own key, is fixed at
+       the call site in ``_walk_yaml_value``, not here.)
+
+    Quoted keys (``"on":``) are matched too, since YAML permits them.
+    """
+    name = str(key).strip()
+    if not name:
+        return KEY_NOT_FOUND
+    pattern = re.compile(
+        r"^\s*(?:-\s+)?(?:['\"])?" + re.escape(name) + r"(?:['\"])?\s*:",
+        re.IGNORECASE,
+    )
+    for idx in range(max(after, 0), len(lines)):
+        if pattern.match(lines[idx]):
+            return idx + 1
+    return KEY_NOT_FOUND
+
+
 def _byte_start(offsets: list[int], line_1based: int) -> int:
     """Return the byte offset for a 1-based line number."""
     idx = line_1based - 1
     return offsets[idx] if 0 <= idx < len(offsets) else 0
+
+
+def _byte_span(offsets: list[int], line_1based: int) -> tuple[int, int]:
+    """Real byte extent of a 1-based source line, newline included.
+
+    ``offsets`` holds ``len(lines) + 1`` entries, so line L runs from
+    ``offsets[L-1]`` to ``offsets[L]``.
+
+    Returns a length of 0 when the line is out of range. A zero extent makes
+    the reader return nothing, which is the honest outcome for a symbol we
+    cannot locate; the alternative is a plausible-looking slice of somebody
+    else's text.
+    """
+    idx = line_1based - 1
+    if idx < 0 or idx + 1 >= len(offsets):
+        return _byte_start(offsets, line_1based), 0
+    return offsets[idx], offsets[idx + 1] - offsets[idx]
 
 
 def _scalar_signature(name: str, value: object) -> str:
@@ -7281,10 +7564,36 @@ def _append_virtual_symbol(
     offsets: list[int],
     docstring: str = "",
     parent: Optional[str] = None,
+    lines: Optional[list[str]] = None,
 ) -> str:
-    """Append a synthesized symbol backed by signature bytes."""
+    """Append a synthesized symbol located at a real line of the source.
+
+    ⚠⚠ **`byte_length` used to be `len(signature)`, and `signature` is a
+    RECONSTRUCTION, not a quotation.** ``byte_offset`` indexed the file while
+    ``byte_length`` measured a string built from parsed data, so the two came
+    from different universes and their product was a slice of arbitrary bytes.
+    Measured 2026-08-04: this held for **237 of 237** virtual symbols. In
+    `health-radar-comment.yml` the `uses` key (signature
+    ``uses: 'actions/download-artifact@...'``, 74 bytes) returned 74 bytes of
+    two entirely different sibling keys. YAML round-tripping also inflates:
+    ``name: Health Radar Comment`` is 27 bytes of source and its reconstructed
+    signature is 28, because the reconstruction adds quotes.
+
+    The extent now describes the actual source line, so ``byte_offset`` and
+    ``byte_length`` are finally in the same coordinate system.
+
+    ``lines`` is optional only so that no caller silently breaks; pass it
+    whenever it is in scope. With it, ``content_hash`` covers the same bytes
+    the extent names, which is what lets ``verify`` succeed. Without it the
+    hash still covers the signature, and ``content_verified`` stays False as
+    it does today.
+    """
     payload = signature.encode("utf-8")
     symbol_id = make_symbol_id(filename, qualified_name, kind)
+    start, length = _byte_span(offsets, line)
+    hashed = payload
+    if lines is not None and 0 <= line - 1 < len(lines):
+        hashed = lines[line - 1].encode("utf-8")
     symbols.append(Symbol(
         id=symbol_id,
         file=filename,
@@ -7297,11 +7606,81 @@ def _append_virtual_symbol(
         parent=parent,
         line=line,
         end_line=line,
-        byte_offset=_byte_start(offsets, line),
-        byte_length=len(payload),
-        content_hash=compute_content_hash(payload),
+        byte_offset=start,
+        byte_length=length,
+        content_hash=compute_content_hash(hashed),
     ))
     return symbol_id
+
+
+def _yaml_line_map(source: str) -> dict:
+    """Map each YAML path to the TRUE 1-based line of its key, from node marks.
+
+    ``yaml.compose`` returns the document as nodes carrying source marks, so a
+    key's line is read rather than searched for. This removes an entire defect
+    class instead of narrowing it.
+
+    ⚠ **The text-search locator it replaces could not be repaired by patching.**
+    Measured against this oracle: the original scan agreed with the truth on
+    ~73% of comparable symbols. Anchoring the key match and refusing on a miss
+    took it to 96.5%. An attempt to close the rest, by advancing a parent's
+    cursor past a nested block, made it *worse* (89.6%), because a text cursor
+    has no notion of where a block ends: every heuristic traded one class of
+    mislocation for another. Node marks have no such ambiguity.
+
+    Paths are built with exactly the same segment rules as
+    :func:`_walk_yaml_value`, including :func:`_yaml_list_item_segment`, so
+    lookups line up. Returns an empty dict when the document will not compose,
+    and the caller falls back to the search path.
+
+    ⚠ **`yaml` is imported LOCALLY as ``_yaml`` throughout this module, never at
+    module scope.** The first version of this function said ``yaml.compose``,
+    raised ``NameError``, and a broad ``except Exception`` turned that into a
+    silently empty map, so the node-mark path never executed while its
+    measurements looked fine. The excepts below are narrow for exactly that
+    reason: a programming error here must surface, not degrade.
+    """
+    try:
+        import yaml as _yaml
+    except ImportError:  # optional dep; degrades to the search path
+        return {}
+    try:
+        root = _yaml.compose(source)
+    except _yaml.YAMLError:
+        return {}
+    if root is None:
+        return {}
+
+    out: dict = {}
+
+    def _plain(node) -> object:
+        """Shallow view, enough for :func:`_yaml_list_item_segment`."""
+        if isinstance(node, _yaml.MappingNode):
+            shallow = {}
+            for k, v in node.value:
+                if isinstance(k, _yaml.ScalarNode) and isinstance(v, _yaml.ScalarNode):
+                    shallow[str(k.value)] = str(v.value)
+            return shallow
+        if isinstance(node, _yaml.ScalarNode):
+            return str(node.value)
+        return None
+
+    def walk(node, path_parts: list[str]) -> None:
+        if isinstance(node, _yaml.MappingNode):
+            for key_node, value_node in node.value:
+                if not isinstance(key_node, _yaml.ScalarNode):
+                    continue
+                parts = path_parts + [str(key_node.value)]
+                out.setdefault(".".join(parts), key_node.start_mark.line + 1)
+                walk(value_node, parts)
+        elif isinstance(node, _yaml.SequenceNode):
+            for index, item in enumerate(node.value):
+                parts = path_parts + [_yaml_list_item_segment(_plain(item), index)]
+                out.setdefault(".".join(parts), item.start_mark.line + 1)
+                walk(item, parts)
+
+    walk(root, [])
+    return out
 
 
 def _yaml_list_item_segment(item: object, index: int) -> str:
@@ -7323,25 +7702,53 @@ def _walk_yaml_value(
     lines: list[str],
     offsets: list[int],
     after_line: int = 0,
-) -> None:
-    """Recursively extract structural symbols from generic YAML content."""
+    line_map: Optional[dict] = None,
+) -> int:
+    """Recursively extract structural symbols from generic YAML content.
+
+    ``line_map`` carries true line numbers read from YAML node marks
+    (:func:`_yaml_line_map`). When it holds this symbol's path, that line wins;
+    the text search is only a fallback for documents that will not compose.
+
+    Returns the highest 1-based line this walk consumed, so a caller can move
+    its own cursor past a nested block.
+
+    ⚠ Without that, a parent's cursor stayed near the block it descended into
+    and a later sibling could match a NESTED key of the same name. Measured on
+    `docker-compose.yml`: the top-level `volumes` (line 41) bound to a
+    service-level `volumes:` at line 21.
+    """
     if isinstance(value, dict):
-        cursor = after_line
+        # ⚠ The scan starts AT `after_line`, not after it. A list item is
+        # identified by its own `name:` line, and the previous code then began
+        # the dict walk on the FOLLOWING line, so the item's own `name` key
+        # could never match itself and bound to a nested `name:` further down
+        # instead (measured: a step's `name` resolved to its `with.name`).
+        cursor = max(after_line - 1, 0)
+        last = cursor
         for key, child in value.items():
             key_name = str(key)
             qualified_name = ".".join(path_parts + [key_name]) if path_parts else key_name
-            line = _find_line(lines, f"{key_name}:", cursor - 1)
-            next_cursor = line + 1
-            cursor = next_cursor
+            line = (line_map or {}).get(qualified_name) or _find_key_line(lines, key_name, cursor)
+            # ⚠ Only advance past a key we actually LOCATED. Advancing on a
+            # miss is what made the old cascade compound: one wrong answer
+            # pushed the cursor forward and corrupted every sibling after it.
+            if line != KEY_NOT_FOUND:
+                cursor = line
+                last = max(last, line)
+            next_cursor = (line + 1) if line != KEY_NOT_FOUND else after_line
             if isinstance(child, (dict, list)):
                 kind = "type"
                 signature = f"{key_name}:"
                 _append_virtual_symbol(
-                    symbols, filename, language, key_name, qualified_name, kind, signature, line, offsets
+                    symbols, filename, language, key_name, qualified_name, kind, signature, line, offsets,
+                    lines=lines,
                 )
-                _walk_yaml_value(
-                    child, path_parts + [key_name], filename, language, symbols, lines, offsets, next_cursor
+                child_last = _walk_yaml_value(
+                    child, path_parts + [key_name], filename, language, symbols, lines, offsets,
+                    next_cursor, line_map,
                 )
+                last = max(last, child_last)
             else:
                 signature = _scalar_signature(key_name, child)
                 _append_virtual_symbol(
@@ -7354,22 +7761,41 @@ def _walk_yaml_value(
                     signature,
                     line,
                     offsets,
+                    lines=lines,
                 )
+        return last
     elif isinstance(value, list):
         cursor = after_line
+        last = cursor
         for index, child in enumerate(value):
             segment = _yaml_list_item_segment(child, index)
-            item_line = cursor or 1
-            if isinstance(child, dict) and isinstance(child.get("name"), str):
+            mapped = (line_map or {}).get(
+                ".".join(path_parts + [segment]) if path_parts else segment
+            )
+            if mapped:
+                item_line = mapped
+            elif isinstance(child, dict) and isinstance(child.get("name"), str):
                 item_line = _find_line(lines, str(child["name"]), cursor - 1)
             elif path_parts:
                 item_line = _find_line(lines, path_parts[-1], cursor - 1)
-            next_cursor = item_line + 1
-            cursor = next_cursor
+            else:
+                item_line = cursor or 1
+            cursor = item_line + 1
+            # ⚠ Hand the child its OWN line, not the line after it. The item is
+            # identified by its `name:` line, and that line also holds the
+            # item's `name` KEY. Passing `item_line + 1` here is what made a
+            # step's own `name` unfindable, so it bound to a nested `name:`
+            # further down the block instead.
+            next_cursor = item_line
+            last = max(last, item_line)
             if isinstance(child, (dict, list)):
-                _walk_yaml_value(
-                    child, path_parts + [segment], filename, language, symbols, lines, offsets, next_cursor
+                child_last = _walk_yaml_value(
+                    child, path_parts + [segment], filename, language, symbols, lines, offsets,
+                    next_cursor, line_map,
                 )
+                last = max(last, child_last)
+        return last
+    return after_line
 
 
 def _parse_yaml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
@@ -7380,14 +7806,15 @@ def _parse_yaml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     lines, offsets = _build_line_offsets(source)
+    line_map = _yaml_line_map(source)
     symbols: list[Symbol] = []
     if isinstance(data, list) and all(isinstance(item, dict) for item in data):
         cursor = 0
         for item in data:
-            _walk_yaml_value(item, [], filename, "yaml", symbols, lines, offsets, cursor)
+            _walk_yaml_value(item, [], filename, "yaml", symbols, lines, offsets, cursor, line_map)
             cursor += 1
         return symbols
-    _walk_yaml_value(data, [], filename, "yaml", symbols, lines, offsets)
+    _walk_yaml_value(data, [], filename, "yaml", symbols, lines, offsets, 0, line_map)
     return symbols
 
 
@@ -8479,7 +8906,7 @@ def _parse_pascal_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -8576,7 +9003,7 @@ def _parse_matlab_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -8662,7 +9089,7 @@ def _parse_ada_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -8846,7 +9273,7 @@ def _parse_commonlisp_symbols(source_bytes: bytes, filename: str) -> list[Symbol
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -8938,7 +9365,7 @@ def _parse_solidity_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -9049,7 +9476,7 @@ def _parse_zig_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -9184,7 +9611,7 @@ def _parse_powershell_symbols(source_bytes: bytes, filename: str) -> list[Symbol
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -9294,7 +9721,7 @@ def _parse_apex_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:
@@ -9398,7 +9825,7 @@ def _parse_ocaml_symbols(source_bytes: bytes, filename: str) -> list[Symbol]:
         return []
 
     tree = parser.parse(source_bytes)
-    source = source_bytes.decode("utf-8", errors="replace")
+    source = ByteSlicedSource(source_bytes)
     symbols: list[Symbol] = []
 
     def _text(node) -> str:

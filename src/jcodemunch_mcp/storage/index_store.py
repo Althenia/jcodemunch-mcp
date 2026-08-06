@@ -51,6 +51,27 @@ logger = logging.getLogger(__name__)
 # in favour of a fresh git-root-rooted walk.
 INDEX_VERSION = 17
 
+# Generation of the SYMBOL EXTRACTION semantics, independent of the storage
+# schema above. Bump this when a parser change makes previously extracted
+# symbols untrustworthy rather than merely incomplete — the stored rows are
+# schema-valid, so INDEX_VERSION cannot express it, and a lower INDEX_VERSION
+# would not force anything anyway (only a stored version GREATER than
+# INDEX_VERSION is refused).
+#
+# An index stamped with an older generation gets ONE full re-parse on the next
+# index_folder / index_repo call, reported as
+# rebuild_reason="parser_generation_upgrade". Written only by the full-save
+# path, because only a full corpus parse earns the stamp; an incremental save
+# leaves it untouched, so a partially re-parsed index keeps claiming the older
+# generation.
+#
+# gen 1 (1.108.244, #414): 16 extractors sliced a decoded str with tree-sitter
+#   BYTE offsets, so every symbol after the first non-ASCII character in a file
+#   got a name taken from an unrelated run of source. The wrong name is baked
+#   into the symbol id, and re-indexing does NOT fix it — the file content is
+#   unchanged, so the incremental path never re-parses it.
+PARSER_GENERATION = 1
+
 
 @dataclass(frozen=True)
 class IndexLoadStatus:
@@ -122,7 +143,7 @@ def _get_git_head(repo_path: Path) -> Optional[str]:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
             cwd=str(repo_path),
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
@@ -143,7 +164,7 @@ def _get_git_branch(repo_path: Path) -> Optional[str]:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=str(repo_path),
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
@@ -186,6 +207,7 @@ class CodeIndex:
     package_names: list[str] = field(default_factory=list)    # Package names published by this repo (from manifest files)
     branch: str = ""                 # Git branch name at index time (empty = base/default branch or non-git)
     file_cap_status: dict = field(default_factory=dict)  # v1.108.126: {truncated, files_discovered, files_indexed, files_skipped_cap, max_folder_files} when the max_folder_files walk cap dropped files; {"truncated": False} otherwise. Empty = pre-v1.108.126 index (unknown).
+    parser_generation: int = 0  # v1.108.244: extraction-semantics generation this index's symbols were produced by. ⚠ Defaults to 0 (= unknown/legacy) deliberately: a construction site that forgets to carry it costs one re-parse, while defaulting to the current generation would silently certify symbols nobody re-parsed.
     coverage: dict = field(default_factory=dict)  # v1.108.145: coverage contract for absence claims — {files_discovered, files_indexed, skip_counts{reason:count}, no_symbols_count, walk, recorded_at} from the last full discovery walk. Empty = unknown (pre-upgrade index or no full walk recorded).
 
     def __post_init__(self) -> None:
@@ -709,6 +731,16 @@ class IndexStore:
 
         return None
 
+    def open_selective(self, owner: str, name: str, **kwargs):
+        """Selective read view, or None meaning *use ``load_index``* (#398 Arc 2).
+
+        ⚠ ``None`` is never an absence claim about the repository. Every caller
+        must fall back to ``load_index``, which is also the JSON auto-migration
+        path — a legacy JSON-only repo has no SQLite rows to select from and
+        must migrate before anything can read it.
+        """
+        return self._sqlite.open_selective(owner, name, **kwargs)
+
     def get_symbol_content(self, owner: str, name: str, symbol_id: str, _index: Optional["CodeIndex"] = None) -> Optional[str]:
         """Read symbol source using stored byte offsets.
 
@@ -956,7 +988,19 @@ class IndexStore:
 
         for index_file in self.base_path.glob("*.json"):
             slug = index_file.name.removesuffix(".json")
-            if slug in seen_slugs or slug.endswith(".meta"):
+            # ⚠ `pathlib.glob` matches DOTFILES, unlike a shell glob. The storage
+            # root holds internal state files alongside indexes — `.pack-<id>.json`
+            # is the starter-pack install marker — and treating one as a repo index
+            # is not a cosmetic mistake (#417, @MotoMato85). The slug splits into
+            # owner `.pack`, the schema guard rejects it, and every command routing
+            # through list_repos() prints "stale or corrupt JSON index; remove it
+            # with `delete-index .pack/<id>`". Following that advice DELETES the
+            # marker: `_repo_slug(".pack", "<id>")` round-trips to the marker's own
+            # filename, so `delete-index` unlinks it and the pack's "already
+            # installed" check goes blind while its indexes stay on disk.
+            # A repo index is never dot-prefixed: GitHub owners cannot start with a
+            # dot, and local indexes are `local/<name>-<hash>`.
+            if slug.startswith(".") or slug in seen_slugs or slug.endswith(".meta"):
                 continue
             json_files_to_migrate.append(index_file)
             try:
@@ -1076,6 +1120,7 @@ class IndexStore:
             "languages": index.languages,
             "symbols": index.symbols,
             "index_version": index.index_version,
+            "parser_generation": getattr(index, "parser_generation", 0),
             "file_hashes": index.file_hashes,
             "git_head": index.git_head,
             "file_summaries": index.file_summaries,

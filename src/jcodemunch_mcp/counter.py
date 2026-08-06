@@ -2,9 +2,9 @@
 
 Problem this solves
 -------------------
-jcm exposes ~83 MCP tools. The host serializes every resident tool's schema
+jcm exposes ~90 MCP tools. The host serializes every resident tool's schema
 into the model's context on every turn (a fixed per-turn token tax), and the
-model must select one tool out of ~83 (dispatch dilution). Both costs scale
+model must select one tool out of the whole catalog (dispatch dilution). Both costs scale
 with tool count and work against jcm's own token-efficiency thesis.
 
 The Counter is a small, stable front door that fronts the full catalog without
@@ -17,7 +17,7 @@ removing any capability:
     jcm ships none today, and the Counter must never become the surface that
     introduces one).
   * ``menu(query, tier)`` -- discovery. Search/browse the action catalog and
-    return compact entries, so all ~83 schemas need not stay resident.
+    return compact entries, so the full schema set need not stay resident.
   * ``route(task, execute)`` -- intent to action. Map a natural-language task
     to the best catalog action(s); optionally dispatch the top one. Composes
     with ``assemble_task_context`` / ``plan_turn`` (it recommends them for
@@ -117,6 +117,39 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 
 def _tokens(text: str) -> list[str]:
     return _WORD_RE.findall((text or "").lower())
+
+
+# Function words carry no retrieval signal, and in THIS corpus they are actively
+# harmful. idf is computed over description prose, where an English pronoun never
+# appears, so idf hands it the HIGHEST weight in the query -- and a short token
+# then substring-matches a large slice of snake_case names. Measured: "draw me a
+# diagram of that" ranked check_rena-me-_safe, get_runti-me-_coverage and
+# find_i-mple-mentations above render_diagram, all three on "me" alone, at 19.3
+# points against render_diagram's 16.5 for the actual word "diagram".
+#
+# Deliberately NOT listed: find / get / show / search. Those are real verbs in
+# this domain, they discriminate between tool families, and existing intent tests
+# depend on them.
+_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by",
+    "can", "could", "did", "do", "does", "for", "from", "had", "has", "have",
+    "how", "i", "if", "in", "into", "is", "it", "its", "just", "me", "my",
+    "of", "on", "or", "our", "out", "over", "should", "so", "some", "that",
+    "the", "their", "them", "then", "these", "this", "those", "to", "up",
+    "us", "was", "we", "were", "what", "when", "where", "which", "will",
+    "with", "would", "you", "your",
+})
+
+# A token shorter than this may only match a name as a WHOLE WORD, never as a
+# fragment inside one. Without the floor, two-character noise matches a third of
+# the catalog by accident.
+_MIN_SUBSTRING_LEN = 4
+
+
+def _query_tokens(text: str) -> list[str]:
+    """Tokens worth scoring a query on. ``_tokens`` stays pure for callers that
+    need the raw split (leakage measurement, description indexing)."""
+    return [t for t in _tokens(text) if t not in _STOPWORDS]
 
 
 def _first_sentence(desc: str, limit: int = 160) -> str:
@@ -233,10 +266,15 @@ def score_action(
         w = weights.get(qt, 1.0) if weights else 1.0
         if qt == name_l:
             score += 10.0 * w
-        elif qt in name_l:
-            score += 4.0 * w
         elif qt in name_toks:
-            score += 3.0 * w
+            # Whole-word hit on a name segment. This MUST outrank the fragment
+            # branch below: matching "diagram" in render_diagram is evidence,
+            # matching "me" inside rename is coincidence. The two were inverted
+            # (4.0 fragment vs 3.0 whole-word), which also made this branch
+            # unreachable -- every token is trivially a substring of its own name.
+            score += 4.0 * w
+        elif len(qt) >= _MIN_SUBSTRING_LEN and qt in name_l:
+            score += 1.5 * w
         if qt in desc_toks:
             score += 1.0 * w
     return score
@@ -269,7 +307,9 @@ def search_catalog(
     rows = [r for r in catalog if r["action"] not in FRONT_DOOR]
     if not query:
         return rows[:limit]
-    qt = _tokens(query)
+    qt = _query_tokens(query)
+    if not qt:  # query was all function words; ranking on it is noise
+        return rows[:limit]
     weights = _idf_weights(qt, rows)
     scored = []
     for r in rows:
@@ -287,6 +327,110 @@ def search_catalog(
 # (compiled_pattern, action, why). Kept deterministic and legible -- this is a
 # curated map, not a learned model, consistent with the read-only charter.
 _INTENT_RULES: list[tuple[re.Pattern, str, str]] = [
+    # --- specificity block: these MUST outrank the broad rules below --------- #
+    #
+    # v1.108.220. Every rule here exists because the v1.108.217 counterfactual
+    # measured a `rule_preempted` miss: a broader rule further down claimed the
+    # query, and because `route` runs its lexical fallback ONLY when no rule
+    # matches, the correct action was never scored at all. Ranking work cannot
+    # touch that class -- the scorer never ran -- so precedence is the only fix.
+    #
+    # ⚠ Added ABOVE the broad rules rather than by narrowing them. Narrowing
+    # `search_symbols`' `\b(find|locate|where is|...)\b` would silently drop
+    # phrasings no corpus covers; an earlier, more specific rule changes only
+    # the cases it names. Same reasoning as the .212 transform block, one
+    # direction reversed.
+
+    # An HTTP endpoint is not a symbol, and `get_blast_radius` cannot accept
+    # one -- so its `\b(break|impact|affect)\b` rule claiming this query handed
+    # the user a tool that could not answer it.
+    (re.compile(r"\b(get|post|put|patch|delete|head|options)\s+/?\S*\b.*\b"
+                r"(endpoint|route|api)\b|"
+                r"\b(endpoint|route)\b[^.]{0,40}\b(break|breaks|impact|affect|"
+                r"depend|change|changing)\b|"
+                r"\b(break|breaks|impact|affect|change|changing)\b[^.]{0,40}\b"
+                r"(endpoint|api route)\b", re.I),
+     "get_endpoint_impact", "Endpoint-centric impact: what breaks if this HTTP route changes."),
+
+    # "break callers if I edit this signature" is a SAFETY question. The callers
+    # rule below answers a narrower one (who calls it) and stops there.
+    (re.compile(r"\b(safe|safely|going to break|will (it|this) break|hurt anyone|"
+                r"ok to)\b[^.]{0,60}\b(edit|editing|change|changing|signature|"
+                r"parameters?|arguments?|returns?)\b|"
+                r"\b(edit|change|changing)\b[^.]{0,30}\b(signature|parameters?|"
+                r"arguments?)\b[^.]{0,40}\b(break|safe|hurt|callers?)\b", re.I),
+     "check_edit_safe", "Preflight whether editing this symbol breaks its callers."),
+
+    # Structural/anti-pattern searches. `search_symbols` claimed these on the
+    # bare verb "find", but a name search cannot express "caught and ignored".
+    (re.compile(r"\b(swallow\w*|silently (ignor|catch)\w*|empty (catch|except)|"
+                r"catch\w*\s+(block\s+)?that\s+(does nothing|is empty)|"
+                r"caught\b[^.]{0,30}\b(ignor\w+|nothing)|"
+                r"bare (except|catch)|anti[- ]?pattern)\b", re.I),
+     "search_ast", "AST pattern match for structural anti-patterns a name search cannot express."),
+
+    # A census of annotations, not a lookup of one.
+    (re.compile(r"\b(every|all|inventory|census|which|what)\b[^.]{0,40}\b"
+                r"(decorators?|annotations?|attributes?)\b|"
+                r"\b(decorators?|annotations?)\b[^.]{0,30}\b(across|used|show up|"
+                r"in the (project|codebase|repo))\b", re.I),
+     "get_decorator_census", "Repo-wide census of decorators / annotations / attributes."),
+
+    # ⚠ "semantic search for this project" contains the literal substring
+    # "search for", which is why `search_symbols` claimed a request to BUILD the
+    # embedding index rather than to query it.
+    (re.compile(r"\b(turn on|enable|set up|precompute|build|make)\b[^.]{0,40}\b"
+                r"(semantic|similarity|embedding|vector)\w*\b|"
+                r"\b(semantic|similarity|embedding|vector)\w*\b[^.]{0,25}\b"
+                r"(work|working|available|on for)\b", re.I),
+     "embed_repo", "Precompute embeddings so semantic and similarity search work here."),
+
+    # `get_session_context`'s `\bso far\b` claimed a savings question.
+    (re.compile(r"\b(tokens?|context|spend|savings?|saved)\b[^.]{0,40}\b"
+                r"(saved|save|avoid\w*|not (have|had) to send)\b|"
+                r"\b(how many|running total|what has)\b[^.]{0,30}\btokens?\b", re.I),
+     "get_session_stats", "Token savings for this session."),
+
+    # --- vocabulary block: intents no shared token could reach ---------------- #
+    #
+    # The counterfactual's `no_lexical_overlap` class: the user's phrasing and
+    # the action's name+description share ZERO tokens, so the score is zero at
+    # any weight and no reweighting can rescue it. A curated rule states the
+    # mapping explicitly instead of hoping vocabulary drifts together.
+    #
+    # ⚠ Deliberately NOT fixed by stuffing the benchmark's words into tool
+    # descriptions: that fits the measurement rather than the product, and it
+    # would raise the corpus's own leakage score -- the metric that exists to
+    # catch exactly this.
+    (re.compile(r"\b(show|see|read|print|give)\b[^.]{0,25}\b(body|implementation|"
+                r"source|code)\b[^.]{0,25}\b(of|for)?\s*(this|that|the)\b|"
+                r"\b(body|implementation) of (this|that|the)\b", re.I),
+     "get_symbol_source", "Return one symbol's full source."),
+    (re.compile(r"\b(natural|real|actual|logical)\b[^.]{0,20}\b(modules?|"
+                r"subsystems?|components?|parts)\b|"
+                r"\bgroup\b[^.]{0,40}\b(belong together|actually belong)\b|"
+                r"\bas opposed to the (folder|directory) (layout|structure)\b", re.I),
+     "get_tectonic_map", "Logical module topology, fused from three coupling signals."),
+    (re.compile(r"\b(concentrated|concentration|piled into|spread out|evenly)\b|"
+                r"\bhow (deep|many layers)\b[^.]{0,30}\b(nest\w*|dependenc\w+|go)\b", re.I),
+     "get_architecture_metrics", "Concentration, dependency depth and modularity in one call."),
+    (re.compile(r"\b(riskiest|most risky|most dangerous|careful editing|be careful)\b|"
+                r"\bwhich (files?|parts?)\b[^.]{0,30}\b(risk|risky|careful)\b", re.I),
+     "get_file_risk", "Per-symbol composite risk, highest first."),
+    (re.compile(r"\b(risky|risk|nervous|dangerous|safe)\b[^.]{0,40}\b"
+                r"(pull request|\bpr\b|merge|merging|branch)\b|"
+                r"\b(pull request|\bpr\b|merging)\b[^.]{0,25}\b(risk|risky|safe)\b", re.I),
+     "get_pr_risk_profile", "Unified risk assessment for a branch or PR."),
+    (re.compile(r"\b(how )?(complicated|complex|hairy|convoluted|gnarly)\b"
+                r"[^.]{0,30}\b(function|method|this one|it)\b|"
+                r"\bhow many branches\b|\bcyclomatic\b", re.I),
+     "get_symbol_complexity", "Cyclomatic complexity, nesting and parameter count for one symbol."),
+    (re.compile(r"\b(actually (runs?|runs in|executed)|really (runs?|used))\b"
+                r"[^.]{0,30}\b(production|prod|live|runtime)\b|"
+                r"\b(never|not) (get |gets |be )?exercised\b|"
+                r"\bhow much of (this|the) code\b[^.]{0,30}\b(runs?|used)\b", re.I),
+     "get_runtime_coverage", "Runtime coverage: which indexed symbols have trace evidence."),
+
     # --- stateful: session / recent-change intents --------------------------- #
     # Read the session journal / working-tree delta, not the whole index.
     # Placed FIRST: stateful phrasings ("affected by my recent changes") carry
@@ -337,7 +481,33 @@ _INTENT_RULES: list[tuple[re.Pattern, str, str]] = [
      "get_dependency_graph", "Map file-level import dependencies."),
     (re.compile(r"\bhealth\b|\bhotspot|\bcomplexit|\bchurn\b|\brisk\b", re.I),
      "get_repo_health", "Repo-level health, hotspots, and risk."),
-    (re.compile(r"\bplan\b|\bwhere (do|should) i (start|begin)\b|\bcontext for\b|\bonboard\b|\bunderstand the\b", re.I),
+    # --- transform: act on another tool's OUTPUT ------------------------------ #
+    # These consume a prior result rather than querying the index, so none of the
+    # words an agent would actually type ("diagram", "a plan for renaming") appear
+    # in the catalog text the lexical fallback ranks over -- measured route recall
+    # for this whole group was 0% before these rules existed.
+    #
+    # Placed LATE on purpose, two constraints at once. Late enough that a specific
+    # data-fetch intent still wins primary: "visualize the call graph" must lead
+    # with get_call_hierarchy, because render_diagram consumes that output and has
+    # nothing to draw without it. Early enough to precede the generic "\bplan\b"
+    # rule below, which would otherwise claim every refactor-plan request.
+    #
+    # High-precision nouns only. A bare "graph"/"render"/"map" would capture the
+    # call-graph, import-graph and topology intents -- the failure these rules
+    # exist to fix, inverted.
+    (re.compile(r"\b(diagram|mermaid|flowchart|graphviz|visuali[sz]e|visuali[sz]ation)\b", re.I),
+     "render_diagram", "Render a graph-producing tool's output as an annotated Mermaid diagram."),
+    # A REQUEST for a plan is not a mutation command, so this is deliberately not
+    # leading-anchored the way the imperative rules above are.
+    (re.compile(r"\b(plan|steps|walk me through)\b[^.]{0,40}"
+                r"\b(rename|renaming|refactor|refactoring|extract|extracting|"
+                r"inline|moving|migrat\w*)\b", re.I),
+     "plan_refactoring", "Edit-ready plan for a rename, move, extract, or signature change."),
+
+    (re.compile(r"\bplan\b|\bwhere (do|should) i (start|begin)\b|\bcontext for\b|\bonboard\b|\bunderstand the\b|"
+                r"\bset me up\b|\beverything i need\b|\bup to speed\b|\bget me (started|going)\b|"
+                r"\bhelp me (debug|fix|track down|get)\b", re.I),
      "assemble_task_context", "Single-call task-scoped context assembly."),
     (re.compile(r"\b(find|locate|where is|look up|search for|definition of)\b", re.I),
      "search_symbols", "Find a symbol by name."),

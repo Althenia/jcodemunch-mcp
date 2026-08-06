@@ -24,6 +24,7 @@ import time
 from typing import Optional
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
+from ..storage.generation import connect_readonly
 from ._utils import index_status_to_tool_error, resolve_repo
 
 logger = logging.getLogger(__name__)
@@ -89,11 +90,10 @@ def _detect_entry_point(target: dict) -> Optional[str]:
 def _runtime_hits(store: IndexStore, owner: str, name: str, symbol_id: str) -> Optional[int]:
     """Best-effort runtime hit count over the indexed trace window."""
     try:
-        import sqlite3  # noqa: PLC0415
         db_path = store._sqlite._db_path(owner, name)
         if not db_path.exists():
             return None
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn = connect_readonly(db_path, isolation_level="")
         try:
             cur = conn.execute(
                 "SELECT COALESCE(SUM(hit_count), 0) FROM runtime_calls WHERE symbol_id = ?",
@@ -118,11 +118,10 @@ def _runtime_data_present(store: IndexStore, owner: str, name: str) -> bool:
     populated.
     """
     try:
-        import sqlite3  # noqa: PLC0415
         db_path = store._sqlite._db_path(owner, name)
         if not db_path.exists():
             return False
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn = connect_readonly(db_path, isolation_level="")
         try:
             row = conn.execute("SELECT 1 FROM runtime_calls LIMIT 1").fetchone()
             return row is not None
@@ -262,8 +261,21 @@ def check_delete_safe(
         for entry in ref_out.get("results", []) or []:
             for ref in entry.get("content_references", []) or []:
                 ref_file = ref.get("file", "")
-                if not ref_file or ref_file == target_file:
+                if not ref_file:
                     continue
+                # ⚠⚠ `ref_file == target_file` used to be skipped here, and it
+                # was #406's defect one layer up: it discarded the FILE when the
+                # thing that must be excluded is the DEFINITION. Before
+                # v1.108.226 the skip was unreachable — `check_references` never
+                # returned a reference in the defining file — so nothing showed
+                # it was wrong. Measured on the two-function module in
+                # tests/test_v1_108_226.py: `helper`, called by `main()` one line
+                # below it, came back **`safe_to_delete` with zero blockers**.
+                # That is this tool's whole job, answered backwards.
+                #
+                # `check_references` now excludes the definition's own line span,
+                # so a reference reported in `target_file` is a genuine
+                # same-file use and belongs in the count.
                 if _is_test_file(ref_file):
                     test_ref_count += 1
                     if test_ref_count <= 3:

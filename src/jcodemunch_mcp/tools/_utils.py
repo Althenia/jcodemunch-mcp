@@ -20,6 +20,23 @@ _bare_name_cache: dict[str, tuple[float, dict[str, list[str]]]] = {}
 _BARE_NAME_LOCK = threading.Lock()
 
 
+def ledger_base_path(store) -> "Optional[str]":
+    """The storage root a ranking-ledger row belongs to (v1.108.188).
+
+    Every reader of ``ranking_events`` takes a base path — ``ranking_db_query``,
+    ``WeightTuner``, ``analyze_perf`` — but the writers passed none, so rows landed
+    in ``~/.code-index`` whatever ``storage_path`` the tool was handed. A search
+    against a non-default store therefore wrote to one database and read from
+    another. Returns ``None`` when the store cannot say, which restores the previous
+    default rather than dropping the row.
+    """
+    try:
+        base = getattr(store, "base_path", None)
+        return str(base) if base is not None else None
+    except Exception:  # pragma: no cover - a store that cannot name itself
+        return None
+
+
 def _get_bare_name_map(store: IndexStore) -> dict[str, list[str]]:
     """Return a cached bare-name → [owner/name] mapping for the store's base_path.
 
@@ -191,6 +208,115 @@ def load_repo_index_or_error(
 
     status = store.inspect_index(owner, name, branch=branch)
     return None, index_status_to_tool_error(status), status
+
+
+#: Recorded when an index would not load but a follow-up inspection could not
+#: establish why. Unknown is a THIRD answer — it must never be reported as one
+#: of the named causes, and a caller branching on `rebuild_reason` needs to be
+#: able to tell "we know it was a future version" from "we could not find out".
+UNLOADABLE_REASON_UNKNOWN = "unloadable_unknown"
+
+
+def describe_unloadable_index(store, owner: str, name: str) -> tuple[str, str]:
+    """Name the cause of an unreadable on-disk index, and the remedy for it.
+
+    ``load_index`` collapses seven distinct failures into ``None`` — absent
+    file, two delete-during-load races, empty ``meta``, unparseable
+    ``index_version``, future ``index_version``, and a corrupt database. The
+    write side used to report every one of them as "created by a newer version
+    of jcodemunch-mcp" and tell the user to delete their whole index
+    directory, which is the wrong cause and a considerably larger remedy than
+    six of the seven call for (#413, @LuigiNicaPRO). ``inspect_index``
+    (PR #291) already discriminates them for the read side; this puts the same
+    discriminator on the write side instead of a second copy of the checks.
+
+    Returns ``(reason, message)`` — ``reason`` is the machine-readable status a
+    caller can branch on, ``message`` the prose warning.
+    """
+    status = None
+    try:
+        status = store.inspect_index(owner, name)
+    except Exception:
+        logger.debug("inspect_index failed for %s/%s", owner, name, exc_info=True)
+
+    if status is None or status.loadable:
+        # inspect_index disagrees with load_index. That is what a transient
+        # failure looks like from here (the file was removed mid-load, or the
+        # load lost a race with a concurrent writer), and we must not invent a
+        # cause for it.
+        return (
+            UNLOADABLE_REASON_UNKNOWN,
+            "Existing index could not be read, and a follow-up inspection could "
+            "not establish why — performing a full re-index.",
+        )
+
+    reason = status.load_error or status.status or UNLOADABLE_REASON_UNKNOWN
+    hint = status.hint or "Re-index this repository to rebuild the index."
+    message = (
+        f"Existing index could not be read ({reason}) — performing a full "
+        f"re-index. {hint}"
+    )
+    if reason == "sqlite_future_version":
+        # The ONE cause that really is a downgrade keeps saying so — and keeps
+        # the remedy, narrowed from "delete every index you have" to this one.
+        message += (
+            " It was created by a newer version of jcodemunch-mcp; if you "
+            "downgraded the package, delete this repository's index under "
+            "~/.code-index/ (or your CODE_INDEX_PATH directory) to remove the "
+            "stale index."
+        )
+    return reason, message
+
+
+#: Warning text for the one-off re-parse an extraction-semantics bump forces.
+PARSER_UPGRADE_WARNING = (
+    "This index's symbols were extracted by an older version of the parser "
+    "whose output is no longer trusted - re-parsing every file once. A normal "
+    "incremental run cannot repair it: the affected files are unchanged, so "
+    "they would never be re-read."
+)
+
+
+def needs_parser_upgrade(index) -> bool:
+    """True when this index's symbols predate the current extraction semantics.
+
+    A missing stamp reads as generation 0, so every pre-1.108.244 index takes
+    the upgrade exactly once (#414). Fails toward re-parsing: this decides
+    whether to spend one full walk, and the cost of a needless one is time,
+    while the cost of a skipped one is symbols that stay wrong forever.
+    """
+    if index is None:
+        return False
+    from ..storage.index_store import PARSER_GENERATION
+
+    return getattr(index, "parser_generation", 0) < PARSER_GENERATION
+
+
+def stamp_incremental_outcome(
+    result: dict,
+    requested: bool,
+    performed: bool,
+    rebuild_reason: Optional[str] = None,
+) -> None:
+    """Record requested-vs-performed indexing mode on a result dict (#413).
+
+    A requested incremental can be replaced by a full rebuild — an unreadable
+    on-disk index, a forced invalidation, or simply no index to diff against.
+    Before this, the only signal was prose inside ``warnings[]``, and the
+    rebuild re-stamped ``meta.index_version`` on its way out, so a caller that
+    did not capture the warning at the moment of the call could not learn
+    afterwards that the substitution had happened at all.
+
+    ``rebuild_reason`` is attached only when an unreadable index forced the
+    rebuild; its absence is not a claim that no substitution occurred — read
+    ``performed_incremental`` for that.
+    """
+    if not isinstance(result, dict):
+        return
+    result["requested_incremental"] = requested
+    result["performed_incremental"] = performed
+    if rebuild_reason:
+        result["rebuild_reason"] = rebuild_reason
 
 
 def resolve_fqn(

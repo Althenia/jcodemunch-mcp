@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..storage import IndexStore
+from ..storage.generation import connect_readonly
 from ._utils import resolve_repo
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ def _run_git(args: list[str], cwd: str, timeout: int = 30) -> tuple[int, str, st
     try:
         r = subprocess.run(
             ["git"] + args,
-            cwd=cwd, capture_output=True, text=True,
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, stdin=subprocess.DEVNULL,
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -125,7 +126,7 @@ def _load_stack_frequency(
     by an mtime bump (matches the Phase 2 confidence-probe pattern).
     """
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        conn = connect_readonly(db_path, isolation_level="")
     except sqlite3.OperationalError:
         return None
     conn.row_factory = sqlite3.Row
