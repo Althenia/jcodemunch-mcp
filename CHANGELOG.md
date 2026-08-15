@@ -1,6 +1,2099 @@
 # Changelog
 
+## [1.108.279] - 2026-08-14 - A machine's language is not English and its bytes are not UTF-8
+
+### `watch-status` on a non-English Windows ([#468](https://github.com/jgravelle/jcodemunch-mcp/issues/468), [#469](https://github.com/jgravelle/jcodemunch-mcp/issues/469))
+
+Both reported by [@lsg1103275794](https://github.com/lsg1103275794), split per
+one-issue-one-verdict, and independent: fixing either one alone leaves the other
+exactly as broken.
+
+**#468 — the output was decoded as UTF-8.** `schtasks.exe` writes in the
+machine's code page, so on a Simplified-Chinese install `watch-status.detail`
+came back as 40 U+FFFD characters. ⚠⚠ **`errors="replace"` is what made it
+silent.** Strict UTF-8 *raises* on those bytes; replacement turned a loud failure
+into a plausible string, and a plausible string is what nobody investigates.
+
+Native output now decodes through the code page Windows reports, asking for the
+**console output** page before the ANSI one — they are not always the same
+(measured on the dev box: 437 and 1252; on the reporter's, both 936). ⚠ The
+ORDER is the answer, not the strict-decode loop under it: a multi-byte page like
+cp936 rejects a wrong guess, while cp437 and cp1252 map nearly every byte and
+cannot fail. That is stated at the function so a successful decode is never read
+as confirmation.
+
+⚠ **`locale.getpreferredencoding()` is deliberately not used** — under
+`PYTHONUTF8=1` it reports utf-8 while the child still writes CP936, which is the
+case the reporter warned about. It would have looked principled and been wrong
+for exactly the users this is for.
+
+**#469 — liveness was decided by English display text.** `"Running" in stdout or
+"Ready" in stdout` reports `active: false` on every non-English Windows, while
+the watcher runs and reindexes normally. `正在运行` does not contain `Running`,
+and `/FO CSV` does not help because its headers *and* values are localized too.
+The verdict now reads `Get-ScheduledTask`'s `State`, an enum whose string form is
+invariant, and `Ready` still counts as active so the meaning of the field is
+unchanged.
+
+⚠ The fallback to the old predicate remains for a box where the enum cannot be
+read, and **it says so**: `state_source` is `scheduled_task_state` or
+`display_text`, and `state` is `null` rather than a guess. A wrong answer that
+names its own source is recoverable; a confident one is not.
+
+⚠ **Three call sites shared the decoding hazard and only one was reported.**
+`_install_windows` raises `InstallerError` carrying `schtasks` stderr and
+`_uninstall_windows` reads its output too, so a localized "access denied" reached
+the user as mojibake — on the path taken when something is already going wrong.
+All three go through one decoder, with a ratchet test that fails if a fourth
+arrives.
+
+⚠⚠ **The reporter's own note is why both survived a green suite:** searching
+`tests/` for `_status_windows`, `schtasks` and the `Running`/`Ready` predicate
+returned no hits. There was no coverage to fail. `tests/test_schtasks_locale.py`
+(20) runs on every platform because it drives the decode and the verdict
+directly; **17 fail against `35eeb2d`**, and the 3 that pass both sides are
+controls asserting the defect itself.
+
+## [1.108.278] - 2026-08-14 - `exact` must mean exact, and a guardrail must not be its own baseline
+
+### `identity_type: "exact"` graded a normalised match ([#458](https://github.com/jgravelle/jcodemunch-mcp/issues/458))
+
+`_tokenize` folds case, strips leading underscores and drops punctuation, and the
+identity channel's tokenized comparison ran against that folded form. So for the
+query `_State`, a pytest fixture named `state` and the class literally named
+`_State` both scored `identity: 50.0, identity_type: "exact"`. The identity
+channel could not separate them, the tie fell through to BM25, and the shorter
+name with a docstring won by **0.355 points out of ~58** — a test fixture
+outranking the source symbol it tests, on the single highest-confidence query a
+caller can send.
+
+A match that needed normalisation now scores **40.0** and reports
+`identity_type: "normalized"`. Literal stays 50.0, prefix 30.0 and segment 20.0
+are untouched, so the tiering mechanism this uses already existed.
+
+⚠ **Case folding alone is still `exact`, and that boundary was the decision.**
+`raw_lower` has been case-folded since the channel arrived, so making case
+load-bearing would change the answer for every caller who types `getuser` for
+`getUser` — a behaviour change with no defect behind it. What drops a tier is a
+match that needed *more* than case. A caller passing only tokenized terms and no
+raw query keeps `exact`: with no raw spelling there is nothing to be literal
+about, and grading it down would report a distinction that was never measured —
+which is the defect, not the fix.
+
+⚠⚠ **The first version of the end-to-end test passed against the broken code**,
+and the reason generalises past this fix. BM25 normalises by document length, and
+on the real repo `_State` is a large class that scored *below* the two-line
+fixture on every lexical field (name 6.996 vs 8.012, signature 6.153 vs 7.389,
+summary 0.0 vs 5.992). A small synthetic class wins on lexical signals alone, so
+the ordering assertion held with or without the identity tier. The corpus in
+`tests/test_identity_normalized_tier.py` gives the class a long docstring of
+words unrelated to the query — length without a match — which is what the real
+class's own prose does. **4 of the 10 tests fail against `8cc01a0`**, including
+the ordering one; the 6 that pass both sides are the unchanged tiers and the
+term-only control.
+
+⚠ This was found by the `Retrieval-quality gate` failing on
+[PR #457](https://github.com/jgravelle/jcodemunch-mcp/pull/457), a telemetry-only
+change that cannot affect ranking: the replay harness indexes this repo, so a new
+test file changed the corpus and displaced the expected top-1. The gate's
+self-indexing sensitivity will keep producing false reds on ordinary test-adding
+PRs. **It also caught a defect nobody was looking for**, and neither half of that
+is addressed here.
+
+### A schema-budget guardrail asserted a file against copies of itself (test-only)
+
+`test_v1_108_183.py::test_the_core_compact_schema_budget_is_unchanged` read three
+numbers out of `benchmarks/schema_baseline.json` and asserted they equalled three
+copies of themselves written into the test. Both sides were the same frozen
+artifact, so it pinned the **artifact** and never the surface: the baseline was
+captured in 2026-07, the tool surface drifted underneath it release after
+release, and the assertion stayed green throughout. It failed for the first time
+on 2026-08-14 when the capture was re-run — **firing on the one event that proves
+nothing regressed, and silent through every event it existed for.**
+
+Removed rather than re-pinned. The budget is guarded where it is measured:
+`tests/test_schema_budget.py` holds the 5% drift ceiling against a live
+`_build_tools_list()` and the §10 `<=4000` hard ceiling recomputed from the live
+build, which is the check written specifically to catch a breach *before* the
+baseline is regenerated. The intent the removed test carried — a param on four
+core tools must not spend the core budget — is asserted structurally by its
+sibling, which fails if `receipt` ever reaches the published core+compact schema.
+
+`tests/test_schema_baseline_transcription.py` now fails if any baseline value
+returns to `tests/` or `benchmarks/`, prose included. Two of the five sites this
+was written for were **docstrings** claiming `core_compact sits at 3996` — a
+stale number in a comment survives longest precisely because nothing executes it.
+Same shape as maintenance practice #4 and as `test_counter_saving_is_read_not_typed`,
+which exists because `run_route_recall.py` asserted `~98%` for two months against
+a measured 95.9%.
+
+⚠ The counter arms (three digits) are deliberately **out of scope** rather than
+guarded badly — below four digits a baseline value collides with ordinary
+integers often enough that the guard would cost more than it saves. The scanner
+is proven non-vacuous both ways: against a real transcription, and against a
+longer number that merely contains a baseline value.
+
+
+## [1.108.277] - 2026-08-13 - Reachability is not only the import graph, and liveness is not only the PID
+
+### `.html` / `.htm` are indexable as a text-searchable file class ([#452](https://github.com/jgravelle/jcodemunch-mcp/issues/452), [PR #459](https://github.com/jgravelle/jcodemunch-mcp/pull/459) by [@phantom-man](https://github.com/phantom-man))
+
+`.html` and `.htm` register on the bundled `html` grammar — the one `RAZOR_SPEC`
+already rides, so no new dependency — with **empty `symbol_node_types`**. An
+indexed template contributes **zero** entries to `index.symbols`, so every
+symbol-driven consumer (`find_dead_code`'s per-symbol sweep, the health-radar
+axes, `get_symbol_importance`, the Gini concentration maths) is unaffected. What
+changes is that the file enters `index.source_files`.
+
+That is the point of the change, not a side effect. `flow_edges._resolve_template`
+resolves a `render(request, "page.html")` string to its template **only when that
+file is indexed**, so before this it returned `None` on every Django, Flask,
+Express and Rails repo we touch — the `views` annotation on `get_signal_chains`
+and the render edges in `get_endpoint_impact` were degraded, silently, for
+exactly that reason.
+
+⚠ **The markdown half of #452 was declined**, and not on scope grounds:
+`find_dead_code` is file-driven with no language filter, nothing imports a `.md`
+file, and on the reporter's own numbers 2,410 new section symbols would have
+landed in dead code — collapsing the `dead_code` radar axis and the composite
+grade we publish weekly for third-party repos. **A repo would have received a
+worse public grade for being well documented.** Section-level doc retrieval is
+[jdocmunch](https://github.com/jgravelle/jdocmunch-mcp)'s product and ships today.
+
+⚠ **The known interaction shipped stated rather than discovered**, in a comment at
+`HTML_SPEC`: an indexed `.html` with no importers was still a dead *file* under
+the file-level rule. **That caveat is closed in this same unreleased window** by
+the #461 fix below, which teaches `find_dead_code` that a resolved render edge is
+a reachability edge.
+
+### `find_dead_code` reported a rendered template as dead at confidence 1.0 ([#461](https://github.com/jgravelle/jcodemunch-mcp/issues/461))
+
+A template is never *imported*. It is reached by a render edge — a string
+argument (`render(request, "page.html")`) that `flow_edges` resolves to a file.
+`find_dead_code` classified purely from the import graph, so an actively
+rendered template came back `zero_importers` while
+`flow_edges._resolve_template` resolved that same file from the same index in
+the same process.
+
+Resolved render edges now contribute live roots, surfaced separately as
+`render_reachable_count` and an analysis note: a file kept alive by an inbound
+render edge is reachable for a *different reason* than one that looks like an
+entry point, and a caller auditing the verdict could not otherwise tell them
+apart from a single count.
+
+⚠⚠ **The confidence value is the sharp part, not the misclassification.** `1.0`
+is reserved for "no importers and not a test file" — a test file gets `0.9`, a
+cascading case `0.7`. So the one file class indexed *because* another subsystem
+can prove it reachable was reported dead with no hedge attached, above the
+default `min_confidence` of `0.8`, meaning it could not be filtered out without
+discarding genuine findings too. **A wrong answer delivered at maximum certainty
+is worse than the same wrong answer delivered tentatively**, because the
+confidence is exactly what a caller uses to decide whether to look.
+
+⚠ **Deliberately NOT an extension exemption**, and two tests exist to fail
+against one. A template that nothing renders **is** dead and is still reported;
+`.html` is not special, having an inbound render edge is. An exemption would
+trade a false positive for a false negative — the worse direction, because
+silence reads as "nothing found" — and would not generalise to the other edge
+families `resolve_flow_edges` already emits.
+
+⚠ **This is not a regression from [#459](https://github.com/jgravelle/jcodemunch-mcp/pull/459) and that PR is not the cause.** Before the HTML
+file class, `.html` was not indexed, so it could not be reported dead — it also
+could not be resolved, which is the silent degradation
+[#452](https://github.com/jgravelle/jcodemunch-mcp/issues/452) was accepted to
+fix. The trade was made knowingly and stated in a comment at `HTML_SPEC`.
+
+⚠ **Two corrections to the issue's own text, made rather than quietly
+contradicted.** It claimed this would newly introduce content scanning to a tool
+that "reads only the import graph"; `find_dead_code` already reads file content
+at two sites (`_package_json_entries`, the `__main__` guard), so the fix is
+always-on and the design question the issue raised does not arise. It also
+flagged the observatory-grade question as unmeasured; measured, templates emit no
+symbols and `dead_symbol_count` is 0, so the symbol-driven `dead_code` radar axis
+does not move.
+
+⚠ Scope checked rather than assumed: **`get_dead_code_v2` does not share this
+defect.** It returns symbols only and templates emit none — 0 template-derived
+entries on the reproduction. Worth stating because
+[#446](https://github.com/jgravelle/jcodemunch-mcp/issues/446) went the other
+way, where both dead-code tools needed the same fix and doing one would have been
+half a job.
+
+The resolver call degrades to the previous behaviour and logs at debug on
+failure: a flow-edge resolution problem must never fail this tool.
+
+### Process liveness now verifies identity, not just PID occupancy ([#450](https://github.com/jgravelle/jcodemunch-mcp/issues/450))
+
+`_is_pid_alive` answered "is this PID taken?", not "is my process still there?"
+After the OS recycles a PID, a process-registry row or coordination-lock file
+naming a long-dead holder read as live indefinitely — observed in the field as
+two-week-old registry rows resolving to a Chrome renderer and an AMD service,
+and a recycled PID could equally "hold" a watcher or index-write lock forever.
+
+`register()` and `acquire()` now record the holder's OS creation time
+(Windows: `GetProcessTimes`, absolute FILETIME; Linux: `/proc/<pid>/stat`
+starttime, deliberately kept boot-relative so `settimeofday`-class clock steps
+— suspend/resume, VM restore, first NTP sync — cannot move every recorded
+value at once). Readers (`live_processes`, `inspect`, `acquire` stale-recovery)
+treat alive-PID-but-mismatched-creation-time as dead → stale → prune/reclaim.
+Rows and locks written by earlier versions carry no `create_time` and keep
+liveness-only behavior, so mixed-version stores degrade instead of
+mass-pruning. The watcher's `_is_pid_alive` wrapper, which bypassed the
+identity check and had no production caller, is removed.
+
+## [1.108.276] - 2026-08-13 - A Windows drive-root child can prove it is a repository
+
+### Exact Git working trees no longer trip the broad-root guard ([#438](https://github.com/jgravelle/jcodemunch-mcp/issues/438))
+
+On Windows, an explicit repository at `X:\repo` has only two logical path
+components, so `index_folder` rejected it alongside genuinely broad paths. The
+guard now accepts that narrow case only when `.git` exists at the selected root.
+Drive roots, shallow non-Git directories, POSIX paths, and UNC depth handling are
+unchanged.
+
+The Windows regression coverage keeps the positive repository case beside both
+negative cases and mocks the filesystem probes, so the runner's drive layout
+cannot decide the result.
+
+⚠⚠ **Review note, recorded because the wrong version of this nearly shipped on
+maintainer advice.** The first review asked for the UNC scope predicate to be
+dropped as redundant with the shared depth helper. It is not, and the two are
+not the same kind of rule: `_path_safety_part_count` measures DEPTH, while
+`not drive.startswith("\\")` bounds SCOPE. A UNC share root has one real part
+and the depth helper adds one for the `\\server\share` anchor, so it computes to
+**exactly two -- the same depth as `C:\repo`**. With the predicate gone, a share
+root holding a `.git` would have been admitted, handing a whole file server to
+the indexer through the guard that exists to prevent it (#321/#322).
+
+⚠ **The regression test for it was ALSO wrong on its first run, in a way that
+passed.** It patched `os.path.exists` to a blanket `True`, which answers
+`_is_container()`'s `/.dockerenv` probe as well -- that drops `_MIN_PATH_PARTS`
+from three to two, so `2 < 2` skips the guard and the assertion never reaches
+the code under test. The probe is narrowed to the `.git` path and the reason is
+recorded at the patch site. **A mock broad enough to satisfy the assertion can
+be broad enough to bypass what the assertion is about.**
+
+### A path-safety test that let the network decide its verdict ([#453](https://github.com/jgravelle/jcodemunch-mcp/issues/453))
+
+Test-only, no behaviour change. `TestWindowsUNCPathSafety` names a UNC path that
+does not exist, and **it was not fully isolated from the real filesystem**, so its
+result depended on the runner's network rather than on the code under test. It
+failed two releases in one day (.272 on `windows-latest/3.10`, .275 on 3.11),
+both times passing on re-run of the identical SHA.
+
+⚠⚠ **The cause is one unpatched probe, and the mechanism explains why it was
+intermittent rather than simply broken.** `resolve_index_identity` calls
+`folder_path.is_file()` (`storage/git_root.py:160`); the test patched `Path.exists`
+and `Path.is_dir` but never `Path.is_file`, so `os.stat` went to the network.
+`Path.is_file()` **swallows ENOENT-class errors** -- what a box with no such share
+returns, which is why it passes everywhere locally -- but **propagates
+`WinError 64` (`ERROR_NETNAME_DELETED`)**, which is what a runner with
+live-but-failing networking returns. Same code, same test, opposite outcomes,
+decided by whose network answered.
+
+⚠ **The false-green half is the same test class and the more expensive one.**
+`test_unc_share_root_remains_too_broad` let the runner's lack of a
+`\\server\share\.git` decide the #438 probe. So the boundary it defends could move
+without the test noticing -- and it did, in #439, where a UNC share root would have
+been admitted as narrow. It now answers that probe TRUE, which proves the UNC scope
+predicate excludes a share root **on its own** rather than by accident of the
+runner's drive layout.
+
+⚠ **Fixed by isolation, deliberately not by a retry or a flaky marker.** A retry
+would have hidden the false red while leaving the false green fully intact -- and
+the false green is what let a real regression through.
+
+**The durable half is `_no_real_access_under()`**, a tripwire wrapping `Path.stat`
+/ `read_text` / `open` that fails loudly if a test touches the fake root at all.
+Two details are load-bearing and were both found by measurement rather than
+design:
+
+- ⚠⚠ **It raises a `BaseException` subclass, not `AssertionError`.** Every read
+  site it covers is wrapped in a bare `except Exception` in production
+  (`_composer_requires` and friends). The first version derived from `Exception`,
+  was silently swallowed, and **a deliberately re-broadened mock passed cleanly
+  with the guard in place** -- a tripwire that cannot fire is worse than none,
+  because it reads as coverage.
+- An audit hook showed the blanket `Path.exists=True` also convinced
+  `detect_framework` that seven manifests existed, so a unit test did seven
+  network round trips reading `composer.json`, `package.json`, `pyproject.toml`,
+  `pom.xml`, `build.gradle`, `Gemfile` and `requirements.txt`. Those never failed
+  anything, because production swallows them. Narrowed anyway.
+
+Proven non-vacuous by removing the `is_file` patch: the guard fires and names the
+call, rather than the run going red somewhere else an hour later.
+
+### A stored list of 50 could mean 50 or 500 ([#441](https://github.com/jgravelle/jcodemunch-mcp/issues/441))
+
+`ranking_events.returned_ids` keeps the first 50 ids and the row carried nothing
+saying how many there really were, so **a complete result set and a truncated one
+were byte-identical in every stored field**. An analysis could neither exclude the
+truncated rows nor say how many it dropped.
+
+Rows now carry `returned_count`: the true size, recorded before the cap. The id
+list stays bounded — only the count is added.
+
+⚠⚠ **Pre-existing rows keep `NULL`, which means UNKNOWN and must never be read as
+"the count equals `len(returned_ids)`".** That inference is the defect, not the
+fix, and no heuristic backfills it — the same treatment `ledger_trust` gives its
+unseparable history. ⚠ `0` is a measurement and `NULL` is an absence; the test
+pins that they do not collide.
+
+⚠ **Blast radius is analysis, not runtime, and that was checked rather than
+assumed.** `regret` only asks whether `returned_ids` is empty or holds more than
+one entry (`regret.py:122`, `:138-144`) and `ledger_trust` only whether it is
+empty (`:112-115`) — truncation begins above 50, so none of them is reached.
+
+⚠ **@rknighton filed this against his own earlier claim.** In Discussion #430 he
+described six rows as having "hit the 50-item cap", an assertion he had inferred
+from the stored length rather than measured, and he caught it on re-verification.
+The defect and the mistake it invites are the same shape.
+
+### ~79% of a telemetry write was reopening the database ([#442](https://github.com/jgravelle/jcodemunch-mcp/issues/442))
+
+With `perf_telemetry_enabled` on — off by default, so this reaches opt-in installs
+only — every event opened a fresh connection and replayed all eight
+`IF NOT EXISTS` statements before inserting one row. Connections are now cached
+per resolved path for the process.
+
+⚠⚠ **The schema replay was NOT the expensive part, and measuring that is what
+killed the cheap fix.** The obvious low-risk change — remember the schema is ready
+and skip the DDL, needing no connection lifetime at all — was measured first,
+across 400 interleaved events:
+
+| arm | median |
+|---|---:|
+| connect + `PRAGMA` + 8 DDL + insert | 15.441ms |
+| connect + insert, schema ensured once | 15.166ms |
+| cached connection + insert | 3.214ms |
+
+Skipping the DDL captures **2%** of the available saving. The other 98% is the
+open/close itself, so caching the connection is the only thing that works. The
+shipped path measures **3.455ms against a 16.615ms pre-fix baseline, a 79%
+reduction**. (Absolute figures are this machine's and slower than the reporter's
+3.99ms/0.74ms; the ratio is what transfers, and it agrees with his 82%.)
+
+⚠ `check_same_thread=False` is **required**, because searches dispatch through
+`asyncio.to_thread` and a cached connection outlives the thread that opened it. It
+is **safe** because every caller holds `_State._lock` — the serialisation the flag
+would otherwise enforce is already there. That reasoning is recorded at the call
+site, because it is the thing a future edit could quietly invalidate.
+
+### Two ways a process-lifetime connection goes bad, both silent
+
+Neither was in the report; the first surfaced when the benchmark crashed.
+
+⚠⚠ **A closed cached connection poisoned the cache.** The old contract had callers
+closing after every write, so any missed call site — or third-party caller — left
+a dead handle that every later caller received. Telemetry would be off for the
+process while every write still reported success.
+
+⚠⚠ **A deleted database file would be written into the void.** SQLite keeps
+writing happily to an unlinked inode; rows land nowhere and nothing raises. Before
+caching, the next event simply recreated the file, so caching would have
+introduced this. ⚠ A liveness probe cannot catch it — the connection is perfectly
+healthy, it is the file that is gone — so the guard checks `exists()` too.
+⚠ **Windows cannot produce this case at all** (it refuses to unlink a file with an
+open handle), so the end-to-end test is POSIX-only and a portable unit test covers
+the predicate. Stating that rather than implying cross-platform coverage.
+
+Both checks together cost **0.344ms, 2.1% of the pre-fix write**, against the 79%
+saved. Paying 2 to keep 79, where the alternative failure is silent.
+
+`close_perf_dbs()` is public because the connections now outlive a write: on
+Windows an open handle blocks removal of the directory holding the database.
+⚠ It is registered with `atexit` **before** `flush` on purpose — `atexit` runs
+LIFO, so registering it second would close the database out from under the final
+flush.
+
+`tests/test_v1_108_276.py` (19, 1 skipped), **11 fail against the pre-fix call
+sites**; the 7 passing both sides are the schema, the migration's idempotence, the
+telemetry-disabled control and the public surface.
+
+⚠⚠ **Writing these tests exposed an unrelated ranking defect, filed as
+[#458](https://github.com/jgravelle/jcodemunch-mcp/issues/458).** The
+`Retrieval-quality gate` failed on this branch -- a telemetry-only change that
+cannot affect ranking -- because the replay harness indexes **this repo itself**,
+so a new test file changes the corpus. Isolated by removing the file from the same
+tree and re-indexing: `mrr 1.0` becomes `0.95` when it is present.
+
+The displacement is real: a fixture named `state` scored `identity_type: "exact"`
+for the query `_State`, identically to the class literally named `_State`, and won
+the tie on field length and having a docstring. **`identity_type` graded a
+normalised match as exact** -- the same shape as #440, a column reporting a grade
+it did not measure. ⚠ The fixture is renamed here so the gate passes; **that
+unblocks a PR and fixes nothing**, and the test file says so at the rename site.
+⚠ The gate's self-indexing sensitivity will produce false reds on ordinary
+test-adding PRs. It also caught this. Both are true; neither is addressed here.
+
+## [1.108.275] - 2026-08-12 - A pattern that matches nothing now says so
+
+### `entry_point_patterns` failed silently ([#446](https://github.com/jgravelle/jcodemunch-mcp/issues/446))
+
+`entry_point_patterns` is documented as glob patterns and matched with `fnmatch`,
+which supports only `*`, `?` and `[seq]`. Two constructs that work in every shell
+do not work here, and neither fails loudly: **brace alternation is not expanded**,
+and **`**` does not match zero directories** (`plugins/**/*.ts` misses
+`plugins/auth.ts`).
+
+⚠⚠ **A pattern that matches nothing is indistinguishable from a repo that genuinely
+has no such entry points** — same output, same confidence, no marker. The caller
+gets more symbols reported unreachable and no reason to doubt it. We made the first
+mistake ourselves, in shipped framework profiles, and did not notice for a release
+([#445](https://github.com/jgravelle/jcodemunch-mcp/issues/445)).
+
+Both dead-code tools now name the patterns that matched nothing, and the message
+explains both `fnmatch` surprises rather than only reporting the outcome. Reporting
+covers every cause at once — braces, `**`, a typo, the wrong path root — instead of
+the one spelling we happened to get wrong.
+
+⚠ **It reports; it never refuses.** A pattern matching nothing is legitimate: a
+caller may pass one pattern set across several repos.
+
+### Two gaps found while implementing it
+
+⚠⚠ **`get_dead_code_v2`'s existing message was correct and almost never fired.** It
+already said "entry_point_patterns was supplied but matched no indexed file" — gated
+on `entry_point_count == 0`. Any repo carrying one ordinary `main.py` made the count
+non-zero, so the caller heard nothing. **A correct warning behind the wrong gate
+reads as "no problem found".** It is now ungated and names the offenders.
+
+⚠⚠ **`get_dead_code_v2`'s call-graph-only exit ignored the parameter entirely.**
+When a repo has no import graph the tool returns early through
+`_call_graph_only_dead_code`, which never received `entry_point_patterns` and still
+does not use them — that mode has no file-level entry-point concept, so there is
+nothing for a path pattern to seed. That is defensible; **silently accepting a
+parameter and discarding it is not.** That exit now says so.
+
+This was found because the new end-to-end test landed on the fallback by accident,
+which is the argument for testing through the tool rather than the helper: the
+helper-level tests all passed while a whole exit ignored the feature.
+
+### Not decided here
+
+Whether `entry_point_patterns` should *also* accept brace expansion remains open on
+[#446](https://github.com/jgravelle/jcodemunch-mcp/issues/446). Implementing the
+warning surfaced an argument for keeping it separate: a pattern containing literal
+`{}` matches such filenames today, so expanding braces would **change** existing
+behaviour rather than being purely additive — a real decision under the 1.x
+no-removal contract, and one that immediately raises whether `**` should gain real
+recursive semantics too. The harm is closed either way.
+
+`tests/test_v1_108_275.py` (14), **4 fail against the v1.108.274 call sites**; the
+10 passing on both sides are helper unit tests and controls, including one asserting
+the tools stay silent when every pattern matches.
+
+## [1.108.274] - 2026-08-12 - A disclosure that is true when written is not yet a control
+
+Two `SECURITY.md` accuracy items from [@elfrost](https://github.com/elfrost)'s QA
+pass ([#444](https://github.com/jgravelle/jcodemunch-mcp/issues/444), split into
+[#448](https://github.com/jgravelle/jcodemunch-mcp/issues/448) and
+[#449](https://github.com/jgravelle/jcodemunch-mcp/issues/449)), and a test so the
+class stops recurring.
+
+The method is worth naming, because it is not one we run against ourselves:
+**diffing a controls document against the tree, treating its named functions,
+defaults and guarantees as checkable assertions.** Neither finding is a
+vulnerability. Both are the document falling behind the code.
+
+### Response-level redaction was absent from `SECURITY.md` entirely (#448)
+
+The document described the secret classifier as deciding from filename and
+directory shape only — accurate — and then said nothing about response-level
+redaction anywhere. `SECURITY.md` contained exactly one occurrence of the string
+`redact`, and it was a filename used as a false-positive example.
+
+So a shipped, **on-by-default** control was undocumented, the Summary of Controls
+table did not list it, and the exemption for `get_file_content`,
+`get_symbol_source` and `get_context_bundle` was undiscoverable by a reader
+auditing against the document.
+
+⚠ **The exemption itself is unchanged and is not a defect.** A per-byte regex sweep
+over payloads of hundreds of KB is latency for no gain, and what those tools return
+is the user's own checked-in code being read back to them. What was missing was
+saying so. The new section states the consequence directly — a credential hardcoded
+in an ordinary source file is caught by neither control, and the mitigations are CI
+secret scanning and pre-commit hooks, because the credential is in the repository
+regardless of what this server does with it.
+
+⚠ **An on-by-default control that is undocumented is a disclosure problem in its own
+right**, not merely a missing nicety. The reader this document is written for cannot
+attest to what it does not say.
+
+### `/org/report` was described as the only remote-write route (#449)
+
+`make_runtime_routes()` mounts three more `POST` routes — `/runtime/otel`,
+`/runtime/sql`, `/runtime/stack` — in both transport builders. The section now
+enumerates all four with their separate gates, and states the property @elfrost
+singled out as good: with `JCODEMUNCH_HTTP_TOKEN` unset these routes return **503
+rather than running unauthenticated**, so a missing token disables the endpoint
+instead of opening it.
+
+The posture never changed. The sentence did not keep up.
+
+### The part that will outlast both: `tests/test_security_disclosure.py`
+
+⚠⚠ **This is the second time this exact failure mode has shipped.** v1.108.261 fixed
+a sentence claiming the telemetry ping sends "**only** an integer delta plus an
+anonymous UUID" while the payload also carried a lifetime `total`. Both sentences
+were true when written and were not revisited as the code grew. **Prose cannot
+notice that happening.**
+
+The section promises that its enumeration is *complete*, so the enumeration is now
+checked against the code: route paths and the declared count are read from
+`make_org_routes()` / `make_runtime_routes()`, and the redaction exemptions from
+`_SOURCE_DUMP_TOOLS`, rather than restated in the test. A route or exemption added
+later is covered by construction. Assertions are about enumerations and defaults,
+never wording, so editing the document stays cheap.
+
+⚠ **It fired on its first run, against this release's own text** — a historical note
+quoting the retired sentence verbatim tripped the check that refuses that claim. The
+note was paraphrased rather than the test loosened: a guard that allows the exact
+phrase in some contexts would pass the moment someone reintroduced it about a
+different route.
+
+6 tests, **all 6 fail against the v1.108.273 document** — so the guard catches the
+two defects it was written for rather than merely agreeing with the text shipped
+beside it.
+
+### Not in this release
+
+Item 1 of the QA pass — the `install-pack` archive guard missing drive-absolute
+member names — is [#447](https://github.com/jgravelle/jcodemunch-mcp/issues/447),
+with @elfrost's [PR #443](https://github.com/jgravelle/jcodemunch-mcp/pull/443)
+open against it.
+## [1.108.273] - 2026-08-12 - A pattern that names two extensions and matches neither
+
+### v1.108.271's #435 fix matched nothing ([#445](https://github.com/jgravelle/jcodemunch-mcp/issues/445))
+
+v1.108.271 fixed [#435](https://github.com/jgravelle/jcodemunch-mcp/issues/435) for
+the `nuxt` and `nestjs` profiles by rewriting their `entry_point_patterns` as brace
+alternation (`{ts,js}`, `{ts,js,mjs}`). The consumer is `fnmatch`, which expands no
+braces: `fnmatch.translate("src/main.{ts,js}")` yields `(?s:src/main\.\{ts,js\})\Z`,
+requiring a filename that literally contains `{ts,js}`.
+
+**The change did not add JavaScript coverage. It removed the TypeScript coverage
+that was working.**
+
+```
+profile  file                      v1.108.270  v1.108.271
+nestjs   src/main.ts               True        False
+nestjs   src/app.module.ts         True        False
+nuxt     plugins/a/b.ts            True        False
+nuxt     middleware/x/g.ts         True        False
+```
+
+`nestjs` is the worst case: its entire entry set was those two patterns, so a stock
+NestJS project went from two entry points to zero, and NestJS is TypeScript-first by
+convention. The failure direction is the one that matters here — a lost reachability
+seed does not error, it silently reports a genuine framework root as unreachable.
+
+⚠⚠ **The guard passed, and that is the more useful half of this.** The #435 sweep
+asks which extensions appear in a pattern *string*, and skipped brace patterns
+outright (`if "{" in glob: continue`) as already-covered. A pattern naming both `ts`
+and `js` satisfied a spelling check while matching no file on disk. **A test that
+inspects the shape of a fix cannot tell it from a plausible-looking non-fix.** The
+new tests run patterns against realistic scaffold paths through
+`_matches_any_pattern` — the real matcher both dead-code tools share — so they
+measure effect rather than spelling.
+
+⚠ **A second fnmatch surprise, pre-existing and not part of the regression:** `**/`
+translates to `(?>.*?/)` and therefore *requires* a slash, so `plugins/**/*.ts`
+matches `plugins/a/b.ts` but not `plugins/auth.ts`. Every profile using `**/` was
+missing files sitting directly in the named directory — the commonest layout there
+is. Fixed here too, since fixing braces alone would have left the patterns still
+missing the majority case.
+
+Both constraints now live in `_entry_globs` / `_entry_named`, which emit the flat
+and nested form for each extension, so a profile lists *where* its entry points live
+and never how to spell a glob. Explicit alternatives were chosen over teaching the
+matcher braces: that keeps the semantics of a user-facing parameter unchanged under
+the 1.x no-removal contract. Whether `entry_point_patterns` should *also* accept
+braces is a separate question — a caller copying these out of `context_metadata`
+hits the identical trap — and is not decided here.
+
+`nestjs`'s four `Layer` globs carried the same braces. No in-tree consumer reads
+them (`profile_to_meta` publishes them to callers), so that half is bad published
+data rather than a measured regression, and is corrected on the same reasoning:
+braces are wrong under a glob matcher and meaningless under a prefix one.
+
+### #435 closed: the `next` profile gained its JS/JSX counterparts
+
+The remainder of #435, deferred behind [PR #433](https://github.com/jgravelle/jcodemunch-mcp/pull/433)
+so as not to force a conflict onto a contributor's rebase. That PR merged
+2026-08-11, retiring the deferral, and the work landed here rather than on its own
+because doing it first would have propagated the brace defect to a third profile.
+
+`next` now covers Next.js's own extension sets — `js`/`jsx`/`ts`/`tsx` for pages and
+layouts, `js`/`ts` for route handlers and middleware — across both the root and
+`src/` layouts. Its entry in `_JS_VARIANT_EXEMPT` is deleted; the ratchet added in
+v1.108.271 is what forced the fix and the retirement to land together, and it worked
+exactly as designed.
+
+`tests/test_v1_108_273.py` (11), **6 fail against the shipped v1.108.272 profiles**;
+the 5 passing on both sides pin the `fnmatch` premises and the new helpers. One of
+them asserts a non-entry file is still not an entry point, because every other test
+here would also pass if the patterns had been replaced with `*`.
+
+## [1.108.272] - 2026-08-12 - A column recorded on the wrong exit is not a measurement
+
+### `identity_hit` was 0 on every non-fusion `search_symbols` row ([#440](https://github.com/jgravelle/jcodemunch-mcp/issues/440))
+
+Reported by [@rknighton](https://github.com/rknighton), with a reproduction that
+runs the same query down two exits and prints the two rows side by side: the
+default path recorded `identity_hit=0` on an exact symbol-name match while
+`search_symbols_fusion` recorded `1` for the same query and the same top result.
+
+Both non-fusion exits built a score-only list (`[{"score": s}]`) and handed it to
+`extract_ledger_features`, which reads `identity` / `identity_match` off the rows
+it is given. Neither key was present, so the feature was `False` by construction
+rather than by measurement — whatever the identity channel had actually found.
+
+⚠ **This is the same defect fixed for fusion in v1.108.187, and the comment left
+at that fix asserted the non-fusion paths were already correct.** They were not.
+They carried the value nowhere the reader looks: the lexical path folds it into
+the BM25 total inside `_bm25_score`, and with `debug=True` it appears nested under
+`score_breakdown`. That comment is corrected in place — a fix that misdescribes
+the code around it hides the next instance of its own bug.
+
+Both exits now build a ledger input through `_ledger_identity_rows`.
+
+⚠ **Recomputed rather than threaded out of scoring, and that is deliberate.**
+`semantic_only` skips the identity channel entirely (`idn = 0.0`), so reusing the
+scorer's value would keep recording a default dressed as a measurement — the very
+thing being fixed. Identity is a pure function of the symbol's name/id and the
+query, and only the top three rows are read, so this is three string comparisons.
+
+⚠ **The ledger rows are NOT fed to `attach_confidence`.** `compute_confidence`
+sniffs the same `identity` key when no `has_identity_match` is passed and scores
+it 1.0 known-true / 0.7 unknown, so sharing one input would move the published
+confidence of every non-fusion search. Recording a column must not move a number
+callers already read. A test asserts the published confidence is unchanged, and
+first asserts that feeding it the ledger rows *would* move it — otherwise the
+test proves nothing.
+
+⚠⚠ **The history is NOT repairable and no heuristic was invented for it.** Like
+`search_symbols_fusion`, these exits always passed `top1_score` and only omitted
+the identity key, so a pre-fix row is indistinguishable from an honest post-fix
+`0`. `identity_label_is_trustworthy` keeps returning `True` for them, and now
+says so. **`search_symbols` is the highest-volume producer in the ledger, so the
+contaminated share is far larger than the fusion case that predicate was written
+for** — the recency window is the only remedy, and the column is clean only for
+rows written after this release.
+
+Two consumers were reading it. `analyze_perf.identity_hits` undercounted by
+however many name matches those searches made. `regret`'s vocabulary-gap signal
+is the conjunction `not identity_hit and semantic_used`, and the semantic exit
+passed `semantic_used=True` literally, so **both halves held by defect** on every
+such row; above the confidence floor and the recurrence threshold, a signal that
+feeds user-visible `suggest_corrections` patches was reporting a vocabulary gap
+it had not tested. Both are correct for new rows and both stay contaminated for
+old ones.
+
+`tests/test_v1_108_272.py` (9). Verified non-vacuous by reverting only the two
+call sites against the same tree: 1 fails pre-fix, and the 8 that pass on both
+sides are the unit-level and no-heuristic controls.
+
+## [1.108.271] - 2026-08-10 - A stock Nuxt 4 project is not an empty one, and advice you cannot follow is worse than none
+
+Two defects, both found by reading a contributor's pull request rather than by
+a report.
+
+### Nuxt 4's default layout indexed zero routes ([#434](https://github.com/jgravelle/jcodemunch-mcp/issues/434))
+
+`NuxtContextProvider` probed `folder_path / "pages"` and returned when it was
+absent, while `detect()` passed on `nuxt.config.*` either way. Nuxt 4 changed
+the **default** `srcDir` to `app/`, so pages live at `app/pages/`. Every stock
+Nuxt 4 project therefore reported the framework as detected and **zero routes**,
+silently.
+
+That is the wrong direction of error for this project. A zero that cannot
+distinguish "this project has no routes" from "we looked in the wrong directory"
+is exactly what the absence contract exists to prevent.
+
+**It was found by reviewing [PR #433](https://github.com/jgravelle/jcodemunch-mcp/pull/433)**,
+which fixes the identical defect in the Next.js provider. @lilubot found a
+defect **class**; we had been treating it as one framework's problem. Nobody had
+reported the Nuxt half.
+
+**Three probes were wrong, not one.** `_parse_pages` and `_build_auto_import_map`
+(`composables/`, `utils/`) both move under `app/`. The auto-import one carries
+the knock-on cost: an empty map makes `_build_auto_import_edges` return early,
+so every synthetic edge that makes Nuxt's implicit imports visible disappears.
+
+⚠ **`_parse_server_api` was already correct and is untouched.** `server/` stays
+at the project root in the Nuxt 4 layout. Its srcDir-relative probe is a strictly
+additive fallback, tried only when the root directory is absent, so it cannot
+change the Nuxt 4 result.
+
+`_resolve_src_dir` reads `srcDir` from `nuxt.config.*` first, because that is the
+actual answer and `srcDir` is configurable beyond either default. Probing is the
+documented fallback, and it requires a **Nuxt-shaped child** (`pages`, `app.vue`,
+`components`, `composables`, `layouts`) rather than a bare `app/` directory:
+plenty of projects have an unrelated one, and guessing wrong relocates the entire
+scan, which is a worse failure than the one being fixed.
+
+The `nuxt` framework profile carried the same root assumption and now names both
+layouts, with `server/` deliberately not mirrored. `nestjs` gained the JavaScript
+variants it was missing across its entry points and all four layer globs
+([#435](https://github.com/jgravelle/jcodemunch-mcp/issues/435)).
+
+⚠ **The `next` profile is deliberately NOT included**, though #435 covers it. PR
+#433 edits those exact lines, and changing them underneath an open contributor
+pull request forces a conflict onto the rebase its author was asked for.
+`test_ts_patterns_carry_js_variants` exempts `next` **by name**, so the exemption
+is a visible thing to delete when #433 lands rather than a gap nobody notices.
+
+### `get_dead_code_v2` advised a parameter it did not accept ([#436](https://github.com/jgravelle/jcodemunch-mcp/issues/436))
+
+Two warnings told the caller to pass `entry_point_patterns`. The function had no
+such parameter, the MCP schema exposed none, and the dispatcher forwarded
+nothing. The parameter was real, but it belonged to `find_dead_code`; the text
+had been carried across without it.
+
+**Both warnings fire on the degenerate path**, which is the moment the tool is
+telling the caller its own answer is untrustworthy. `signal_warning` can be
+accompanied by "nothing can be returned" and then offer two remedies of which one
+did not exist. Remediation advice on the failure path is the last thing a caller
+can fall back on.
+
+The parameter now exists at all three layers and does real work: matched files
+join `extra_entries`, the same hook `package.json` roots already use, so Signal 1
+genuinely discriminates. Both warnings became conditional, so a caller who took
+the advice is not handed it again.
+
+⚠ `_matches_any_pattern` is **imported from `find_dead_code`**, never
+reimplemented. Two definitions of what a pattern means would be this defect in a
+new costume, and a test asserts the two are the identical object.
+
+⚠⚠ **`fnmatch` does not treat `**` as recursive.** `handlers/**/*.py` does **not**
+match `handlers/h.py`. Use `handlers/*.py` for one level, or a bare filename to
+match at any depth. The schema description says so, because its first draft used
+exactly the pattern that does not work as its example.
+
+**The general guard is worth more than the instance.**
+`test_advised_parameter_exists_on_the_tool_that_advises_it` walks every tool
+module's AST, extracts each `Pass <name>` from a string inside a function, and
+asserts the name is one of that function's parameters. No docstring review
+catches this class, because the sentence is correct English about a real feature
+belonging to a different tool.
+
+### Also in this release
+
+`benchmarks/codex_surface/` measures jCodeMunch's net token effect on Codex CLI
+across four arms. ⚠⚠ **Its first full run is a NEGATIVE result and its arm
+numbers must not be quoted**: every arm difference was smaller than the
+baseline's own run-to-run spread, and the directions were incoherent. The
+hypothesis is untested, not disproven.
+
+⚠ **One measurement did survive, and it corrects a claim made in this
+repository.** 86% of baseline input is cached, so the tool-schema block is paid
+at full rate roughly once and at cache-read rates thereafter. Any framing of
+"24,007 tokens in every request" is wrong. `--surface-only` still measures the
+schema exactly and needs no API credits; what it does not measure is what that
+costs in practice.
+
+### Tests
+
+`tests/test_nuxt_srcdir.py` (18; 15 fail pre-fix) and
+`tests/test_v1_108_271.py` (106; 8 fail pre-fix, with the general guard failing
+on `get_dead_code_v2.py` specifically while passing on 98 other tool modules).
+
+## [1.108.270] - 2026-08-09 - A directory that declares itself a cache is not corpus
+
+jCodeMunch now honours the [Cache Directory Tagging Specification](https://bford.info/cachedir/):
+a directory containing a `CACHEDIR.TAG` whose **first 43 bytes** are
+`Signature: 8a477f597d28d172789f06886806bc55` is pruned from the walk, along
+with everything beneath it.
+
+**This arrived from outside, and the route is the point.** A sibling tool wrote
+a derived projection into a directory inside an indexed tree. jCodeMunch walked
+in and indexed its JSON as source, so content that was never project source came
+back from `search_symbols` and `search_text`. That tool then adopted
+`CACHEDIR.TAG` to declare the directory derived — and we ignored the
+declaration, because we had no notion of one. The containment it built did
+nothing for us.
+
+⚠⚠ **Why a tag rather than another denylist entry.** Three fixes were available
+and two are traps. `_SKIP_DIRECTORY_NAMES` already lists `.git`, `.venv`,
+`.tox` — every dotted directory somebody thought of in advance — so adding the
+offender re-arms the same trap for the next tool. jdocmunch fixed its half with
+a dotted-directory *rule* (jdoc#113), which is better but keys on a naming
+convention and cannot see a cache that is not dotted. The tag is a declaration
+by the **writer**: the only one of the three that does not require every reader
+to know about every writer in advance.
+
+⚠⚠ **The signature is verified, and that is the whole design.** A file merely
+*named* `CACHEDIR.TAG` excludes nothing. A name-only check asserts one instance
+of the property instead of the property, which is precisely the defect class
+this answers — the sibling tool's own test pinned its sidecar suffix as `.txt`
+and stayed green while a `.json` beside it was ingested; v1.108.267 keyed a
+constant branch on node type alone and it read as coverage while returning
+`None` for every Kotlin input. Five lookalike tags (empty, wrong hash, signature
+not first, truncated by one byte, wrong case) are parametrized controls, and a
+name-only implementation fails all five.
+
+⚠ **`cache_dir` is an ordinary exclusion, NOT a withheld reason.** A tagged
+directory holds regenerable derived data by its writer's own declaration, which
+puts it in the same class as `gitignore` and `wrong_extension`: the corpus being
+defined, not a file we refused. Coverage stays `complete` and absence claims
+over the remainder stay citable. Contrast `too_large`, where the file is real,
+current and wanted and only our limit kept it out.
+
+⚠ Reaches the full walk and the watcher fast path — the third entry point,
+`resolve_explicit_paths`, **deliberately bypasses it**, and there is a test
+saying so. That route already opts past `gitignore` and skip-directory rules by
+design so a caller can name a generated file on purpose; it keeps only the
+security filters. A caller naming a file inside a cache is asking for it by name.
+
+⚠ **Local walks only.** `index_repo` is deliberately uncovered: validating the
+signature needs the blob's content, and the GitHub tree listing carries only
+paths and sizes, so honouring it there costs a fetch per candidate directory. A
+filename-only check is the one thing this release exists to reject, so the
+GitHub walk gets nothing rather than a lookalike. A test pins the absence so it
+stays a known gap instead of surfacing later as a silent inconsistency.
+
+Config key `respect_cachedir_tag` (default true, only an explicit `false`
+disables it) / `JCODEMUNCH_RESPECT_CACHEDIR_TAG`. Pruned directories are counted
+as `cache_dir` in `discovery_skip_counts`.
+
+`tests/test_v1_108_270.py`, 31 tests. Non-vacuous against unmodified HEAD in an
+isolated worktree: **27 fail before the fix**, and the 4 that pass on both sides
+are the controls.
+
+## [1.108.269] - 2026-08-09 - A withheld oversize file says so, and the cap is reachable
+
+[#429](https://github.com/jgravelle/jcodemunch-mcp/issues/429). Found when this
+repository's own `src/jcodemunch_mcp/server.py` crossed `DEFAULT_MAX_FILE_SIZE`
+by **532 bytes (0.10%)** and the MCP entrypoint stopped entering its own index.
+
+The size cap itself is working as designed. v1.108.193 made `too_large` a
+**withheld** reason precisely so a corpus missing a real, current, wanted file
+refuses to certify absence, and that refusal is correct. Two things around it
+were not.
+
+**The exclusion was silent on the path that matters.** `resolve_explicit_paths`
+warned per entry; the `os.walk` path bumped a counter and said nothing. Same
+limit, same repository, and whether you were told depended on whether you had
+passed `paths=`. The counter surfaced only as `coverage.excluded.too_large`
+inside a verdict block, and only when a later query happened to ask about
+absence and got refused — so a user with a 600 KB generated client received
+quietly incomplete answers with no signal that anything had been withheld.
+Indexing now emits one aggregate warning naming the withheld files, the
+effective cap, and both routes to raise it. It names at most five and then
+reports a remainder: a repository of generated clients turning one warning into
+a wall of them is its own kind of silence.
+
+**The per-call override was unreachable over MCP.** `get_max_file_size` has
+accepted a `max_size` argument since .193, but no caller passed one and it
+reached no tool schema, so over the transport every actual user is on, editing
+a config file was the only route. `index_folder` and `index_repo` now take
+`max_size` and declare it. It is hidden under `compact_schemas` like its
+neighbours and honoured all the same — an escape hatch is not worth core-tier
+schema tokens, and the warning now tells a caller it exists at the moment it
+becomes relevant.
+
+⚠⚠ **Found alongside, and the more serious half: `index_repo.discover_source_files`
+carried a hardcoded `max_size: int = 500 * 1024`** that consulted neither config
+nor env. A **fourth** copy of the limit, so .193's escape hatch and .197's
+per-project key both applied to `index_folder` and did nothing whatsoever for a
+GitHub repository, on any route. It dropped the file with a bare `continue` and
+no counter anywhere, so unlike the local walk the exclusion was not merely
+under-reported — it was unobservable from every surface. A cap fixed on one
+discovery path is not fixed.
+
+⚠ The local walk has **three** discovery entry points (full walk, explicit
+paths, watcher fast path) and `max_size` reaches all three, for the same reason
+`repo=` was threaded to all three in .197: a cap that reaches some of them makes
+a file appear on one route and vanish on another.
+
+⚠ `max_size` is per-call and does not persist. #429's own repository wants the
+config key; the argument is for one run.
+
+**Not addressed here:** `server.py` is 10,549 lines and will cross the next
+ceiling too. Splitting it is the actual fix; this only makes the repository
+navigable in the meantime. Parked in `ROADMAP.md` with close conditions, per the
+rule that an issue opens when work starts or a user is blocked. ⚠ Raising the
+limit again is explicitly not one of those close conditions — the cap already
+moved once for this class of file, and moving it a second time buys the same
+amount of time and teaches the next person to move it a third.
+
+`tests/test_v1_108_269.py`, 34 tests. Proven non-vacuous against unmodified
+HEAD in an isolated worktree: **26 fail before the fix**, and the 8 that pass on
+both sides are the controls.
+
+## [1.108.268] - 2026-08-09 - JSON-RPC gets a private stdout
+
+Suite parity with jdocmunch-mcp 1.129.0 ([jdoc#110](https://github.com/jgravelle/jdocmunch-mcp/issues/110)).
+Found by auditing the siblings after fixing it there, not by a report.
+
+The MCP stdio transport writes framed JSON to stdout, so any other write to
+that stream breaks a response. jcodemunch already carries scar tissue from
+this: the handshake watchdog in `run_stdio_server` exists because a paying
+client on Codex/rmcp waited 5h+ for a frame that never came, after `uvx`
+package-resolution chatter landed on stdout.
+
+⚠⚠ `contextlib.redirect_stdout` never closed this. It rebinds `sys.stdout` and
+nothing more, so it does not cover a C extension calling `write(1, ...)`
+(tqdm, tokenizers, torch), a subprocess that inherited fd 1, or another thread.
+`tools/embed_repo.py:128` builds a `SentenceTransformer` **inside a tool call**,
+so a first embed on a machine without the model cached downloads it mid-request
+and its native progress output goes straight at the JSON-RPC stream. There is
+no startup warmup here to pull that load off the request path.
+
+`stdio_guard.claim_stdout()` duplicates the real stdout, points fd 1 at stderr,
+and hands the duplicate to `stdio_server(stdout=...)`, which already accepts
+one. Afterwards fd 1 **is** stderr for the whole process and the framed stream
+is reachable only through the transport's handle.
+
+⚠ **The handshake watchdog stays, and this does not fix the uvx case.** Chatter
+written by a launcher *before* this process starts is already in the pipe and
+cannot be retracted after exec. This closes everything written from our own
+process onward — a different half of the same problem.
+
+⚠ Fails open under pythonw or a replaced `sys.stderr`: the swap is skipped, the
+server starts as before, and says so on stderr.
+
+`tests/test_stdio_guard.py`, 8 tests, driven through real subprocesses — an
+in-process test of a descriptor-level swap would be testing the mock.
+
 All notable changes to jcodemunch-mcp are documented here.
+
+## [1.108.267] - 2026-08-08 - Kotlin and Bash constants are extracted, and a declared pattern must now prove itself
+
+Reported by @mussonking (#428) against Rust, confirmed across six languages.
+
+### The defect
+
+A `LanguageSpec` can declare `constant_patterns`, the walker can dispatch on
+them, and `_extract_constant` can have no branch for any of them. It falls
+through to `return None`.
+
+**There is no signal, and that is the actual harm.** A declared-but-unimplemented
+pattern is indistinguishable from a language that genuinely has no constants:
+`search_symbols` returns nothing and the caller concludes the symbol does not
+exist, which is the one thing an index must never let you conclude wrongly. The
+reporter only caught it because he knew for a fact his file held 935 of them.
+
+Six languages declare a constant surface and extract nothing: Rust, Go, Java,
+PHP, Kotlin, Bash. Membership in `constant_patterns` predicts nothing in either
+direction, because Scala and Gleam also declare patterns with no branch and work
+anyway by routing through `symbol_node_types` instead.
+
+### Fixed here: Kotlin and Bash
+
+**Kotlin was a different and nastier failure than a missing branch.** There *is*
+a `property_declaration` branch, but it is written against Swift's grammar: it
+requires a `value_binding_pattern` child with `mutability == let`. Kotlin spells
+the same thing `binding_pattern_kind > val`, with the name under
+`variable_declaration > simple_identifier`, so the branch returned `None` on
+every possible Kotlin input while reading as coverage. It is now keyed on
+language as well as node type, because a branch keyed only on node type is how it
+went unreachable in the first place. `const val` is a constant by declaration; a
+bare `val` is merely immutable, so it takes the naming convention the other
+extractors use.
+
+**Bash settled the multi-symbol question.** `readonly FIRST="x" SECOND="y"` is one
+`declaration_command` carrying two `variable_assignment` children, and
+`Optional[Symbol]` cannot express that. A new plural `_extract_constants` handles
+multi-binding node types and delegates everything else to `_extract_constant`
+unchanged, so Go's `const ( ... )` and Java's multi-declarator `field_declaration`
+have their plumbing already in place. Only the read-only forms count: `local` and
+a bare `declare` declare a variable, so the declaration itself is the evidence and
+no naming heuristic is needed.
+
+### The part that outlives the instance
+
+`tests/test_constant_extraction_guard.py` walks every spec declaring
+`constant_patterns`, feeds it a minimal sample, and asserts at least one constant
+comes back. Rust, Go, Java and PHP are exempt **by name** with `#428` and a
+reason, never as a category, and a ratchet asserts each still extracts nothing, so
+a fix cannot land without deleting its own exemption. Those four are left for the
+PR @mussonking offered.
+
+⚠ **The guard isolates config, and it has to.** `parse_file` consults
+`is_language_enabled`, so an unisolated run reports the developer's
+`config.jsonc` rather than the parser. A first sweep here showed a seventh
+affected language, arduino, extracting zero symbols; it was disabled locally and
+the parser was fine. Same failure mode as #411, where a test read the real
+`~/.code-index/config.jsonc`.
+
+Guard proven non-vacuous against unmodified HEAD in an isolated worktree: **5 fail
+before the fix**, 19 pass, and the passing set includes the exemption ratchet and
+a control asserting the measurement can return empty.
+
+## [1.108.266] - 2026-08-08 - A blank line inside a table cell no longer truncates it
+
+Silent data corruption in the MUNCH decoder. Found in-house.
+
+### The defect
+
+Two functions in `encoding/format.py` disagreed without saying so. `assemble`
+joins payload sections with a blank line and `split_sections` splits on one,
+while `write_table` uses `csv.writer`, which wraps a cell containing newlines in
+quotes but keeps the newlines real.
+
+So a cell whose value contains a **blank line** looks exactly like a section
+boundary, and the row gets cut in half.
+
+**It is worse than truncation, because the row count survives.** The orphaned
+second half becomes its own block; `read_table` filters by tag, so the fragment's
+first field is not the tag and it is dropped without comment. Reproduced against
+our own codec:
+
+```
+blocks: 2   rows in: 2   rows out: 2
+sym_a -> 'def f():'          # was 'def f():\n\n    return 1'
+sym_b -> 'def g(): pass'     # intact
+```
+
+Two rows in, two rows out, one cell quietly missing its middle. Nothing raises,
+nothing warns, and no arity check can catch it.
+
+The trigger is a blank line, not a newline. Multi-line cells already ship and
+round-trip correctly today. What supplies a blank line: a dict or list literal
+with a blank line between groups, a docstring with a paragraph break, or any
+span an outliner captures across one. It is latent rather than active only
+because current encoders mostly capture signatures and short spans — any future
+encoder that widens what goes in a cell trips it, and the symptom would be "the
+outline is subtly wrong sometimes", which is the worst kind to chase.
+
+### The fix
+
+`split_sections` stops treating a blank line as a boundary while the preceding
+block still has an open RFC 4180 quoted field, and re-joins instead. Detection is
+a quote-parity count: doubled quotes are the escape form and cancel, so an
+unterminated field is exactly an odd total.
+
+- **No wire-format change.** Encoders emit identical bytes; only the reader got
+  stricter about what a boundary is.
+- **Repairs payloads already written.** Anything that hit this decodes correctly
+  now.
+- **Finishes a job this file already started.** `_quote_if_needed` escapes
+  newlines for scalars, with a comment citing "audit finding F1" and naming this
+  exact `assemble` / `split_sections` collision. The scalar path was hardened;
+  the table path never was.
+- **Malformed input degrades instead of vanishing.** An unterminated quote
+  through end of payload keeps its text.
+
+Escaping newlines at write time was considered and rejected: unescaping on read
+would corrupt legitimate code content, since a source cell containing the two
+literal characters `\n` would come back as a real newline. That would need a
+header flag and a version gate. The reader-side repair has none of that exposure.
+
+Tests: `tests/encoding/test_format.py` 68 to 78. Ten new cases — the reported
+cell, multiple blank lines in one cell, a blank line at the very end of a cell, a
+cell of only blank lines, embedded quotes alongside a blank line, two cells each
+carrying one, a scalars block in front, and CRLF. **Seven fail before the fix.**
+Three pass on both sides deliberately, as controls: genuine boundaries near
+quoted values must still split, an unterminated quote must still degrade, and
+CRLF must keep working.
+
+## [1.108.265] - 2026-08-08 - Retrieval confidence grades ranking quality, not units
+
+Found while fixing the same defect in jdocmunch
+([#106](https://github.com/jgravelle/jdocmunch-mcp/issues/106)) and checking
+whether the siblings shared it. jcodemunch did. jdatamunch does not — it has no
+confidence surface and blends linearly, so this is a two-server defect rather
+than a suite-wide one.
+
+### The defect
+
+`compute_confidence`'s `strength` sub-signal squashes a raw top-1 score, and the
+curve was hardcoded to the BM25 scale for every caller. Measured on identical
+relative separation between the top two results:
+
+| scorer | top-1 | strength | confidence |
+|---|---|---|---|
+| BM25 | 20.0 | 0.9933 | 0.223 |
+| WRR fusion | 0.0492 | 0.0122 | 0.048 |
+| cosine | 0.82 | 0.1854 | 0.356 |
+
+Four scales reach that function, not two. Besides fusion and cosine,
+`sort_by="centrality"` ranks by PageRank, which sums to 1 across files — so the
+most central symbol in a repository was being graded at a strength near 0.01.
+
+Two consumers read the number, and the weight tuner is the smaller one:
+
+- `verdict.STATE_LOW_CONFIDENCE` gates whether a scan may assert an answer.
+  Fusion and semantic searches were being downgraded for arithmetic rather than
+  for evidence.
+- `WeightTuner` adjusts `semantic_weight` from the difference in mean confidence
+  between `semantic_used` groups. A scale gap of roughly 0.5 dwarfs its 0.05
+  decision threshold, so it reads "semantic hurts" and steps the weight down
+  toward its floor on any mixed-mode ledger. Measured end to end in the sibling
+  before this port: seven consecutive downward rounds, on data where the
+  semantic channel was answering the queries.
+
+### The fix
+
+Each caller now passes the ceiling of whichever scorer produced its scores.
+
+- New `signal_fusion.fused_score_ceiling(channels, smoothing, weights)` returns
+  `sum(weights) / (k + 1)`, the score a symbol ranked first in every channel
+  actually reaches. `fuse` and the ceiling now share one weight-resolution
+  helper, and a parametrized test fuses a perfect-consensus set and asserts the
+  top score equals the ceiling, so the two cannot drift apart.
+- The sibling's `1/(k+1)` constant would have been wrong here. Its fusion
+  weights are normalized to sum to 1; these are not, so with three unit-weight
+  channels the correct ceiling is three times that. A test asserts the sibling's
+  constant is not the answer.
+- `sort_by="centrality"` uses the most central file in the repository as its
+  ceiling. `combined` stays BM25-scaled, since PageRank enters it multiplied by
+  100.
+- **The BM25 path is unchanged.** `1 - exp(-3t/12)` is algebraically identical
+  to the old `1 - exp(-t/4)`, asserted at six score values, so only the callers
+  that were wrong move. An unknown or non-positive ceiling falls back to BM25,
+  so a caller that passes none is unchanged rather than newly wrong.
+
+**Upgrade note:** `_meta.confidence` moves upward for fusion, semantic and
+centrality searches, and some `low_confidence` verdicts move with it. If you
+gate anything on a confidence threshold, re-check it.
+
+### Also in this release
+
+Two commits made after the 1.108.264 tag ride along: ruff's rule `select` is now
+pinned explicitly rather than inherited from the installed version, and the
+file-IO encoding scanner locates a `mode` argument by value rather than by
+position.
+
+Tests: `test_confidence_score_scale.py` (17). Suite 7394 passed / 7 skipped, a
+delta of exactly the new file. No existing test pinned a fusion or semantic
+confidence value, which is why a five-fold mis-scaling shipped and survived.
+
+## [1.108.264] - 2026-08-07 - Text-mode file IO declares its encoding
+
+Read side of the cp1252 hazard, and the third member of the family:
+
+| Release | Direction |
+|---------|-----------|
+| v1.108.230 | subprocess **input** |
+| v1.108.262 | our own **output** |
+| v1.108.264 | **file IO**, this one |
+
+`open()`, `Path.read_text()` and `Path.write_text()` use the platform default
+when no encoding is given, which is cp1252 on Windows. Reading a UTF-8 file then
+raises on the five bytes cp1252 leaves undefined (`81 8D 8F 90 9D`) and silently
+mangles everything else it can map. Writing produces a file the rest of the world
+cannot read.
+
+14 call sites fixed: the watcher and hook-event manifests, the embedding drift
+canary, the tuning sidecar, the session-stats and savings files, and the
+benchmark baseline reader.
+
+### ⚠ The published figure of "45" was wrong, and this corrects it
+
+v1.108.262's changelog, release notes and CLAUDE.md all said 45 sites were
+unencoded. **The real number is 14.**
+
+The scan behind that figure checked only the `encoding=` **keyword**.
+`Path.read_text(encoding=None, errors=None)` takes encoding as its **first
+positional parameter**, so `read_text("utf-8", errors="replace")` was already
+correct at 28 sites that the scan reported as broken. The remaining three were
+`os.open` and `zipfile.open`, which have no encoding parameter at all.
+
+The figure was published without being checked. Correcting it here rather than
+quietly shipping the smaller number, because a wrong count in a changelog is a
+claim like any other.
+
+### The guard
+
+`tests/test_file_io_encoding_guard.py` (23) with an empty ratchet, matching the
+subprocess guard: a new unencoded call fails, a listed exemption that gets fixed
+must be deleted, and exemptions are named individually with reasons rather than
+whole directories being skipped.
+
+The scanner is positional-aware and **that is tested in both directions**. Ten
+correct-code snippets must not be flagged and six broken ones must be, because a
+guard with false positives is one nobody believes, and a ratchet nobody believes
+collects exemptions. A separate test asserts `read_text`'s first caller-supplied
+parameter is still `encoding`, so the rule cannot rot silently.
+
+### Migration
+
+`tuning.jsonc`'s header comment carries an em-dash, so on Windows it was written
+as cp1252 and read back as cp1252 -- self-consistent, and wrong for every other
+reader. It is now written and read as UTF-8. An existing cp1252 file still parses:
+the one mangled character lands inside a comment `_strip_jsonc` removes, verified
+by a test rather than assumed.
+
+## [1.108.263] - 2026-08-07 - refresh --json was dead on arrival
+
+`jcodemunch-mcp refresh --json` raised `UnboundLocalError` and printed nothing.
+It has been broken since the flag shipped in v1.108.259.
+
+```python
+print(_json.dumps(_out, indent=2))     # _json is not bound at this point
+```
+
+Other handlers in `main()` do `import json as _json` further down the function.
+That makes `_json` a **local for the whole of `main()`**, so a branch dispatched
+above those imports fails with `UnboundLocalError` rather than `NameError` --
+which is also why copying the line from a neighbouring handler looked right.
+
+Fixed by using the module-level `json` import.
+
+### The part worth writing down
+
+Ruff reported this as F821 on **every one of the four releases** that carried it.
+The lint job was red on v1.108.259, .260, .261 and .262, all of which were
+committed, tagged, uploaded to PyPI and announced anyway.
+
+Two independent gaps let that happen:
+
+- **Nothing in the test suite touched the CLI.** `tests/test_refresh_campaign.py`
+  exercised `run()` and `status()` directly, one layer below the defect. Testing
+  the function you wrote instead of the command a user types is how an entire
+  flag ships dead with 32 tests passing over it.
+- **The local suite is not the build.** `pytest` does not run `ruff`, the 8-job
+  test matrix passed the whole time, and the release flow never read the check
+  after pushing. Every signal that was being watched was green.
+
+Both are now closed rather than noted. The release checklist gains an explicit
+`uv run ruff check src/` step and an explicit "read the CI run for the pushed
+SHA" step, and this file's tests now drive the real CLI in a subprocess:
+five new cases covering `--status --json`, `--json`, the text control, a
+non-zero exit on refusal, and the `UnboundLocalError` signature by name. Four of
+the five fail before the fix.
+
+## [1.108.262] - 2026-08-07 - CLI output is UTF-8 even when piped
+
+`jcodemunch-mcp receipt --explain` crashed on Windows whenever stdout was a pipe
+or a redirect:
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode character '−'
+```
+
+No output, a traceback out of a shipped command.
+
+### Why it survived
+
+On Windows `sys.stdout` is the **console** stream, which is already UTF-8, when
+attached to a terminal, and the **locale** stream, cp1252, when piped or
+redirected. So the command works when a human runs it and dies the moment
+anything consumes it: a script, a CI job, `| more`, or another tool.
+
+Two characters are live in output today: U+2212 MINUS SIGN in
+`receipt --explain`, and U+2713 CHECK MARK in `render_diagram`.
+
+The crash is the loud half. The quiet half is worse: everything else was being
+emitted as **cp1252 bytes**, so `delivery` wrote its em-dash as byte `0x97` and
+`--help` produced output that is not valid UTF-8 at all. Any consumer decoding as
+UTF-8 got mojibake or an error, with nothing raised on our side.
+
+### The fix
+
+`_force_utf8_stdio()` runs at the top of `main()`, before any subcommand can
+write. Fixed at the entry point rather than per string, because the next
+non-ASCII character someone adds must not reintroduce it.
+
+- `PYTHONIOENCODING` is honoured as an explicit opt-out. An operator who named an
+  encoding made a decision.
+- `errors="replace"` is deliberate: filesystem paths can carry surrogates from a
+  `surrogateescape` decode, and those raise even under UTF-8. Mangling one
+  display character beats killing the command.
+- A stream that is already UTF-8 is left alone, and one that refuses
+  reconfiguration is survivable rather than fatal.
+
+### Relationship to the v1.108.230 sweep
+
+This is the sibling of the cp1252 **decode** class swept then. That sweep
+hardened subprocess **input** and left our own **output** alone, which is the
+shape a fix leaves when it is scoped to the symptom that was reported rather than
+to the hazard. The subprocess ratchet is still empty and still passing; this adds
+the other half.
+
+⚠ The MCP stdio transport is unaffected and this is asserted, not remembered: it
+wraps `sys.stdout.buffer` in its own TextIOWrapper, so it never reads the text
+layer reconfigured here. A test fails if that stops being true.
+
+Tests: `tests/test_cli_output_encoding.py` (15, of which 9 fail before the fix).
+They run the CLI in a subprocess with a pipe, because that is the only
+configuration that reproduces it -- in-process the pytest capture layer accepts
+any string and nothing can fail.
+
+### Still open
+
+45 text-mode `open()` / `read_text()` call sites in `src/` have no explicit
+`encoding=`, so they decode as cp1252 on Windows. That is the read-side sibling
+of the same hazard and is NOT fixed here; it needs its own scoped pass. None of
+them is on the `delivery` path that prompted this work, verified by tracing a
+real run.
+
+## [1.108.261] - 2026-08-07 - A disclosure sentence that names every field
+
+#424 is decided and closed: **the anonymous savings record does not carry a
+config dimension.** No sender change, no new field, and the disclosure sentences
+that were sequenced behind that decision stay as they are, because nothing about
+what is sent changed.
+
+Verifying that rather than assuming it turned up one sentence that was already
+incomplete.
+
+```
+SECURITY.md   "only sends an integer delta plus an anonymous UUID"
+actual        {"delta": ..., "total": ..., "anon_id": ...}
+```
+
+The lifetime `total` is sent and was not named, in a sentence containing the word
+"only". It is the same category of number as the delta, so this is an
+incompleteness rather than an undisclosed kind of data, and the other two sites
+(README and SECURITY's background-behavior list) both say "counts" and "counters"
+in the plural and were already correct.
+
+It still matters. That paragraph is the one a security reviewer reads, "only" is
+a promise about the complete set, and this project has already been quarantined
+once over the gap between what a package does and what its documentation says it
+does. The decision to add nothing is exactly what makes the existing sentence the
+final word on the subject, so it should be exactly right.
+
+Now reads:
+
+> The community token-savings counter (`share_savings`) is unrelated and sends
+> exactly three fields: an integer delta, an integer lifetime total, and an
+> anonymous UUID — never query strings, paths, repo names, or any configuration
+> value.
+
+The trailing clause carries the #424 decision into the disclosure itself.
+
+### Enforced, not just corrected
+
+Two tests, because a convention needs a test rather than a habit:
+
+- The payload literal must remain exactly three known fields. A fourth fails
+  here first and names SECURITY.md in the failure message, so the code change
+  and the disclosure edit cannot separate.
+- The SECURITY.md sentence must name delta, lifetime total, UUID, and the
+  no-configuration-value promise. It fails against the old wording, which is how
+  the fix was verified.
+
+`test_the_telemetry_payload_carries_no_surface_field` now records that #424 was
+decided rather than pending, so a future session cannot re-derive the field as a
+good idea without deliberately deleting a test that explains why not.
+
+No behaviour change. Documentation and tests only.
+
+## [1.108.260] - 2026-08-07 - A receipt that confirms your typo
+
+Found while re-checking #424. Not the issue itself, which stays open and is the
+maintainer's call.
+
+`JCODEMUNCH_TOOL_SURFACE=countr` reported itself back verbatim while serving the
+full 91-tool surface, because only `"counter"` is ever special-cased:
+
+```
+JCODEMUNCH_TOOL_SURFACE=countr
+  reported surface : countr        <- receipt echoes the typo back
+  front door active: False
+  visible tools    : 91            <- full surface, silently
+```
+
+Someone who typo'd the value and went looking for why their token cost did not
+drop read a receipt that **confirmed the setting had been accepted**. The
+`surface` CLI and `get_session_stats` both carry this field.
+
+Fifth occurrence of the diagnostic-disagrees-with-the-runtime class, after
+v1.108.250 and v1.108.255. A diagnostic must resolve its value the same way the
+runtime does, or it is worse than no diagnostic, because it is believed.
+
+### The fix
+
+`_effective_surface()` now always returns one of `VALID_TOOL_SURFACES`
+(`counter`, `full`). Unrecognized values resolve to `full`, which is what they
+have always **done**; only the reported value moves.
+
+Silently normalising would not have been enough on its own, because that hides
+the typo in the other direction. The receipt names the rejected value instead:
+
+```json
+{"surface": "full", "surface_requested": "countr", "surface_unrecognized": true,
+ "surface_note": "tool_surface 'countr' is not recognized and was ignored; ..."}
+```
+
+A correct setting carries none of those keys. A one-time WARNING names the bad
+value, the valid set, and the knob that sets it. Config values are validated on
+the same path as env values, since the config key shares the hazard.
+
+### Behaviour is unchanged
+
+An unrecognized surface has always served the full surface. This release changes
+what is **reported**, which is the entire defect. `tests/test_tool_surface_clamp.py`
+(25) pins that with a before/after tool count plus a non-vacuity floor asserting
+the two surfaces are actually distinguishable.
+
+Note on evidence: the test file cannot be run against the pre-fix module, because
+the symbols it imports did not exist. The defect was captured empirically before
+the change, and the numbers above are that capture.
+
+### What this does NOT do
+
+It does not touch the telemetry payload. That is #424 and it stays the
+maintainer's decision. Verified while here and now pinned by a test: the savings
+payload is `{delta, total, anon_id}` and carries no surface dimension, so this
+release is decision-neutral on whether it ever should.
+
+## [1.108.259] - 2026-08-07 - A re-index you can schedule
+
+Closes #395, from a constraint reported by @dkiaulakis.
+
+We ask users to re-index constantly: in issue replies, in staleness warnings, in
+the `stale_index` verdict channel, and on every `INDEX_VERSION` or
+`PARSER_GENERATION` bump. All of it assumes re-indexing is cheap enough to run on
+request. On one machine it is. On a fleet sharing a store it is a scheduled
+maintenance event, so our standard advice was unactionable for exactly the users
+with the most code.
+
+New `refresh` subcommand. Same work, bounded slices that resume:
+
+```bash
+jcodemunch-mcp refresh . --max-seconds 300     # one cron slot
+jcodemunch-mcp refresh . --status              # progress, no work done
+```
+
+Each run does what its budget allows, persists where it stopped, and returns.
+Running it again continues. The work converges whether it gets one long window or
+twenty short ones.
+
+### Why `paths=[...]` was not already enough
+
+The issue noted that `index_folder(paths=[...])` scopes to an explicit list and
+only lacked a caller that knew the list. That turned out to be half the story.
+`detect_changes_with_mtimes` compares content hashes, so a subset refresh over
+unchanged files correctly reports "No changes detected" and does nothing. That is
+right for an edit and useless for a `PARSER_GENERATION` upgrade, where the bytes
+are identical and the stored **symbols** are what is wrong, which is precisely the
+case a fleet cannot afford to fix today.
+
+So `index_folder` gains `force_reparse`, valid only alongside `paths`. Forcing
+without an explicit list would re-parse the whole corpus in one call, which is
+the unbounded event this issue exists to avoid.
+
+### The defect this nearly shipped with
+
+`index_folder` escalates a stale `parser_generation` to a **full** re-parse. With
+that intact, every "bounded" slice quietly ran the entire maintenance event:
+measured on an 8-file fixture as four full re-parses where four bounded slices
+were requested. A campaign of N slices would have cost N full re-indexes, which
+is strictly worse than the single event it replaces.
+
+A forced subset refresh is now exempt from that escalation, and nothing else is,
+because no other caller has a mechanism to finish the job. Six tests fail if the
+exemption is removed.
+
+### Coverage is verified, not assumed
+
+`storage/index_store.py` already stated the rule: an incremental save leaves the
+generation stamp alone, because a partially re-parsed index must keep claiming
+the older generation. A campaign that stamps early is that bug with a scheduler
+in front of it.
+
+So a campaign stamps only after re-parsing the whole corpus, and proves it by
+re-running discovery at the end:
+
+- Files added while the campaign ran were never parsed by it. They are appended
+  and the stamp is deferred, reported as `corpus_drifted`. The campaign still
+  converges.
+- Any batch error blocks the stamp.
+- `stamp_parser_generation` refuses to move the stamp backwards.
+
+### Operational notes
+
+- `--pause-ms` is the duty-cycle knob. The budgets bound when a run **ends**, not
+  what it costs while it runs; Python cannot preempt a running parse.
+- AI summaries are **off** by default here, unlike `index_folder`. A scheduled
+  background job must not bill a paid summarizer API without being asked.
+- Campaign state is written atomically, so a killed run never leaves a
+  half-written cursor, and a corrupt state file starts a fresh campaign rather
+  than stranding the operator forever.
+- `refresh` re-parses an existing index; it does not build the first one, and
+  says so with the command that does.
+
+### Cost
+
+Measured on this repository (795 files): 60 files in 3.8 s, about 63 ms per file,
+so a full campaign is roughly 50 s spread over as many slices as you choose. Each
+run reports its own rate and the estimated work remaining, which is the number
+that matters because it is measured on the operator's hardware. Documented in
+USER_GUIDE.md under "When a re-index is a maintenance event (fleets)".
+
+Tests: `tests/test_refresh_campaign.py` (32).
+
+## [1.108.258] - 2026-08-07 - A config read that reads the config
+
+Closes #426. `config.get()` returned the hardcoded default for every env-mapped
+key until `load_config()` had run, with no signal that config was never loaded.
+A caller could not tell "the value is 512000" from "I have no idea what the
+value is".
+
+```
+JCODEMUNCH_MAX_FILE_SIZE=20000000 python -c "..."
+   before: 512000     # env ignored, silently
+   after:  20000000
+```
+
+Not specific to that key. `max_folder_files`, `max_index_files` and
+`staleness_days` behaved identically; the env mapping was correct all along, it
+was only applied by `load_config()`, and `get()` read `_GLOBAL_CONFIG`, which
+was `{}` until then.
+
+### Why this was filed and fixed even though nothing was broken in production
+
+`index`, `index-file` and `serve` all dispatch after the shared `load_config()`
+in `main()`, so no shipped path resolved a limit unloaded. This is a sharp edge,
+not an outage, and it is worth saying plainly: the "not verified" note in #425
+resolves as a harness artifact.
+
+The reason it still needed fixing is that `server.py` already carried three
+comments of the same shape, on three different subcommands, each a real bug
+found separately and fixed by adding one `load_config()` call to one handler.
+Every subcommand dispatched above the shared call was one edit from being the
+fourth, and nothing failed loudly when it happened. The failure mode is a
+plausible-looking default, which is the hardest kind to notice. Fixing rows one
+at a time is precisely why there is always a next row.
+
+### The fix
+
+`get()` now loads lazily when nothing has been loaded yet, so the ordering
+question stops existing rather than being answered correctly one handler at a
+time. Two things constrain it, both raised in the issue before any code was
+written:
+
+- **It does not displace the explicit calls.** `main()` re-runs `load_config()`
+  after `_setup_logging()` on purpose, so config warnings reach the configured
+  log destination. Only the lazy path is conditional; every explicit call is
+  unconditional and still emits.
+- **It fires on not-loaded AND empty, tracked by a separate `_CONFIG_LOADED`
+  flag rather than by truth-testing the dict.** Emptiness alone would re-read
+  the file on every key for any state that legitimately resolves to `{}`. The
+  flag alone would clobber a caller that populated `_GLOBAL_CONFIG` directly.
+
+One new side effect had to be refused rather than accepted: `load_config()`
+auto-creates a default `config.jsonc` when none exists, and a **read** that
+writes a file into the user's storage directory would be a worse surprise than
+the defect being fixed. The lazy path passes `create_missing=False`. Value
+resolution is unchanged either way, because the file it declines to write is the
+template and the template is `DEFAULTS`.
+
+The lazy load also never raises. A read that starts failing is worse than the
+silent default it replaces, so a load failure falls through to previous
+behaviour and leaves the flag unset so the next read retries.
+
+### Test isolation
+
+`tests/conftest.py` now resets config state **before** each test as well as
+after. Teardown alone left one hole: `_GLOBAL_CONFIG` is `{}` until the first
+test's teardown fires, and a lazy load out of that state would pull the
+developer's real `~/.code-index/config.jsonc` into whichever test read config
+first. Same family as #411, where a test broke on any box that had the key it
+was testing actually set.
+
+`tests/test_config_lazy_load.py` (18 tests, 13 fail before the fix, 5 controls
+pass on both sides). The reproductions run in subprocesses, because a fresh
+interpreter is the only honest way to reach "nothing has been loaded yet".
+
+## [1.108.257] - 2026-08-07 - A response limit that is a response limit
+
+Closes #425. Nothing bounded the size of a single MCP tool response. What
+bounded it in practice was `max_file_size`, an **indexing** limit, in a
+different subsystem, doing the job by coincidence, with no test pinning the
+relationship.
+
+Two consequences, both now closed:
+
+- The protection could be removed by an unrelated change to how bodies are
+  cached or sliced, and nothing would have failed.
+- Raising `max_file_size` to index a large generated file silently raised the
+  largest reply the server could emit. That key was made settable in v1.108.193
+  for indexing coverage, and its documentation never claimed to govern transport
+  payload size.
+
+### The cap
+
+New `response_max_bytes` config key (`JCODEMUNCH_RESPONSE_MAX_BYTES`), default
+**1 MiB**, resolved by `get_max_response_bytes()` in the same shape as its three
+sibling limits. `0` is an explicit opt-out; anything else invalid falls back to
+the default, because a typo must never mean "no ceiling".
+
+Enforced in a thin wrapper **around** the dispatcher, not inside it. The
+dispatcher has more than a dozen `return` sites across the MUNCH-encoded, JSON,
+in-band-error and front-door paths, so a check at any one of them is a check the
+next new branch will not have. `call_tool` is now that wrapper and
+`_call_tool_impl` is the dispatcher; the front door's `order`/`route`
+re-dispatch goes through the wrapper too.
+
+Over the cap the call returns a structured error naming the actual size, the
+limit, and the key that moves it. **It refuses rather than truncating**: a
+shortened body is indistinguishable from a complete one to the caller, which
+makes silent truncation the one outcome worse than an error here. An
+already-failing result passes through untouched, since capping an error would
+replace a specific diagnosis with a generic one, and a cap that raises is
+swallowed, because a cap that can fail closed is worse than no cap.
+
+### The reported "not verified" note was a harness artifact
+
+#425 recorded, as an open question, that neither `JCODEMUNCH_MAX_FILE_SIZE`
+nor an isolated `config.jsonc` moved `get_max_file_size()`. Reproduced, then
+traced: `config.get()` reads `_GLOBAL_CONFIG`, which is empty until
+`load_config()` runs, so **every** env-mapped key resolves to its default in a
+process that has not loaded config. It is not specific to `max_file_size`;
+`max_folder_files`, `max_index_files` and `staleness_days` behave identically.
+Calling `load_config()` first makes the env var take effect.
+
+The env var therefore works for its real consumers: the `index` and `index-file`
+subcommands are dispatched after the shared `load_config()`, as is `serve`. **No
+production path resolves that limit unloaded**, so this is not a live defect,
+and the report is more severe than the code. Recorded here rather than fixed
+because the underlying sharp edge — `config.get()` silently answering with a
+default instead of signalling "not loaded" — has already produced three
+one-subcommand-at-a-time patches in `server.py` and deserves its own issue
+rather than a fourth.
+
+### The rename made an existing parity file pass vacuously
+
+`test_dispatch_schema_parity.py` walks the dispatcher's AST for
+`name == "<tool>"` branches and asserts each argument key it reads is a declared
+`inputSchema` property. It parsed `call_tool` by name, so after the rename it
+parsed the thin wrapper, found **zero** branches, and its parity assertion
+passed over an empty set.
+
+Nothing about that assertion failed. What failed was
+`test_dispatch_chain_is_parseable_and_nonempty`, a guard-the-guard added for
+exactly this, asserting the walk finds more than 50 branches. It earned its
+keep: without it, a whole parity file would have gone silently inert on a
+rename, and the suite would have been greener than the code. The walk now
+targets `_call_tool_impl`.
+
+### Tests
+
+New `tests/test_response_cap.py` (29). Includes an end-to-end refusal through
+`call_tool` plus a control proving the refusal is the cap and not a broken tool,
+a byte-vs-character measurement case, and two decoupling tests asserting that
+moving either limit does not move the other.
+
+## [1.108.256] - 2026-08-07 - The registry entry advertised a claim the README had already retired
+
+`server.json` is the payload the MCP registry publishes, and it is what
+mcp.so, MCPFind, mcprepository and PulseMCP display. Its `description` read:
+
+```
+70+ languages, 95%+ token savings.
+```
+
+That number predates v1.108.233. When the benchmark harness was re-measured
+against pinned upstream commits, the headline moved **against us on purpose**:
+237.3x fell to 27.9x and 99.6% fell to 96.4%. The README was corrected then to
+`86-99% (96% average)`, because per-query results span 86% to 99% and quoting
+only the aggregate overstates the low end by omission. `server.json` was not,
+so the retired claim stayed live on every aggregator that mirrors the registry.
+
+The description now reads `70+ languages, 86-99% token savings.` (98
+characters; the registry caps this field at 100 and validates it *before*
+authenticating, so an overlong string fails after the login round-trip rather
+than before it).
+
+`TOKEN_SAVINGS.md` carried the same retired figure, in the document the README
+cites as its methodology link. It now states the range, the baseline it is
+measured against, and why the larger 99.6% / 237.3x number exists but is not
+the one to lead with.
+
+No behavior change. Shipped as a release rather than a bare commit so the
+registry entry, PyPI, the GitHub release and the plugin manifest all name one
+version, which is the property that makes a stale registry entry detectable at
+a glance in the first place.
+
+## [1.108.255] - 2026-08-07 - Hook output on channels the model never sees
+
+Contributed by [@georgebashi](https://github.com/jgravelle/jcodemunch-mcp/pull/420).
+
+### Cause
+
+For a Claude Code hook that exits 0, `hookSpecificOutput.additionalContext` is
+the only channel that reaches the model. Both stderr and top-level
+`systemMessage` surface to the *user* instead. (Exit 2 does feed stderr to the
+model, but it also blocks the call, which is not what an advisory nudge wants.)
+
+The advisory Read and Grep nudges and the SubagentStart repo briefing were all
+written to a user-facing channel. The hooks fired, gated correctly, computed the
+right text, and none of it landed. The Read nudge had been in this state since
+v1.22.5, which correctly replaced a hard `Read` deny with an exit-0 stderr
+warning to unbreak Read-before-Edit (#241), and in moving off the deny channel it
+moved off the only channel that reached the model. The comment it left behind
+read `# Stderr text is surfaced to the agent as guidance.`
+
+Nine tests in `test_hooks.py` asserted `"search_text" in err`. **They passed
+because the message went nowhere.**
+
+### Fixed
+
+- Read and Grep nudges and the SubagentStart briefing now emit
+  `additionalContext`. No `permissionDecision` accompanies them, so calls still
+  proceed and Read-before-Edit keeps working.
+- **New `hook-sessionstart` subcommand.** PreCompact can report its snapshot to
+  the user but has no channel to inject it into model context, so the snapshot
+  was computed at the exact moment that state was about to be lost and then
+  discarded. SessionStart restores it afterwards; both hooks share one builder,
+  so they can never describe the same session differently. Registered with
+  matcher `compact|resume|fork` and silent on `startup|clear`, because an unrelated
+  session's journal would present stale files as current focus.
+- TaskCompleted diagnostics stay on `systemMessage` deliberately: that event has
+  no non-blocking model channel, and its only alternative, exit 2, would refuse
+  task completion over advisory findings.
+
+### `config --check` reported a healthy machine as unconfigured
+
+Found while reviewing the above. The hook section of `config --check` kept its
+own hand-written list of expected hooks and tested presence with the substring
+`jcodemunch-mcp <subcommand>`. Two consequences:
+
+- `_hook_invocation()` resolves to an **absolute path** whenever `shutil.which`
+  finds the executable, so the installed command reads
+  `C:/Python314/Scripts/jcodemunch-mcp.EXE hook-pretooluse`. The substring is not
+  in it. On any such machine (most of them) the check reported **every hook
+  not installed** while every hook was installed and working.
+- The list omitted `hook-sessionstart` the day it shipped, and displayed
+  `PreToolUse(Read)` when the installer has written `Read|Grep` since the Grep
+  nudge landed.
+
+Both now derive from `_enforcement_hooks()`, the installer itself, and presence
+is tested with `_extract_jcm_subcommand`, the helper written for exactly these
+path shapes. New `tests/test_config_check_hooks.py` (9; **8 fail pre-fix**, one
+control passes both sides) asserts against the CLI's real stdout, because the
+defect was invisible from every layer beneath it.
+
+## [1.108.254] - 2026-08-07 - Python package-relative imports built no graph edge at all
+
+Reported by [@faxik](https://github.com/jgravelle/jcodemunch-mcp/issues/423) as an
+asymmetry in `get_call_hierarchy`: an edge returned by `direction="callees"` was
+missing from `direction="callers"` on the other endpoint, so `caller_count: 0`
+read as proof of absence. The asymmetry is real, and it was the visible symptom
+of something larger.
+
+### Cause
+
+`resolve_specifier` read relative imports with **JavaScript path semantics**.
+Python's relative form is not a path: in `from ..parser.fqn import x` the leading
+dots count package levels and the rest is a dotted module path. Joining it as a
+path produced the single segment `tools/..parser.fqn`, which matches nothing.
+
+Measured on this repository:
+
+| python relative specifiers (all internal by definition) | 818 |
+| --- | ---: |
+| resolved before | 71 (**8.7%**) |
+| resolved after | 817 (99.9%) |
+| internal import edges recovered | **746** |
+
+Everything gated on the import graph inherited this: `find_importers`,
+`get_blast_radius`, `get_dependency_graph`, `get_call_hierarchy`'s callers
+direction, and `check_delete_safe`.
+
+**The consequence is the serious part, and it reproduced here.**
+`find_importers` on our own `parser/fqn.py` returned exactly one importer, a
+test file, while `tools/_utils.py` imports it in production through
+`from ..parser.fqn import fqn_to_symbol`. A live symbol presented as imported by
+tests only — which is precisely the bucket a delete-safety check calls removable.
+
+### Fix
+
+`_resolve_python_relative` implements the real semantics: N leading dots walk
+N-1 packages up from the importer's own package, the remainder names a module,
+and a package resolves to its `__init__`. Climbing past the repo root returns
+None rather than guessing.
+
+⚠ **Gated on the importer's extension, not the specifier's shape**, so no JS/TS
+specifier can take this branch — `./foo`, `../lib/util` and the `#284` dotted
+basename convention keep the path reading exactly, asserted by test. Python
+semantics are tried first and fall through on a miss, so the forms that already
+resolved still do.
+
+### Disclosure: the callers direction now says when it could not look
+
+The resolver fix removes today's cause, but an unresolvable import will always
+exist for some language, so a `0` still needs to be non-citable when the graph
+was not searched. `get_call_hierarchy` now reports
+`_meta.caller_graph_incomplete` naming the files that call the symbol but were
+never considered, and refuses the absence verdict when the answer is empty.
+
+⚠ **Deliberately not gated on `caller_count == 0`.** The report's second case
+came back with 16 callers, every one a test, while the single production caller
+was excluded. A non-zero count can be exactly as incomplete as a zero, and it is
+the one nobody inspects.
+
+### Two tests that failed for the right reason
+
+- `test_find_importers.py`'s `python_relative` case asserted
+  `(".helpers", "lib/module.py", {"lib/helpers.py"}) -> None`, **encoding the
+  defect as intended behaviour**. Corrected, with the reason recorded inline.
+- `test_absence_wiring_guard.py` caught the new `build_verdict` call site being
+  added without `index_changed`. That guard exists so the next verdict-emitting
+  tool cannot quietly join the list, and it worked on the first tool to join
+  after it was written.
+
+Tests: `test_python_relative_imports.py` (19; **7 fail pre-fix**, and the 8 that
+pass on both sides are deliberate controls — the JS/TS path-reading guards and
+the absolute/external cases — so a green run cannot be produced by relative
+resolution quietly breaking).
+
+## [1.108.253] - 2026-08-07 - route answered an ambiguous question with one confident action
+
+Follow-on to the emitted-task measurement in
+[#422](https://github.com/jgravelle/jcodemunch-mcp/issues/422). That run scored
+`route` on the wording it actually receives -- the `task` strings agents emit,
+not the words users type -- and found it landing below a constant answer.
+
+**Cause.** The broad rule
+`/find|locate|where is|look up|search for|definition of/ -> search_symbols`
+fired on 26 of 40 emitted strings, because agent-phrased tasks almost all open
+with "find". The gold labels split 18 `search_text` / 17 `search_symbols`, so on
+the majority case that rule was a coin flip by construction. Worse, a curated
+rule emits a single recommendation: 28 of 40 cases came back with exactly one
+action, so `@3` could not recover from a wrong `@1` and was identical to it.
+
+**Fix, in two parts.**
+
+- A **content-search rule** above the broad one, for targets that are a string
+  rather than a name: quoted literals, log lines, error messages, comments,
+  TODO/FIXME, regexes, and occurrence phrasing ("every place", "all the
+  places", "occurrences of"). A symbol-name index cannot match any of those.
+- The broad `find` trigger now **also offers `search_text` as an alternate**,
+  appended last so it can never displace an earlier rule's rank. "find X" is
+  genuinely undecidable without more signal; what was indefensible was
+  returning one action and presenting it as confident.
+
+Both follow the precedence convention the specificity block was built on:
+narrower rules added *above*, the broad rule left intact, so no phrasing silently
+loses its route.
+
+### Measured
+
+Held-out set of 20 emitted strings, drawn from rows the fix was never developed
+against:
+
+| | before | after | floor |
+| --- | ---: | ---: | ---: |
+| strict @1 | 15.0% | 10.0% | 70.0% |
+| strict @3 | 20.0% | **80.0%** | 70.0% |
+
+`@3` crosses from 50 points below a constant answer to 10 above it. Single
+recommendations went from 12 of 20 to zero.
+
+Human-phrased corpora do not regress: `queries.json` improves (route@1
+67.8% -> 69.5%, @3 86.4% -> 88.1%, one fewer miss) and `holdout.json` is
+unchanged at 65.9% / 75.0%.
+
+### What this does NOT fix, stated plainly
+
+**`@1` did not improve.** It remains far below the floor, because "find X" still
+leads with `search_symbols` while emitted traffic skews toward `search_text`.
+That ordering was deliberately left alone: the split is inside the labeling
+uncertainty the corpus author flagged himself, and reordering to chase it would
+fit the sample rather than the intent. A rank-1 discriminator -- most likely
+"does the task name an identifier-shaped token" -- needs its own fresh data, not
+another pass over the set already used to verify this change.
+
+Tests: `test_counter.py` +9 (**9 fail pre-fix**; 2 controls pass on both sides,
+including one asserting the narrower anti-pattern rule still outranks the new
+content rule). `benchmarks/route_recall/results.json` regenerated -- a rules
+change makes a committed measurement artifact stale, and
+`test_retrieval_counterfactual.py` catches exactly that.
+
+## [1.108.252] - 2026-08-07 - `receipt` counted 12 of 348 calls, because it only ever looked in one profile
+
+Reported by [@MotoMato85](https://github.com/jgravelle/jcodemunch-mcp/issues/421)
+with a controlled per-root table, a correct root-cause read of the code, and the
+observation that jMunch Console's frozen tile is downstream of this, not a bug of
+its own. Every claim reproduced.
+
+**`jcodemunch-mcp receipt` scanned a hardcoded `~/.claude/projects`.** That is
+where transcripts land for the *default* profile only. `CLAUDE_CONFIG_DIR`
+relocates Claude Code's whole config tree, so every session started under a
+second profile wrote its transcript somewhere `receipt` never walked.
+
+The reporter's measurement, same binary, only the root changed:
+
+| transcript root | calls | savings_tokens |
+| --- | ---: | ---: |
+| `~/.claude/projects` (what `receipt` scanned) | 12 | 32,646 |
+| `~/.claude-headroom-code-on/projects` | 223 | 745,339 |
+| `~/.claude-headroom-code-off/projects` | 113 | 349,280 |
+
+12 of 348 calls, about 3%.
+
+### Why the existing override could not fix it
+
+`--projects-root` took a single path. With two profiles open at once there is no
+one root that contains both, so no invocation could produce a correct total.
+
+### Cause
+
+`_projects_root()` returned `Path.home() / ".claude" / "projects"` and nothing in
+the package ever learned any other location. The calls were silently missing
+rather than failing loudly.
+
+### Fix
+
+Learn the roots from the sessions themselves. We already run inside every one:
+
+- The MCP server registers `$CLAUDE_CONFIG_DIR/projects` at startup. The client
+  spawns the server as a child, so the variable is inherited.
+- Every Claude Code hook payload carries `transcript_path`, whose grandparent is
+  the projects root. The hooks register it as a backstop for installs where the
+  variable is set only for the CLI.
+
+Both append to a small list at `~/.code-index/_transcript_roots.json` (directory
+paths only, disclosed in [SECURITY.md](SECURITY.md#background-behavior-fully-disclosed)),
+and `receipt` scans the union. Registration is retroactive: the moment a root is
+known, all the history already inside it counts, so nobody has to re-run
+anything. `receipt --roots` prints exactly what will be walked, and the JSON
+export carries the same list as `transcript_roots`.
+
+jMunch Console's "jCode tool calls" tile and per-tool table are fixed by this
+with no console change: both come from the same scan.
+
+### Notes
+
+- **`--projects-root` stays an override, and is now repeatable.** Making it
+  additive would break the one thing it was already good for, pinning a scan to
+  a known tree, and the existing tests caught exactly that.
+- **Sessions de-duplicate by filename stem** (the session UUID), so a copied or
+  symlinked tree cannot double the ledger. A file skipped by the mtime filter
+  deliberately does *not* claim the stem, or a stale copy would mask a fresher
+  one in another root.
+- **An mtime prefilter skips files last written before `--since`**, with an hour
+  of margin for coarse timestamps and clock skew. A union multiplies the walk,
+  and jMunch Console drops its whole Savings panel to fixtures if the subprocess
+  takes more than 60 seconds.
+- **The hook side effect writes nothing to stdout**, which is asserted by test:
+  Claude Code parses hook stdout as the hook's reply, so a stray write there
+  corrupts the protocol.
+
+Tests: `test_transcript_roots.py` (21).
+
+### Also in this release
+
+**The starter-pack CDN cache-key pin** (`&v=<version>` on the download URL,
+committed after 1.108.251 shipped). The unversioned URL never changed between
+releases, so the CDN in front of `jcodemunch.com` kept serving the previous pack
+for a full day after each deploy — on 2026-08-07 it handed out the build whose
+indexes delete themselves on the next server start ([#419](https://github.com/jgravelle/jcodemunch-mcp/issues/419)),
+hours after the fix was live. Resolving the pack's published version from the
+catalog gives each build a distinct cache key. Best effort: any failure falls
+back to the unversioned URL rather than failing the install.
+
+**Four license-transport tests were repaired, not just re-counted.** The catalog
+probe consumed the first scripted response, so the download then failed with an
+unscripted-GET transport error. The tests still returned 1 and still passed their
+`rc` assertion while proving nothing about the license path they exist to guard.
+They now script the probe and assert on the *download* call: one download, no
+retry, and the key absent from every URL. Third time an unrelated but required
+change to the pack API has tripped a raw-count assertion in that module, so the
+counts are gone in favor of the invariant.
+
+## [1.108.251] - 2026-08-06 - every server start silently deleted your installed starter packs
+
+Reported by [@MotoMato85](https://github.com/jgravelle/jcodemunch-mcp/issues/419)
+with a complete root-cause trace, a controlled sweep run, and a counter-experiment
+that proved the trigger. Every claim reproduced exactly.
+
+**Installed starter packs were deleted on the next server start.** Reproduced end
+to end against a real download: install the free `nodejs` pack, run the startup
+sweep, `cleanup_orphan_indexes() -> 4`, store empty.
+
+### Cause
+
+The pack builder clones into
+`tempfile.gettempdir() / "jcm-pack-clones" / <owner>-<repo>`, and that absolute
+path ships inside every pack `.db`'s `meta.source_root` and `meta.git_root`.
+`install-pack` extracted files verbatim. `cleanup_orphan_indexes()` deletes any
+index whose non-empty `source_root` is not a directory, skipping only **empty**
+ones as remote repos. On every machine except the builder's, each pack was
+therefore an "orphaned local repo".
+
+**Worse than disappearing.** The sweep does not delete the `.pack-<id>.json`
+marker, so `install-pack`'s already-installed check and jMunch Console kept
+reporting the pack as present over an empty store. Reinstalling restarted the
+cycle. The deletions log at INFO, which a stdio MCP server's user never sees.
+
+### Fixed in three places
+
+- `install-pack` blanks `source_root` / `git_root` on each extracted `.db`.
+  Best-effort by design: a pack that installs un-neutralised is still recoverable,
+  and failing the install would turn a meta problem into an unusable pack.
+- `heal_pack_index_paths()` repairs packs **already on disk**, run at startup
+  before the sweep. Fixing the producer does not fix its history, and reinstalling
+  is not a remedy a user knows to apply when everything reports "installed".
+- `cleanup_orphan_indexes()` skips pack-clone paths outright, as a backstop for a
+  store that has not been healed yet. The order of those two is never load-bearing.
+
+Blanking is the correct repair rather than a special case: an empty `source_root`
+is already the store's way of saying "no local clone backs this index", which is
+the truth for a downloaded pack. It also takes packs out of `watch-all`, which had
+been picking up all 15 and logging a failed index per pack (the reporter's
+Isolation 5). Matching is on a path **component**, so a user directory merely named
+`my-jcm-pack-clones-backup` is not exempted from orphan cleanup.
+
+⚠ **This was invisible to us by construction.** An audit of the maintainer's own
+store found 95 indexes and zero deletions pending: those packs predate the current
+builder and carry an empty `source_root`. The person most able to notice was
+structurally immune.
+
+⚠ `cleanup_orphan_indexes()` — a primitive that deletes user data — had **no test
+coverage at all**. `tests/test_pack_index_survives_orphan_sweep.py` (18 tests) now
+covers it, including controls that keep the file from going green by orphan
+cleanup ceasing to work altogether.
+
+## [1.108.250] - 2026-08-06 - `config --check` reported a default while the indexer used your config
+
+Reported by [@domis86](https://github.com/jgravelle/jcodemunch-mcp/issues/416) as a
+follow-up on #416. With a `.jcodemunch.jsonc` present but **not** declaring
+`max_folder_files`, and a global `config.jsonc` that did declare it,
+`config --check` printed the hardcoded default `2000` and tagged the row
+`[config]`.
+
+**Indexing was correct the whole time.** A run with a global cap of 3 against 5
+files discovered 5, indexed 3 and dropped 2, with the right warning. Only the
+diagnostic lied, which is the exact inverse of #416 and harder to trust, because
+`config --check` is the tool users are pointed at to debug this class of problem.
+
+### One cause, two defects
+
+`_PROJECT_CONFIGS` held `deepcopy(_GLOBAL_CONFIG)` overlaid with the project's
+keys, and `get(key, repo=)` returned the caller's `default` for anything missing
+from it. Global was never consulted for a key the project file did not declare.
+
+1. **Ordering.** The snapshot is taken whenever `load_project_config()` runs.
+   `config --check` runs it *before* `load_config()` populates global, so the copy
+   captured an empty global and every undeclared key reported its hardcoded
+   default. Indexing loads in the other order, which is why the two disagreed.
+2. **Staleness.** A file-backed entry was excluded from the v1.108.197 mirror
+   refresh, so a later edit to global config stayed invisible to it forever. That
+   release fixed this for repos with *no* project file; the defect survived one
+   branch over.
+
+`_PROJECT_CONFIGS` now holds an **overlay** of only the keys the project file
+actually declares, and `get()` resolves project → global → default on every read.
+There is no snapshot left to be taken early or to go stale. A key rejected for bad
+type is simply absent from the overlay and falls through to global, which is what
+its "using global default" warning always claimed.
+
+### Not `max_folder_files`-specific
+
+Answering the report's closing question: `max_file_size` and `max_index_files`
+were wrong in the same conditions and are fixed by the same change. Any key read
+through the project-aware path that the project file omitted showed a default
+wearing a `[config]` tag.
+
+⚠ This is the third time a `config --check` row has disagreed with the runtime it
+describes (#300/#304 `summarizer_model`, #393 `use_ai_summaries` /
+`summarizer_provider`, now the three indexing limits). Each was previously fixed
+one row at a time. `tests/test_config_check_matches_resolver.py` (11 tests) is
+written against the defect class instead: the row-versus-effective-value and
+load-order-independence guards are parametrized over the whole limit set, one test
+compares the row against the cap the walk *reported enforcing* rather than against
+a second read of config, and three controls pass on both sides of the fix so the
+file cannot go green by project config or capping quietly ceasing to work. Eight
+of the eleven fail against pre-fix code.
 
 ## [1.108.249] - 2026-08-06 - a flag that claimed compaction, and an advisory that measures where a doc points
 
@@ -13906,7 +15999,7 @@ Thanks to **@MariusAdrian88** for this contribution (#244).
 - **`cross_repo_default` config key** — boolean default for the `cross_repo` parameter across all import graph tools. Env var: `JCODEMUNCH_CROSS_REPO_DEFAULT`. Default: `false`.
 - **53 new tests** (1431 total, 9 skipped).
 
-## [1.12.9] — docs patch 2026-03-30
+## Docs patch — 2026-03-30 (no version bump)
 
 ### Changed
 - **QUICKSTART.md Step 3** — upgraded AGENT_HOOKS.md footnote to an `[!IMPORTANT]` callout naming the "pressure bypass" failure mode (agent sees CLAUDE.md rule, ignores it under load) and explaining why hooks are needed for hard enforcement.

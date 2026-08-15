@@ -365,17 +365,35 @@ def _compute_centrality(
 
 
 def _identity_score(sym: dict, query_joined: str, raw_query: str = "") -> float:
-    """Identity channel: exact or prefix match on symbol name/ID.
+    """Identity channel: exact, normalised, or prefix match on symbol name/ID.
 
-    Returns a high score for exact matches and a decreasing score for
-    prefix matches by specificity.  Replaces the old ``50.0`` exact-name hack.
+    Returns a high score for exact matches and a decreasing score for weaker
+    identity matches by specificity.  Replaces the old ``50.0`` exact-name hack.
 
     Scoring:
       - Exact name match          → 50.0
       - Exact ID match            → 50.0
+      - Normalised name/ID match  → 40.0
       - Name starts with query    → 30.0
       - ID contains query segment → 20.0
       - No match                  →  0.0
+
+    ⚠ **The 40.0 tier is the whole point of #458 and it is easy to delete by
+    "simplification".** ``_tokenize`` folds case *and* strips leading
+    underscores and punctuation, so a pytest fixture named ``state`` and the
+    class literally named ``_State`` both reach the tokenized comparison for
+    the query ``_State``. Grading them alike put them at 50.0 apiece, and the
+    tie fell through to BM25, where the shorter name with a docstring won —
+    a test fixture outranking the source symbol it tests, by 0.355 points out
+    of ~58. A literal match must outrank a normalised one, and ``identity_type``
+    must not report ``exact`` for a grade it did not measure (#440's shape).
+
+    ⚠ **Case folding alone still counts as exact, deliberately.** ``raw_lower``
+    is already case-folded and has graded exact since the channel arrived, so
+    making case load-bearing would change the answer for every caller who types
+    ``getuser`` for ``getUser`` — a behaviour change with no defect behind it.
+    What drops to 40.0 is a match that needed *more* than case: an underscore,
+    a separator, anything ``_tokenize`` removed.
     """
     raw_lower = raw_query.lower() if raw_query else ""
     if not raw_lower and not query_joined:
@@ -389,7 +407,9 @@ def _identity_score(sym: dict, query_joined: str, raw_query: str = "") -> float:
 
     # Tokenized fallback preserves previous semantics for callers that only have terms.
     if query_joined == name_lower or query_joined == sym_id_lower:
-        return 50.0
+        # With no raw spelling there is nothing to be literal about, so the
+        # tokenized match is the best evidence available and stays exact.
+        return 50.0 if not raw_lower else 40.0
 
     # Prefix match on name (e.g. query "get_sym" matches "get_symbol_source")
     if query_joined and name_lower.startswith(query_joined):
@@ -405,6 +425,44 @@ def _identity_score(sym: dict, query_joined: str, raw_query: str = "") -> float:
         return 20.0
 
     return 0.0
+
+
+def _ledger_identity_rows(
+    scores: list[float],
+    entries: list[dict],
+    query_terms: list[str],
+    raw_query: str,
+) -> list[dict]:
+    """Ledger input pairing each ranking score with the identity channel's verdict.
+
+    v1.108.272 (#440). ``extract_ledger_features`` reads ``identity`` off the rows it
+    is handed, and the non-fusion exits handed it score-only rows — so ``identity_hit``
+    was recorded 0 on every ``search_symbols`` row whatever the identity channel found.
+
+    Identity is recomputed here rather than threaded out of scoring. It is a pure
+    function of the symbol's name/id and the query, the lexical path folds it into the
+    BM25 total inside ``_bm25_score`` where it is no longer separable, and only the top
+    three rows are ever read — so this is three string comparisons, not a second pass.
+
+    ⚠ Recomputing also makes ``semantic_only`` honest. That mode skips the identity
+    channel entirely (``idn = 0.0``), so reusing its value would keep recording a
+    default dressed as a measurement — the very thing being fixed.
+
+    ⚠ For the LEDGER only. ``compute_confidence`` sniffs the same key when no
+    ``has_identity_match`` is passed and scores it 1.0 known-true / 0.7 unknown / 0.6
+    known-false, so feeding these rows to ``attach_confidence`` would move the
+    confidence of every non-fusion search. That is its own change with its own
+    justification, not a side effect of recording a column.
+    """
+    query_joined = " ".join(query_terms)
+    rows: list[dict] = []
+    for i, score in enumerate(scores):
+        row: dict = {"score": score}
+        # Only the top three are read; below that the lookup is pure cost.
+        if i < 3 and i < len(entries):
+            row["identity"] = _identity_score(entries[i], query_joined, raw_query)
+        rows.append(row)
+    return rows
 
 
 def _bm25_score(sym: dict, query_terms: list[str], idf: dict[str, float], avgdl: float,
@@ -473,6 +531,10 @@ def _bm25_breakdown(sym: dict, query_terms: list[str], idf: dict[str, float], av
     out["identity"] = identity
     if identity >= 50.0:
         out["identity_type"] = "exact"
+    elif identity >= 40.0:
+        # #458: the query matched only after tokenization folded case,
+        # underscores and punctuation away. Still a match, not an exact one.
+        out["identity_type"] = "normalized"
     elif identity >= 30.0:
         out["identity_type"] = "prefix"
     elif identity >= 20.0:
@@ -1149,6 +1211,7 @@ def search_symbols(
         "_meta": meta,
     }
     from ..retrieval.confidence import attach_confidence as _attach_confidence
+    from ..retrieval.confidence import BM25_CEILING as _BM25_CEILING
     from ..retrieval.confidence import extract_ledger_features as _ledger_feats
     from ..retrieval.freshness import FreshnessProbe as _FreshnessProbe
     from ..storage.token_tracker import record_ranking_event as _record_ranking_event
@@ -1170,8 +1233,27 @@ def search_symbols(
     if _runtime_summary:
         meta["runtime_freshness"] = _runtime_summary
     _conf_input = [{"score": s} for s in _conf_scores]
-    _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
-    _feat = _ledger_feats(_conf_input)
+    # `sort_by` decides the scale, and it is not always BM25. `centrality`
+    # ranks by PageRank, which sums to 1 across FILES — a top file lands
+    # near 0.05, so the BM25 curve graded the most central symbol in the
+    # repo at strength ~0.01. Its honest ceiling is the most central file
+    # there is. `combined` adds PageRank x100 to BM25 and stays BM25-scaled.
+    if sort_by == "centrality":
+        _conf_ceiling = max(pagerank.values(), default=0.0) or _BM25_CEILING
+    else:
+        _conf_ceiling = _BM25_CEILING
+    _attach_confidence(
+        result, _conf_input, is_stale=_probe.repo_is_stale,
+        score_ceiling=_conf_ceiling,
+    )
+    # v1.108.272 (#440). Pre-packing entries, matching `_conf_scores` and the fusion
+    # exit: the packer can drop rows the ranking did produce, and `identity_hit`
+    # describes what the ranking found.
+    _feat = _ledger_feats(
+        _ledger_identity_rows(
+            _conf_scores, [e for _, _, e in _sorted_heap], query_terms, query
+        )
+    )
     _record_ranking_event(
         # v1.108.188: the store this call was told to use, not whichever one the
         # first savings write of the process happened to pin.
@@ -1572,8 +1654,20 @@ def _search_symbols_semantic(
     if _runtime_summary:
         meta["runtime_freshness"] = _runtime_summary
     _conf_input = [{"score": s} for s in _conf_scores]
-    _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
-    _feat = _ledger_feats(_conf_input)
+    # Bounded at 1.0: `semantic_only` scores are a raw cosine, and the hybrid
+    # score is `(1-w)*lexical_norm + w*cos` where BOTH terms are already
+    # normalized to [0,1]. On the BM25 curve a 0.82 cosine read as strength
+    # 0.185 — a strong hit graded as a weak one.
+    from ..retrieval.confidence import COSINE_CEILING as _COSINE_CEILING
+    _attach_confidence(
+        result, _conf_input, is_stale=_probe.repo_is_stale,
+        score_ceiling=_COSINE_CEILING,
+    )
+    # v1.108.272 (#440). `top` is pre-packing and already ordered, so its symbols line
+    # up with `_conf_scores` positionally.
+    _feat = _ledger_feats(
+        _ledger_identity_rows(_conf_scores, [s for _, s in top], query_terms, query)
+    )
     _record_ranking_event(
         # v1.108.188: the store this call was told to use, not whichever one the
         # first savings write of the process happened to pin.
@@ -1952,10 +2046,14 @@ def _search_symbols_fusion(
         meta["runtime_freshness"] = _runtime_summary
     # v1.108.187. `_ledger_feats` reads `identity`/`identity_match` off these rows and
     # this input carried neither, so `identity_hit` was recorded False on every fusion
-    # row regardless of what the identity channel found. Unlike the non-fusion paths,
-    # whose rows carry `identity` from `_identity_score`, the fused rows never get
-    # that key. The channel's own `raw_scores` is the answer, and it admits only
-    # symbols scoring above zero.
+    # row regardless of what the identity channel found. The channel's own `raw_scores`
+    # is the answer, and it admits only symbols scoring above zero.
+    #
+    # ⚠ v1.108.272 (#440). This comment used to say the non-fusion paths' rows "carry
+    # `identity` from `_identity_score`", as though fusion were the lone offender. That
+    # was wrong: they carried the key nowhere `extract_ledger_features` looks, and had
+    # the same defect for the same reason. Fixed at both exits via
+    # `_ledger_identity_rows`. Reported by @rknighton.
     #
     # ⚠ Fed to the LEDGER only, not to `attach_confidence`. `compute_confidence`
     # sniffs the same key when no `has_identity_match` is passed and scores it 1.0
@@ -1963,7 +2061,15 @@ def _search_symbols_fusion(
     # confidence of every fusion search. That is its own change with its own
     # justification, not a side effect of recording a column.
     _conf_input = [{"score": s} for s in _conf_scores]
-    _attach_confidence(result, _conf_input, is_stale=_probe.repo_is_stale)
+    # A WRR score tops out at sum(weights)/(k+1) — ~0.049 for three unit-weight
+    # channels, against BM25's tens. Grading it on the BM25 curve reported
+    # near-zero strength for a perfect fused hit, which then drove the weight
+    # tuner the wrong way; see retrieval/confidence.py.
+    from ..retrieval.signal_fusion import fused_score_ceiling as _fused_ceiling
+    _attach_confidence(
+        result, _conf_input, is_stale=_probe.repo_is_stale,
+        score_ceiling=_fused_ceiling(channels, smoothing=smoothing, weights=weights),
+    )
     _id_raw = getattr(id_ch, "raw_scores", None) or {}
     _feat = _ledger_feats([
         {"score": fr.score, "identity": _id_raw.get(fr.symbol_id, 0.0)}

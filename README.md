@@ -15,6 +15,7 @@ Works with **Claude Code**, **Cursor**, **VS Code**, **Codex CLI**, **Windsurf**
 ![License](https://img.shields.io/badge/license-dual--use-blue)
 ![MCP](https://img.shields.io/badge/MCP-compatible-purple)
 ![Local-first](https://img.shields.io/badge/local--first-yes-brightgreen)
+[![Issues closed](https://img.shields.io/github/issues-closed/jgravelle/jcodemunch-mcp?label=issues%20closed&color=brightgreen)](https://github.com/jgravelle/jcodemunch-mcp/issues?q=is%3Aissue+is%3Aclosed)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20102349.svg)](https://doi.org/10.5281/zenodo.20102349)
 
 <!-- mcp-name: io.github.jgravelle/jcodemunch-mcp -->
@@ -136,7 +137,7 @@ Want to skip initial indexing for popular frameworks? Pre-built **starter packs*
 - **Retrieve one symbol instead of loading a file.** `get_symbol_source` returns the exact function body, byte-precise, for the majority of edits that touch one function in a 700-line file (~95% savings on that read).
 - **Assemble a whole task's context in one call.** `assemble_task_context` classifies the task intent, extracts anchor symbols, and runs the right tool sequence under one token budget. `plan_turn` routes the turn before the first read.
 - **Ask structural questions grep can't answer.** `find_importers`, `get_blast_radius`, `get_call_hierarchy`, `find_dead_code`, `get_changed_symbols`, `get_hotspots`, `search_ast` anti-pattern sweeps, and more.
-- **Preflight risky changes.** `check_edit_safe`, `check_delete_safe`, `get_pr_risk_profile`, and `plan_refactoring` with edit-ready `{old_text, new_text}` blocks.
+- **Preflight risky changes, and know when to stop.** `check_edit_safe`, `check_delete_safe`, `get_pr_risk_profile`, and `plan_refactoring` with edit-ready `{old_text, new_text}` blocks. The two safety checks return `stop_rule.terminal`: true means no further jcodemunch call moves the verdict, so re-running `find_importers` or `check_references` to be sure is wasted work. It means final, not safe. False names the specific thing that would change the answer.
 - **Trust the answers.** Calibrated confidence scores, freshness flags, coverage contracts on absence claims, compiler-verified references via SCIP import, and automatic secret redaction before anything reaches the LLM.
 - **Keep the index fresh automatically.** Watch modes, agent hooks, and a VS Code extension close the staleness gap.
 
@@ -145,9 +146,9 @@ That's the highlight reel. The complete tour of 90+ tools, the MUNCH compact wir
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.241](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.241)** (2026-08-04) — offloadable-work annotation, off by default
-- **[v1.108.240](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.240)** (2026-08-04) — `fresh` stops meaning "we could not find out"
-- **[v1.108.239](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.239)** (2026-08-04) — a YAML key keeps its own name
+- **[v1.108.279](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.279)** (2026-08-14) — A machine's language is not English and its bytes are not UTF-8
+- **[v1.108.278](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.278)** (2026-08-14) — `exact` must mean exact, and a guardrail must not be its own baseline
+- **[v1.108.277](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.277)** (2026-08-13) — Reachability is not only the import graph, and liveness is not only the PID
 <!-- WHATSNEW:END -->
 
 ---

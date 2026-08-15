@@ -804,11 +804,63 @@ zero mandatory dependency. Measured 1942 ms → 2.9 ms warm on 30,479 × 384.
 disagreeing on ordering — now describes **production code**, not parked design.
 And measured here on a deliberately near-tied synthetic 4,000-vector corpus, the
 two shipped lanes **disagreed at rank 0**: two installs of the same version
-ranking differently based only on whether NumPy was importable. @rknighton's
-zero-disagreement result on real corpora is the counterweight, and both belong
-together — the hazard is real in principle and does not fire in practice on
-Django, FastAPI or jcm. **The tie-break key shipped in v1.108.228 on the strength
-of that**, which is a better reason than the one this section originally gave it.
+ranking differently based only on whether NumPy was importable. **The tie-break
+key shipped in v1.108.228 on the strength of that**, which is a better reason than
+the one this section originally gave it.
+
+⚠⚠ **CORRECTION 2026-08-08. This paragraph used to answer that finding with
+@rknighton's "zero disagreement on real corpora", and that number no longer
+exists — he [withdrew it himself](https://github.com/jgravelle/jcodemunch-mcp/issues/398#issuecomment-5175071271)
+on 2026-08-04, because the packet had compared its exact baseline against a local
+float32 certification candidate and **the shipped NumPy-absent lane never ran**.
+We said on the issue the same day that the synthetic rank-0 finding "stands
+unrebutted, and we'll record it that way rather than as contested" — and then left
+the withdrawn zero standing here as its counterweight for four days. A retracted
+result is not weaker evidence; it is none, and quoting one to make our own hazard
+look inert is worse than having no counterweight at all.**
+
+**The real production-lane comparison, pinned to `v1.108.228`
+([reported 2026-08-08](https://github.com/jgravelle/jcodemunch-mcp/issues/398#issuecomment-5228065764)).**
+Shipped NumPy-present against shipped NumPy-absent, the four dimensions reported
+separately as asked:
+
+| dimension | ranking problems | repeated lane pairs |
+| --- | ---: | ---: |
+| rank-0 difference | 0 of 12 | 0 of 120 |
+| ordered top-k difference | 0 of 12 | 0 of 120 |
+| top-k membership difference | 0 of 12 | 0 of 120 |
+| **exact-tie partition difference** | **8 of 12** | **80 of 120** |
+
+Supplemented by 5,000 mechanically generated queries over the same three frozen
+indexes: **no query changed its first result at any depth**, while ordered-list
+differences appear below rank 0 (5 at depth 5, rising to 114 at depth 100) and
+tie partitions inside the retained top 100 differ for 130 of 5,000.
+
+⚠ **State this as "no rank-0 difference on these corpora", never as "does not
+fire in practice".** It does fire: below rank 0, and on tie partitions in most
+problems. The earlier phrasing was true of the withdrawn number and is false of
+this one. @rknighton draws the line himself and we should not draw it looser than
+its author: the evidence supports keeping the faster lane, and it does not support
+claiming the lanes are equivalent, that rank 0 can never change, or that the
+production incidence is zero. The synthetic capability is not in question either —
+his own replay reproduces our four-symbol case across 24 insertion orders and 50
+fresh processes, and 3,211 of 10,002 boundary-targeted geometric cases change
+rank 0.
+
+⚠ **OPEN QUESTION, and it is ours: does the `.228` tie-break key touch this hazard
+at all?** `(-score, symbol_id)` makes ordering deterministic *given* a set of
+scores, which is exactly what bucket (1) needed. But an exact-tie partition
+difference means the two lanes disagree about which items are equal in the first
+place, and no tie-break key reconciles that. The credit this section gives `.228`
+above may therefore be for a different defect than the one the 8-of-12 row
+describes. Asked on the issue; not answered here.
+
+⚠ **The 33-query screen in the earlier packet is retired, by its own author's
+measurement.** Against the completed 5,000-query replay it scored **15% precision
+and 4.4% sensitivity** (5 of 33 nominations real, 109 of 114 real differences
+missed), because it emulated both lanes inside NumPy instead of running them.
+Nothing above rests on it. Recorded because a cheap screen that nominates a subset
+for full replay is a pattern we would otherwise be tempted to reuse.
 
 **Lane 3 (certified uncertainty-set rescoring) is PARKED, and the premise to
 re-examine is its own.** It exists to make an approximate scorer safe by
@@ -823,7 +875,15 @@ concern it was for.
 corpus, one logical candidate row each. The gate never specified a query count,
 and picking one now — after seeing a result we like — is exactly the move the
 "neither side picks the bar after seeing results" rule forbids. It bounds how
-strongly the zero-disagreement figure generalises; it does not bound the verdict.
+strongly the breadth figures generalise; it does not bound the verdict.
+
+⚠ **The query-count limit is narrower than it was, but it has not gone away.**
+The 2026-08-08 comparison adds 12 ranking problems and a 5,000-query replay, and
+the 120 repeated lane pairs demonstrate stability rather than 120 independent
+situations. Those queries are mechanically generated from indexed symbols, not
+user traffic and not complete tool calls, over three frozen corpora. **A
+production-rate estimate still does not exist**, and would need representative
+real usage across enough users and time.
 
 ---
 
@@ -1057,6 +1117,62 @@ in maintenance practice #5 — **did not survive measurement**; see the close
 condition above. The advisory is still worth having, but it answers a narrower
 question than the one that prompted it, and the example that sold it was not an
 example of it.
+
+---
+
+## Split `server.py` — the dispatcher is past every reasonable file limit
+
+`src/jcodemunch_mcp/server.py` is **10,549 lines / ~513 KB**. On 2026-08-08 it
+crossed `DEFAULT_MAX_FILE_SIZE` (512,000 bytes) by **532 bytes**, and this
+project's own MCP entrypoint stopped entering this project's own index. The file
+grew another 1,239 bytes in the day it took to write #429 up.
+
+v1.108.269 shipped the observability and the escape hatch: an oversize file is
+now named in the indexing response instead of surfacing as a counter inside a
+refused verdict, `max_size` is reachable over MCP, and `index_repo` stopped
+hardcoding the cap. **None of that is this entry.** It made the repository
+navigable; the file is still the size it was.
+
+⚠ **Raising a limit is not a fix when the file is the problem.** The cap moved
+once already for this class of file (v1.108.193, then v1.108.197 for the
+per-project key). Moving it again buys the same amount of time and teaches the
+next person to move it a third time. `server.py` will cross whatever ceiling
+replaces 512 KB.
+
+⚠⚠ **This is the highest-blast-radius refactor available in this repository**,
+which is why it is a plan and not an in-flight issue. `server.py` owns tool
+registration, the `call_tool` dispatch chain, CLI subcommand dispatch, auth and
+rate-limit middleware, all three transports, and the Counter front door. Several
+guarantees are load-bearing *because* they sit at a single chokepoint —
+`evidence/producers.py` mints receipts from the `call_tool` chokepoint
+specifically so it is immune to early returns by construction, and the response
+size ceiling (#425) wraps that same dispatcher. A split that relocates a
+chokepoint without relocating its immunity argument silently voids it.
+
+It is also the most-edited file in the project, so any split is a merge-conflict
+event for every branch open at the time.
+
+### Close conditions
+
+- No single module in `src/jcodemunch_mcp/` exceeds `DEFAULT_MAX_FILE_SIZE`, with
+  the default cap **unchanged** — raising the limit does not satisfy this.
+- Indexing this repository reports `too_large: 0` and `complete: true`, so
+  absence is citable across the whole tree including the entrypoint.
+- The `call_tool` chokepoint keeps a single ingress. If dispatch is split, the
+  receipt-minting and response-cap wrappers still see every call, and a test
+  asserts an exit cannot bypass them.
+- Tool count and every `inputSchema` are byte-identical across the split. A
+  schema that changes shape during a file move is a surface change wearing a
+  refactor's clothes.
+
+### Provenance
+
+Found in-house and filed by jjg as
+[#429](https://github.com/jgravelle/jcodemunch-mcp/issues/429) on 2026-08-08,
+alongside the two defects that shipped as v1.108.269. Parked here rather than
+left open per the standing rule that an issue opens when work starts or a user is
+blocked; accepted design with no start date is a plan. #429's close comment
+points here, so the promise that this is tracked resolves to a real entry.
 
 ---
 

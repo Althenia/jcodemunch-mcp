@@ -77,11 +77,60 @@ Secret files are never stored in the index or cached content directory.
 
 ---
 
+## Response-Level Secret Redaction
+
+Secret *exclusion* above keeps credential **files** out of the index. Secret
+*redaction* is the second, independent control: before any tool response leaves
+the server, it is swept for credential-shaped strings and matches are masked, so
+a secret that reached the index some other way does not reach the model's
+context window.
+
+It runs in the central `call_tool` dispatcher, so it covers every tool by
+construction rather than by each tool remembering. Patterns cover AWS access and
+secret keys, GCP service-account keys, Azure storage keys and client secrets,
+JWTs, bearer tokens, GitHub tokens and fine-grained PATs, Anthropic, OpenAI and
+Slack keys, PEM private keys, generic `api_key`-shaped assignments, and private
+IPv4 addresses.
+
+**Default: enabled.** Set `JCODEMUNCH_REDACT_RESPONSE_SECRETS=0` to disable it.
+
+### Three tools are exempt, deliberately
+
+`get_file_content`, `get_symbol_source` and `get_context_bundle` are **skipped**
+(`server.py`, `_SOURCE_DUMP_TOOLS`). These are the tools whose job is to return
+raw cached source, and the exemption is a considered tradeoff on two grounds: a
+per-byte regex sweep over payloads that can run to hundreds of KB is latency
+spent for no gain, and anything those tools return is the user's own checked-in
+code being read back to them, not a credential crossing a boundary it had not
+already crossed.
+
+⚠ **The consequence, stated plainly, because it is the gap a reader needs:** a
+credential hardcoded inside an ordinary source file is caught by neither control.
+Not by the filename classifier, because the filename is ordinary; not by the
+redactor, because those three paths are exempt. If that matters in your
+environment, the mitigations are the ones you would use anyway — secret scanning
+in CI, and pre-commit hooks — because the credential is in your repository
+regardless of what this server does with it.
+
+This exemption is a performance and scope decision, not a claim that source
+files never contain secrets.
+
 ## File Size Limits
 
-* **Default maximum:** 500 KB per file (configurable via `max_file_size`).
-* Files exceeding the limit are skipped during discovery.
+* **Default maximum:** 500 KB per file (configurable via `max_file_size` in config, the `JCODEMUNCH_MAX_FILE_SIZE` environment variable, or the `max_size` argument on a single `index_folder` / `index_repo` call).
+* Files exceeding the limit are skipped during discovery, and the indexing response names them in `warnings`. A skipped file is treated as **withheld**, not excluded: coverage reports `complete: false` and absence claims over the corpus are refused, because "we never read that file" and "that symbol does not exist" are different answers.
 * A configurable **file count limit** (default: 500 files) prevents runaway indexing of extremely large repositories. Can be overridden using the `JCODEMUNCH_MAX_INDEX_FILES` environment variable.
+
+---
+
+## Cache Directories
+
+* jCodeMunch honours the [Cache Directory Tagging Specification](https://bford.info/cachedir/). A directory containing a `CACHEDIR.TAG` file whose first 43 bytes are `Signature: 8a477f597d28d172789f06886806bc55` is pruned from the walk along with everything beneath it.
+* **The signature is verified.** A file merely named `CACHEDIR.TAG` excludes nothing.
+* This is the only exclusion rule declared by the *writer* of a directory rather than listed by us, so a tool that writes derived data into your tree is honoured without jCodeMunch knowing its name, and it applies to cache directories that are not dot-directories.
+* Pruned directories are counted as `cache_dir` in `discovery_skip_counts`. This is an ordinary exclusion, not a withholding: a tagged directory is regenerable derived data by its own declaration, so absence claims over the remaining corpus stay citable.
+* Disable with `respect_cachedir_tag: false` or `JCODEMUNCH_RESPECT_CACHEDIR_TAG=0` if you tag a directory you nonetheless want indexed.
+* Applies to local folder indexing. GitHub repository indexing does not honour the tag, because validating the signature requires the file's content and the tree listing carries only paths and sizes.
 
 ---
 
@@ -256,9 +305,10 @@ The performance and ranking telemetry introduced in v1.74.0–v1.80.0 is
 * `~/.code-index/embed_canary.json` (16-string drift canary) is written
   only by an explicit `check_embedding_drift(capture=true)` invocation.
 * No telemetry is sent over the network. The community token-savings
-  counter (`share_savings`) is unrelated and only sends an integer
-  delta plus an anonymous UUID — never query strings, paths, or repo
-  names. Disable with `JCODEMUNCH_SHARE_SAVINGS=0`.
+  counter (`share_savings`) is unrelated and sends exactly three fields:
+  an integer delta, an integer lifetime total, and an anonymous UUID —
+  never query strings, paths, repo names, or any configuration value.
+  Disable with `JCODEMUNCH_SHARE_SAVINGS=0`.
 * Stored ranking events include the **literal query string** (truncated
   result-id list, no source code). Treat the storage path with the same
   care as any local source you index.
@@ -272,6 +322,7 @@ The performance and ranking telemetry introduced in v1.74.0–v1.80.0 is
 | Path traversal validation | `security.validate_path()`     | Always enabled              |
 | Symlink escape protection | `security.is_symlink_escape()` | Symlinks skipped by default |
 | Secret file exclusion     | `security.is_secret_file()`    | Always enabled              |
+| Response secret redaction | `redact.redact_dict()` in the `call_tool` dispatcher | Enabled; `JCODEMUNCH_REDACT_RESPONSE_SECRETS=0` disables. **Exempt:** `get_file_content`, `get_symbol_source`, `get_context_bundle` |
 | Binary file detection     | `security.is_binary_file()`    | Always enabled              |
 | File size limit           | File discovery pipeline        | 500 KB                      |
 | File count limit          | File discovery pipeline        | 500 files                   |
@@ -297,6 +348,7 @@ Everything jCodeMunch does beyond answering a tool call is listed here. All of i
 - **Local index storage.** Indexes live at `~/.code-index/` (override with `CODE_INDEX_PATH`). Delete the directory and every trace of indexing is gone.
 - **Live session journal.** While the server runs, it periodically writes a small `_session_live.json` in `~/.code-index/` recording the files and searches the agent touched this session (paths and query strings only, no file contents). It exists so the out-of-process PreCompact hook can restore session orientation after context compaction. Throttled, atomically written, overwritten in place; disable with `JCODEMUNCH_LIVE_JOURNAL=0`.
 - **Process presence file.** While a server runs, it writes one small JSON file at `~/.code-index/_processes/<pid>.json` recording its own PID, transport, version, start time, and the launching client's name — nothing about your code, repos, or queries. It exists so `get_session_stats` can tell you how many jCodeMunch servers are sharing one index store: some MCP clients don't reap stdio servers at session end, and they accumulate invisibly (one user found 25+ holding ~17 GB between them). The file is removed on exit, and any reader prunes entries whose process is no longer alive, so a hard kill leaves nothing behind. No daemon, no timer, no network.
+- **Transcript root registry.** The server (at startup) and the hooks (when one fires) append the directory Claude Code writes this session's transcripts to — `$CLAUDE_CONFIG_DIR/projects`, or the grandparent of the hook payload's `transcript_path` — to a small JSON list at `~/.code-index/_transcript_roots.json`. **Directory paths only**: no transcript contents, no repo paths, no queries, no file contents, and nothing about your code. It exists so `jcodemunch-mcp receipt` can count the sessions you actually ran: it used to scan a hardcoded `~/.claude/projects`, so anyone running a second `CLAUDE_CONFIG_DIR` profile saw a ledger missing most of their calls (one user measured 12 of 348). No daemon, no timer, no network. `receipt --roots` prints exactly what is registered; delete the file to clear it, and delete `~/.code-index/` to erase everything.
 - **Local performance ledger — off by default.** With `perf_telemetry_enabled: true` in `config.jsonc`, the server records tool latencies, ranking events (query strings and returned symbol ids), and one per-session row of delivery counts (`session_yield`: how many symbols were delivered, how many of those were the same symbol twice, and an estimated token count for the repeats) into `~/.code-index/telemetry.db`. It is what `analyze_perf`, `suggest_corrections`, and the weight tuner read. **This database never leaves your machine** — the anonymous savings meter above sends aggregate counters only and never reads this file. Off unless you turn it on; delete the file to erase it.
 - **User-invoked network calls.** A few commands you run explicitly reach the network. None run in the background or fire on a plain import; each happens only when you invoke the command:
   - **License validation.** `license`, `org-rollup`, and `install-pack --license` send your license key to `validate.php` on `j.gravelle.us` to confirm it. The key travels in the request body / a header, never the URL, so it can't land in intermediary access logs. This gates only the team `org-rollup` feature; the individual tools never call it.
@@ -304,7 +356,14 @@ Everything jCodeMunch does beyond answering a tool call is listed here. All of i
   - **Embedding-model download.** `download-model` — and the first semantic encode when the `[local-embed]` extra is installed — downloads the ONNX model (`all-MiniLM-L6-v2`, ~23 MB, one time) from `huggingface.co`; after that, semantic search needs no network.
   - **Team savings report.** `org-report` (team SKU) sends **only** `org_id`, `seat_id`, `tokens_saved`, `usd`, `calls`, and a date. No code, no file paths, no queries, no repo names. It goes to a host **you** choose, on your own network, never to a jMunch server. With no `--endpoint` or `JCODEMUNCH_ORG_ENDPOINT` set it writes to a local file (`org_savings.db`) and nothing leaves the machine at all. ⚠ **`seat_id` defaults to your machine's hostname**, which often contains a person's name: set `JCODEMUNCH_CLIENT_ID` to send an identifier of your choosing instead. It runs only when you invoke it. There is no scheduler and no background reporting.
 
-- **Accepting reports from other machines. Off by default, behind three explicit gates.** One machine can act as the "org host" that collects the reports above, via `POST /org/report`. This is the only route in jCodeMunch that accepts writes from another computer, so it is gated three ways: the HTTP transport has to be running at all (`serve --transport streamable-http`), `org_ingest_enabled` must be turned on (it defaults to **false**, via `JCODEMUNCH_ORG_INGEST_ENABLED=1`), and the request must carry your `JCODEMUNCH_HTTP_TOKEN` bearer. It stores exactly the six fields listed above, in `org_savings.db` on that host. A default install accepts nothing, listens for nothing, and needs no action from you to keep it that way.
+- **Accepting reports from other machines. Off by default, behind explicit gates.** jCodeMunch has **four** routes that accept writes from another computer. All four are off in a default install, all four require the HTTP transport to be running at all (`serve --transport streamable-http` or `--transport sse`), and all four require the request to carry your `JCODEMUNCH_HTTP_TOKEN` bearer.
+
+  - **`POST /org/report`** — one machine acting as the "org host" that collects the seat reports above. Gated a third way by `org_ingest_enabled`, which defaults to **false** (`JCODEMUNCH_ORG_INGEST_ENABLED=1`). It stores exactly the six fields listed above, in `org_savings.db` on that host.
+  - **`POST /runtime/otel`**, **`POST /runtime/sql`**, **`POST /runtime/stack`** — live ingestion of runtime traces, the same data `import-trace` accepts from a file. Gated a third way by `runtime_ingest_enabled`, which defaults to **false** (`JCODEMUNCH_RUNTIME_INGEST_ENABLED=1`). Bodies are capped (`JCODEMUNCH_RUNTIME_INGEST_MAX_BODY_BYTES`, 5 MB default, checked before *and* after decompression as a gzip-bomb guard) and PII is redacted at the ingest chokepoint unless you turn that off.
+
+  With the token unset these routes return **503 rather than running unauthenticated** — a missing token disables the endpoint instead of opening it. A default install accepts nothing, listens for nothing, and needs no action from you to keep it that way.
+
+  ⚠ Until v1.108.274 this list named `POST /org/report` and described it as the sole remote-write route. That was true when written and was not revisited when the runtime-ingest routes were added. Reported by [@elfrost](https://github.com/elfrost) ([#449](https://github.com/jgravelle/jcodemunch-mcp/issues/449)). The count is now pinned by `tests/test_security_disclosure.py`, because the promise this section makes is that the enumeration is *complete*, and a sentence cannot keep that promise on its own.
 
 Beyond the user-invoked calls listed above, the base package makes no other network calls and leaves no other persistent processes. AI-summary extras call their configured provider's API only when you enable them — see the [extras matrix below](#optional-extras--system-surfaces-each-pulls-in).
 

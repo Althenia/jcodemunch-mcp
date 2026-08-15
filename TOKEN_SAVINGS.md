@@ -6,8 +6,14 @@ jCodeMunch saves tokens on two independent axes:
 2. **Encoding (MUNCH)** — responses that do go to the agent are packed in a
    purpose-built compact wire format, not verbose JSON.
 
-The retrieval axis is the big number (typically 95%+ on code-reading tasks);
-encoding is a smaller-but-independent multiplier on whatever traffic remains.
+The retrieval axis is the big number: **86-99% on code-reading tasks, 96.4%
+average (27.9x)** against a grep-and-read agent across 15 tasks and 3 pinned
+repositories. Quote the range, not the average alone: per-query results span
+7.3x to 84.3x, so the aggregate on its own overstates the low end. The larger
+99.6% / 237.3x figure is against a *read-every-file* baseline, which is a
+ceiling nobody actually pays; see `benchmarks/METHODOLOGY.md` for why both are
+published and which one to lead with. Encoding is a smaller-but-independent
+multiplier on whatever traffic remains.
 They compose — every byte saved on the wire is a byte the agent doesn't pay
 to read.
 
@@ -137,6 +143,8 @@ Savings are stored as **tokens**, never as currency. Dollar valuations are appli
 ### The lifetime meter and the `receipt` CLI
 
 `~/.code-index/_savings.json` holds the lifetime total plus per-day buckets, survives client reinstalls, and is multi-process safe. The `jcodemunch-mcp receipt` CLI reports it alongside windowed figures computed from your own local transcripts (`--since` / `--until` / `--by-day`; `--model` picks the valuation rate, `--rates` lists the price table). `receipt --export json` includes a `savings_provenance` block chaining the figures to the committed, CI-re-run measurement artifacts in `benchmarks/provenance/` — the report carries its own receipts. Full design: [UNDER_THE_HOOD.md](UNDER_THE_HOOD.md) Chapter 4.
+
+The windowed figures come from wherever Claude Code actually wrote your transcripts, not just the default profile. `CLAUDE_CONFIG_DIR` relocates that tree, so `receipt` scans a **union**: the default `~/.claude/projects`, the current `CLAUDE_CONFIG_DIR`, any roots earlier sessions registered (see [SECURITY.md](SECURITY.md#background-behavior-fully-disclosed)), deduplicated by session UUID so a copied or symlinked tree never double-counts. `--projects-root` remains an override for pinning a scan to a known tree, and is now repeatable so it can name every profile at once. `receipt --roots` prints the exact list that will be walked.
 
 ---
 

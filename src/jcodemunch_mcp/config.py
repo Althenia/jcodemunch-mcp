@@ -13,6 +13,12 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _GLOBAL_CONFIG: dict[str, Any] = {}
+# True once `load_config()` has run in this process. Read by `get()`, which
+# lazily loads rather than answering from `default` for a config it never read
+# (#426). A separate flag rather than truth-testing `_GLOBAL_CONFIG` because
+# "loaded" and "non-empty" are different questions, and the emptiness test alone
+# would re-load on every read for any state that legitimately produced `{}`.
+_CONFIG_LOADED = False
 _PROJECT_CONFIGS: dict[str, dict[str, Any]] = {}
 _PROJECT_CONFIG_HASHES: dict[str, str] = {}
 # Repo keys whose _PROJECT_CONFIGS entry is a MIRROR of global that WE wrote
@@ -29,6 +35,8 @@ ENV_VAR_MAPPING = {
     "JCODEMUNCH_TRUSTED_FOLDERS": "trusted_folders",
     "JCODEMUNCH_TRUSTED_FOLDERS_WHITELIST_MODE": "trusted_folders_whitelist_mode",
     "JCODEMUNCH_MAX_FILE_SIZE": "max_file_size",
+    "JCODEMUNCH_RESPECT_CACHEDIR_TAG": "respect_cachedir_tag",
+    "JCODEMUNCH_RESPONSE_MAX_BYTES": "response_max_bytes",
     "JCODEMUNCH_MAX_FOLDER_FILES": "max_folder_files",
     "JCODEMUNCH_MAX_INDEX_FILES": "max_index_files",
     "JCODEMUNCH_STALENESS_DAYS": "staleness_days",
@@ -333,6 +341,8 @@ DEFAULTS = {
     "trusted_folders": [],
     "trusted_folders_whitelist_mode": True,
     "max_file_size": 512000,
+    "respect_cachedir_tag": True,
+    "response_max_bytes": 1048576,
     "max_folder_files": 2000,
     "max_index_files": 10000,
     "staleness_days": 7,
@@ -490,6 +500,8 @@ CONFIG_TYPES = {
     "trusted_folders": list,
     "trusted_folders_whitelist_mode": bool,
     "max_file_size": int,
+    "respect_cachedir_tag": bool,
+    "response_max_bytes": int,
     "max_folder_files": int,
     "max_index_files": int,
     "staleness_days": int,
@@ -700,9 +712,16 @@ def _validate_type(key: str, value: Any, expected_type: type | tuple) -> bool:
     return isinstance(value, expected_type)
 
 
-def load_config(storage_path: str | None = None) -> None:
-    """Load global config.jsonc. Called once from main()."""
-    global _GLOBAL_CONFIG
+def load_config(storage_path: str | None = None, create_missing: bool = True) -> None:
+    """Load global config.jsonc. Called once from main().
+
+    `create_missing=False` suppresses the auto-creation of a default config file
+    below. Used by the lazy load in `get()` (#426): a READ must never be the
+    thing that writes a file into the user's storage directory. Value resolution
+    is otherwise identical, because the created file is the template and the
+    template is `DEFAULTS`.
+    """
+    global _GLOBAL_CONFIG, _CONFIG_LOADED
 
     # Determine config path
     if storage_path:
@@ -714,7 +733,7 @@ def load_config(storage_path: str | None = None) -> None:
     # defaults to the token-lean "counter" front door; an existing install that
     # merely lacks a config file keeps the historical "full" surface, so a
     # package update never silently collapses a user's tool surface.
-    if not config_path.exists():
+    if not config_path.exists() and create_missing:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         content = _fresh_config_content(config_path.parent)
         config_path.write_text(content, encoding="utf-8")
@@ -794,6 +813,8 @@ def load_config(storage_path: str | None = None) -> None:
 
     # Apply env var fallback for keys not explicitly set in config
     _apply_env_var_fallback(_explicit_keys)
+
+    _CONFIG_LOADED = True
 
 
 def _parse_env_value(value: str, expected_type: type | tuple, key: str | None = None) -> Any:
@@ -936,12 +957,76 @@ def _resolve_repo_key(repo: str) -> str | None:
     return None
 
 
+def _ensure_loaded() -> None:
+    """Load the global config if this process never has (#426).
+
+    Deliberately narrow. It fires ONLY for the state that means "nothing was
+    ever read": not loaded AND empty. Both halves are load-bearing:
+
+    - The flag alone would fire for a caller that populated `_GLOBAL_CONFIG`
+      directly (every test that stuffs a dict in does exactly this) and would
+      CLOBBER it on the next read.
+    - Emptiness alone would re-load on every read for any state that
+      legitimately resolves to `{}`, turning one file read into a per-key one.
+
+    ⚠ It does NOT displace the explicit `load_config()` calls. `main()` re-runs
+    it after `_setup_logging()` on purpose, so config warnings reach the
+    configured log destination; that call is unconditional and still emits them.
+    This only removes the ability to LOSE, it does not decide the ordering.
+
+    ⚠ Never raises. A read that starts failing is a worse defect than the silent
+    default this replaces, so a load failure falls through to `DEFAULTS`
+    behaviour exactly as before.
+    """
+    if _CONFIG_LOADED or _GLOBAL_CONFIG:
+        return
+    try:
+        # create_missing=False: a config READ must not write a file into the
+        # user's storage directory as a side effect.
+        load_config(create_missing=False)
+    except Exception:
+        logger.debug("Lazy config load failed; answering from defaults", exc_info=True)
+
+
 def get(key: str, default: Any = None, repo: str | None = None) -> Any:
-    """Get config value. If repo is given, uses merged project config."""
+    """Get config value, resolving project -> global -> default.
+
+    ⚠ v1.108.250 (#416 follow-up, @domis86): `_PROJECT_CONFIGS` holds ONLY the
+    keys a project's `.jcodemunch.jsonc` actually declares — it is an OVERLAY,
+    not a merged snapshot. Global is consulted HERE, on every read, so a key the
+    project file omits resolves live.
+
+    It used to hold `deepcopy(_GLOBAL_CONFIG)` overlaid with the project keys,
+    and this function returned `default` for anything missing from it. That is
+    two bugs wearing one costume:
+
+    1. ORDERING. The snapshot is taken whenever `load_project_config` runs. In
+       `config --check` that is BEFORE `load_config()` populates global, so the
+       copy captured an empty global and every undeclared key reported its
+       hardcoded default while `_detect_source` truthfully tagged the row
+       `[config]`. Indexing loads in the other order, so runtime behaviour was
+       correct and only the diagnostic lied — the exact inverse of #416.
+    2. STALENESS. A file-backed entry is excluded from the mirror refresh below,
+       so a later edit to global config was invisible to it forever.
+
+    Resolving at read time kills both: there is no snapshot to be taken early or
+    to go stale. Do NOT reintroduce a merge at load time to "save a lookup".
+
+    ⚠ v1.108.258 (#426): loads lazily when nothing has been loaded yet. Before,
+    a read in an unloaded process answered from `default` for EVERY env-mapped
+    key -- `JCODEMUNCH_MAX_FILE_SIZE=20000000` resolved as 512000 -- and the
+    caller could not tell "the value is 512000" from "I never read the config".
+    That silence had already produced three one-subcommand-at-a-time
+    `load_config()` patches in `server.py`; every subcommand dispatched above the
+    shared call was one edit from a fourth, and nothing failed loudly.
+    """
+    _ensure_loaded()
     if repo:
         resolved = _resolve_repo_key(repo)
-        if resolved and resolved in _PROJECT_CONFIGS:
-            return _PROJECT_CONFIGS[resolved].get(key, default)
+        if resolved:
+            project = _PROJECT_CONFIGS.get(resolved)
+            if project is not None and key in project:
+                return project[key]
     return _GLOBAL_CONFIG.get(key, default)
 
 
@@ -1098,7 +1183,11 @@ def load_project_config(source_root: str) -> None:
             project_config = json.loads(stripped)
 
             with _CONFIG_LOCK:
-                merged = deepcopy(_GLOBAL_CONFIG)
+                # ⚠ An OVERLAY of the project's own keys, NOT a merge over
+                # global. `get()` consults global at read time; baking a copy of
+                # it in here is what made `config --check` report defaults and
+                # made a later global edit invisible. See get()'s docstring.
+                overlay: dict[str, Any] = {}
                 for key, value in project_config.items():
                     if key in CONFIG_TYPES:
                         if _validate_type(key, value, CONFIG_TYPES[key]):
@@ -1143,47 +1232,47 @@ def load_project_config(source_root: str) -> None:
                                             Path(folder).expanduser().resolve()
                                         )
                                     valid_folders.add(expanded_folder)
-                                merged[key] = list(valid_folders)
+                                overlay[key] = list(valid_folders)
                             elif key == "server_output" and isinstance(value, str):
                                 normalized = _normalize_server_output(value)
                                 if normalized is not None:
-                                    merged[key] = normalized
+                                    overlay[key] = normalized
                             else:
-                                merged[key] = value
+                                overlay[key] = value
                         else:
                             logger.warning(
                                 "Project config key '%s' has invalid type. Using global default.",
                                 key,
                             )
-                _PROJECT_CONFIGS[repo_key] = merged
+                # A rejected key is simply absent from the overlay, so it falls
+                # through to global on read — which is what the warning promises.
+                _PROJECT_CONFIGS[repo_key] = overlay
                 _PROJECT_CONFIG_HASHES[repo_key] = content_hash
                 # File-backed, so no longer a mirror of global.
                 _PROJECT_CONFIG_MIRRORS.discard(repo_key)
         except Exception as e:
             logger.warning("Failed to load project config: %s", e)
             with _CONFIG_LOCK:
-                # A file exists but did not parse. The fallback is global, but
-                # this is NOT a mirror: the next call must retry the file.
-                _PROJECT_CONFIGS[repo_key] = deepcopy(_GLOBAL_CONFIG)
+                # A file exists but did not parse. An empty overlay means every
+                # key falls through to global on read. This is NOT a mirror:
+                # the next call must retry the file.
+                _PROJECT_CONFIGS[repo_key] = {}
                 _PROJECT_CONFIG_MIRRORS.discard(repo_key)
     else:
         with _CONFIG_LOCK:
-            # ⚠ v1.108.197: REFRESH, don't seed-once. A repo with no
-            # `.jcodemunch.jsonc` has nothing of its own to say, so its entry is
-            # a mirror of global — and a mirror that is only ever written on
-            # first sight stops being one the moment global changes. The old
-            # `if repo_key not in _PROJECT_CONFIGS` guard froze the snapshot
-            # taken at first index, so a later global change was invisible to
-            # every `get(..., repo=...)` read for that repo. Harmless while
-            # repo-scoped reads were rare; not harmless now that the three limit
-            # resolvers take `repo=` (#390).
+            # A repo with no `.jcodemunch.jsonc` has nothing of its own to say,
+            # so its overlay is empty and every key resolves against global at
+            # read time. v1.108.197 needed a REFRESH here because the entry was
+            # a frozen COPY of global that went stale the moment global changed;
+            # an empty overlay cannot go stale, so the refresh is now trivially
+            # correct rather than load-bearing.
             #
-            # ⚠ Refresh ONLY entries this branch wrote (`_PROJECT_CONFIG_MIRRORS`).
+            # ⚠ Still write ONLY entries this branch owns (`_PROJECT_CONFIG_MIRRORS`).
             # An entry installed by anyone else — a caller configuring a repo in
             # memory with no file on disk — is theirs. Overwriting it is data
             # loss wearing a cache-maintenance costume, and it is silent.
             if repo_key not in _PROJECT_CONFIGS or repo_key in _PROJECT_CONFIG_MIRRORS:
-                _PROJECT_CONFIGS[repo_key] = deepcopy(_GLOBAL_CONFIG)
+                _PROJECT_CONFIGS[repo_key] = {}
                 _PROJECT_CONFIG_MIRRORS.add(repo_key)
             _PROJECT_CONFIG_HASHES.pop(repo_key, None)
 
@@ -1238,6 +1327,7 @@ def is_language_enabled(language: str, repo: str | None = None) -> bool:
 
 def get_descriptions() -> dict:
     """Get the nested descriptions dict."""
+    _ensure_loaded()  # sibling reader of get(); same #426 hazard
     return _GLOBAL_CONFIG.get("descriptions", {})
 
 
@@ -1958,6 +2048,29 @@ def generate_template() -> str:
   //   prove absence -- the file is real, current and wanted, it just never
   //   entered the index. The default is deliberately conservative; raise it if
   //   your repo has large legitimate source files, and re-index.
+
+  // "respect_cachedir_tag": true,
+  //   Honour the Cache Directory Tagging Specification
+  //   (https://bford.info/cachedir/): prune any directory holding a
+  //   `CACHEDIR.TAG` whose first 43 bytes are the spec signature. The
+  //   signature is verified -- a file merely NAMED CACHEDIR.TAG does not
+  //   exclude anything.
+  //   Unlike every other exclusion here, this one is declared by whoever WROTE
+  //   the directory rather than listed by us, so a tool that drops a cache into
+  //   your tree is honoured without jcodemunch knowing its name, and it works
+  //   for caches that are not dotted. Pruned directories are counted as
+  //   `cache_dir` in `discovery_skip_counts`. Set false if you tag a directory
+  //   you nonetheless want indexed; only an explicit false disables it.
+
+  // "response_max_bytes": 1048576,
+  //   Ceiling on a SINGLE MCP tool response, in bytes, enforced at the
+  //   call_tool chokepoint. Over the cap the call returns a structured error
+  //   naming both the size and the limit -- never a shortened body presented as
+  //   complete, because a caller cannot tell the difference. This is a
+  //   RESPONSE limit and is deliberately separate from `max_file_size`, which
+  //   is an INDEXING limit; before this key existed the indexing cap bounded
+  //   reply size by coincidence, from another subsystem, with no test pinning
+  //   the relationship. Raise it if you genuinely need larger single replies.
 
   // "max_folder_files": 2000,
   //   Maximum number of files to index when indexing a local folder.

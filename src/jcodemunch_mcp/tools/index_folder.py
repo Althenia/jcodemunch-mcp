@@ -32,7 +32,9 @@ from ..security import (
     get_max_file_size,
     get_max_folder_files,
     get_extra_ignore_patterns,
+    get_respect_cachedir_tag,
     get_skip_directories,
+    is_cache_directory,
     SKIP_FILES
 )
 from ..storage import IndexStore
@@ -93,6 +95,7 @@ def _attach_cap_report(result: dict, cap: Optional[dict]) -> None:
         f"from the index. Raise max_folder_files in config.jsonc (or set "
         f"JCODEMUNCH_MAX_FOLDER_FILES) and re-index, or narrow the path."
     )
+
 
 #: Skip reasons where the file is REAL, CURRENT and WANTED, and we refused it
 #: anyway (v1.108.193, reported by @dkiaulakis). Every other reason describes a
@@ -318,6 +321,33 @@ def _path_safety_part_count(path: Path) -> int:
     return count
 
 
+def _is_shallow_windows_git_root(path: Path) -> bool:
+    r"""Return whether ``path`` is a Git root directly below a local drive.
+
+    ``C:\repo`` has a safety depth of two and normally trips the broad-root
+    guard. A ``.git`` directory or file at that exact path proves the caller
+    selected a working-tree root rather than the drive itself or a broad parent.
+    The corresponding POSIX case was considered and intentionally left unchanged
+    so this exception remains scoped to the reported Windows drive-root behavior.
+
+    ⚠ The depth check and the UNC check answer different questions and neither
+    is redundant with the other. ``_path_safety_part_count`` is a DEPTH rule;
+    ``not drive.startswith("\\\\")`` is a SCOPE rule. A UNC share root has one
+    real part and the depth helper adds one for the ``\\server\share`` anchor,
+    so it computes to exactly two -- the same value as ``C:\repo``. Dropping the
+    UNC test would therefore admit ``\\server\share`` itself, which #321/#322
+    classify as too broad whatever it happens to contain.
+    """
+    drive = str(path.drive)
+    return (
+        os.name == "nt"
+        and _path_safety_part_count(path) == 2
+        and bool(drive)
+        and not drive.startswith("\\\\")
+        and os.path.exists(path / ".git")
+    )
+
+
 @lru_cache(maxsize=512)
 def _is_trusted(
     folder_path: Path, trusted_folders: tuple, whitelist_mode: bool = True
@@ -401,6 +431,7 @@ class _IndexFilters:
     skip_dirs_regex: Optional[re.Pattern] = None
     check_binary: bool = True
     check_filename: bool = True
+    respect_cachedir_tag: bool = True
 
 
 def _build_index_filters(
@@ -413,6 +444,7 @@ def _build_index_filters(
     skip_dirs_regex: Optional[re.Pattern] = None,
     check_binary: bool = True,
     check_filename: bool = True,
+    respect_cachedir_tag: bool = True,
 ) -> _IndexFilters:
     """Bundle pre-computed filter config for ``_should_index_file``.
 
@@ -432,6 +464,7 @@ def _build_index_filters(
         skip_dirs_regex=skip_dirs_regex,
         check_binary=check_binary,
         check_filename=check_filename,
+        respect_cachedir_tag=respect_cachedir_tag,
     )
 
 
@@ -526,6 +559,13 @@ def _should_index_file(
             ancestor = ancestor / part
             if is_linked_worktree(ancestor):
                 return False, "nested_worktree", rel_path, None
+            # CACHEDIR.TAG on the fast path. The full walk prunes these in
+            # `os.walk`'s dirnames and never reaches here, exactly like the two
+            # checks above; this branch exists so a watchfiles event for a file
+            # that appeared inside a tagged cache does not enter the index by
+            # the back door. Third entry point, same rule as #429.
+            if cfg.respect_cachedir_tag and is_cache_directory(ancestor):
+                return False, "cache_dir", rel_path, None
 
     # 8. Gitignore (string-prefix specs, walk-order)
     if gitignore_specs and _is_gitignored_fast(resolved_str, gitignore_specs):
@@ -724,6 +764,7 @@ from ._utils import (
     PARSER_UPGRADE_WARNING,
     describe_unloadable_index,
     needs_parser_upgrade as _needs_parser_upgrade,
+    size_cap_warning as _size_cap_warning,
     stamp_incremental_outcome as _stamp_incremental_outcome,
 )
 from .package_registry import extract_package_names as _extract_package_names
@@ -1132,8 +1173,10 @@ def discover_local_files(
     _repo_key = str(root)
     max_size = get_max_file_size(max_size, repo=_repo_key)
     max_files = get_max_folder_files(max_files, repo=_repo_key)
+    respect_cachedir_tag = get_respect_cachedir_tag(repo=_repo_key)
     files = []
     warnings = []
+    oversize: list[str] = []
 
     skip_counts: dict[str, int] = {
         "skip_dir": 0,
@@ -1150,6 +1193,7 @@ def discover_local_files(
         "unreadable": 0,
         "binary": 0,
         "file_limit": 0,
+        "cache_dir": 0,
     }
 
     # Pre-compute string-based gitignore specs — built incrementally during
@@ -1194,6 +1238,7 @@ def discover_local_files(
         skip_dirs_regex=None,
         check_binary=True,
         check_filename=True,
+        respect_cachedir_tag=respect_cachedir_tag,
     )
 
     skip_dirs_regex = _build_skip_dirs_regex()
@@ -1206,15 +1251,23 @@ def discover_local_files(
         # index and burn the max_folder_files cap (#372).
         pruned = []
         worktrees = []
+        caches = []
         kept = []
         for d in dirnames:
             if skip_dirs_regex.match(d):
                 pruned.append(d)
             elif is_linked_worktree(dpath / d):
                 worktrees.append(d)
+            # A directory that declares ITSELF a cache, per the Cache Directory
+            # Tagging Specification. Checked last because it costs an open() and
+            # the two rules above are string/stat work; ordering is behaviour-
+            # neutral since a directory matching an earlier rule is pruned
+            # either way.
+            elif respect_cachedir_tag and is_cache_directory(dpath / d):
+                caches.append(d)
             else:
                 kept.append(d)
-        if pruned or worktrees:
+        if pruned or worktrees or caches:
             rel_dir = os.path.relpath(dirpath, root_str)
             for d in pruned:
                 skip_counts["skip_dir"] += 1
@@ -1224,6 +1277,9 @@ def discover_local_files(
                 logger.debug(
                     "SKIP nested_worktree: %s", os.path.join(rel_dir, d)
                 )
+            for d in caches:
+                skip_counts["cache_dir"] += 1
+                logger.debug("SKIP cache_dir: %s", os.path.join(rel_dir, d))
         dirnames[:] = kept
 
         # Load .gitignore for this directory BEFORE filtering its files so
@@ -1244,6 +1300,12 @@ def discover_local_files(
             )
             if not ok:
                 skip_counts[reason] = skip_counts.get(reason, 0) + 1
+                if reason == "too_large" and rel_path:
+                    # Collected, not warned per file: the aggregate lands once
+                    # after the walk (#429). `_should_index_file` deliberately
+                    # returns no warning here because the watcher fast path
+                    # shares it and fires per event.
+                    oversize.append(rel_path)
                 if warning is not None:
                     warnings.append(warning)
                 logger.debug(
@@ -1260,6 +1322,10 @@ def discover_local_files(
         len(files),
         skip_counts,
     )
+
+    _size_warning = _size_cap_warning(oversize, max_size)
+    if _size_warning is not None:
+        warnings.append(_size_warning)
 
     # File count limit with prioritization
     if len(files) > max_files:
@@ -1298,6 +1364,8 @@ def index_folder(
     paths: Optional[list[str]] = None,
     progress_cb: "Optional[Callable[[int, int, str], None]]" = None,
     identity_mode: str = "config",
+    force_reparse: bool = False,
+    max_size: Optional[int] = None,
 ) -> dict:
     """Index a local folder containing source code.
 
@@ -1317,6 +1385,27 @@ def index_folder(
             and an existing index, skips full directory discovery (~3s → ~50ms).
         identity_mode: "config" (default), "local", or "git". Local mode keeps
             v1.90 path-hash identity; git mode opts in to git-root identity.
+        force_reparse: Re-parse the files listed in `paths` even when their
+            content is unchanged (v1.108.259, #395). Requires `paths` and
+            `incremental`; ignored otherwise.
+
+            ⚠ Without this, a subset refresh over unchanged files is a no-op by
+            design: `detect_changes_with_mtimes` compares hashes and correctly
+            reports "No changes detected". That is right for an edit and wrong
+            for a PARSER_GENERATION upgrade, where the file content is identical
+            and the stored SYMBOLS are the thing that is wrong. It is the whole
+            reason `index_folder(paths=[...])` could not be used to slice up a
+            generation upgrade before this existed.
+        max_size: Per-file byte cap for this run, overriding config and the
+            default (#429). ``get_max_file_size`` has accepted this override
+            since v1.108.193, but no caller passed one and it reached no tool
+            schema, so over MCP — the transport every actual user is on — the
+            only route to the cap was editing a config file. Left None the
+            resolution order is unchanged: project ``.jcodemunch.jsonc``, then
+            global config / ``JCODEMUNCH_MAX_FILE_SIZE``, then the default.
+
+            ⚠ Per-call, so it does NOT persist. A repo with a permanently
+            oversize file wants the config key; this is for one run.
 
     Returns:
         Dict with indexing results.
@@ -1383,7 +1472,8 @@ def index_folder(
     _MIN_PATH_PARTS = 2 if container else 3
     path_part_count = _path_safety_part_count(folder_path)
     if path_part_count < _MIN_PATH_PARTS:
-        if not is_trusted:
+        shallow_windows_git_root = _is_shallow_windows_git_root(folder_path)
+        if not is_trusted and not shallow_windows_git_root:
             error_msg = (
                 f"Resolved path '{folder_path}' is too broad to index safely "
                 f"(fewer than {_MIN_PATH_PARTS} path components). "
@@ -1394,10 +1484,16 @@ def index_folder(
             logger.error(error_msg)
             return {"success": False, "error": error_msg}
 
-        warning_msg = (
-            f"Resolved path '{folder_path}' would normally be rejected as too broad, "
-            "but it matched trusted_folders and was allowed."
-        )
+        if is_trusted:
+            warning_msg = (
+                f"Resolved path '{folder_path}' would normally be rejected as too broad, "
+                "but it matched trusted_folders and was allowed."
+            )
+        else:
+            warning_msg = (
+                f"Resolved path '{folder_path}' is a Git working-tree root directly "
+                "below a Windows drive root and was allowed."
+            )
         logger.warning(warning_msg)
         warnings.append(warning_msg)
 
@@ -1618,7 +1714,13 @@ def index_folder(
             # `repo=` for the same reason the two walks below take it: this is a
             # third discovery entry point, and a cap the project sets must reach
             # all three or the file appears on one route and vanishes on another.
-            _fast_max_size = get_max_file_size(repo=str(Path(walk_root).resolve()))
+            # `max_size` first for the same reason `repo=` is passed: this is
+            # the third discovery entry point, and a cap that reaches only two
+            # of them makes a file appear on one route and vanish on another
+            # (#429 follows the same rule the comment above states for repo).
+            _fast_max_size = get_max_file_size(
+                max_size, repo=str(Path(walk_root).resolve())
+            )
 
             def _fast_forced_paths() -> set:
                 for _c in changed_paths:
@@ -1641,6 +1743,9 @@ def index_folder(
                 skip_dirs_regex=_build_skip_dirs_regex(),
                 check_binary=False,
                 check_filename=True,
+                respect_cachedir_tag=get_respect_cachedir_tag(
+                    repo=str(Path(walk_root).resolve())
+                ),
             )
 
             # Branch detection for watcher fast-path
@@ -1996,12 +2101,14 @@ def index_folder(
                 walk_root,
                 list(paths),
                 max_files=max_files,
+                max_size=max_size,
                 follow_symlinks=follow_symlinks,
             )
         else:
             source_files, discover_warnings, skip_counts = discover_local_files(
                 walk_root,
                 max_files=max_files,
+                max_size=max_size,
                 extra_ignore_patterns=_merged_ignore or None,
                 follow_symlinks=follow_symlinks,
             )
@@ -2171,10 +2278,22 @@ def index_folder(
                 owner, repo_name, rebuild_reason,
             )
             warnings.append(_rebuild_message)
-        elif _needs_parser_upgrade(existing_index):
+        elif _needs_parser_upgrade(existing_index) and not (force_reparse and paths is not None):
             # One-off full re-parse after an extraction-semantics bump (#414).
             # Reported through the same fields a caller already reads for an
             # unreadable index, so a substituted rebuild always has a reason.
+            #
+            # ⚠⚠ Exempted for a forced subset refresh (v1.108.259, #395). A
+            # caller passing `paths=` AND `force_reparse=True` is running the
+            # upgrade in bounded SLICES on purpose. Escalating to a full
+            # reindex here would run the entire unbounded maintenance event
+            # inside every slice — measured on an 8-file fixture as four full
+            # re-parses where four bounded ones were requested, which on the
+            # fleet this was written for is worse than doing nothing.
+            #
+            # The campaign owns coverage and the generation stamp instead; see
+            # tools/refresh.py. Nothing else may skip this escalation, because
+            # any other caller has no mechanism to finish the job.
             incremental = False
             rebuild_reason = "parser_generation_upgrade"
             logger.warning(
@@ -2302,6 +2421,31 @@ def index_folder(
                         if any(fp == req or fp.startswith(req + "/") for req in requested_rels)
                     }
                 deleted = sorted(covered - set(file_mtimes))
+
+                # v1.108.259 (#395): re-parse the listed files even when their
+                # content is unchanged. `detect_changes_with_mtimes` compares
+                # hashes, so a subset refresh over untouched files is otherwise
+                # a correct no-op — right for an edit, wrong for a parser
+                # generation upgrade, where the bytes are identical and the
+                # stored symbols are what is wrong.
+                #
+                # ⚠ Scoped to `requested_rels` deliberately. Forcing without an
+                # explicit list would mean re-parsing the whole corpus in one
+                # call, i.e. exactly the unbounded maintenance event #395 exists
+                # to avoid.
+                if force_reparse:
+                    _already = set(changed) | set(new) | set(deleted)
+                    _known = set((existing_index.file_hashes or {}).keys())
+                    _forced = [
+                        fp for fp in sorted(file_mtimes)
+                        if fp not in _already and fp in _known
+                    ]
+                    if _forced:
+                        changed = sorted(set(changed) | set(_forced))
+                        logger.info(
+                            "index_folder: force_reparse promoted %d unchanged file(s)",
+                            len(_forced),
+                        )
 
             if not changed and not new and not deleted:
                 _refresh_git_head_if_advanced(

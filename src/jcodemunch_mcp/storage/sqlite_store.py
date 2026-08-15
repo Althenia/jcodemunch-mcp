@@ -14,7 +14,7 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, cast
 
 from ..parser.symbols import Symbol
@@ -236,6 +236,32 @@ _INIT_PRAGMAS = [
 # this it surfaced as a bogus `local/org_savings` card (sym 0, no source_root)
 # that could never be deleted.
 _NON_REPO_DB_FILES = frozenset({"telemetry.db", "org_savings.db"})
+
+# Directory name the starter-pack builder clones into on its CI machine
+# (`build_pack.py`: tempfile.gettempdir() / "jcm-pack-clones" / <owner>-<repo>).
+# That absolute path is baked into every shipped pack index's meta and exists
+# on no user's machine, so `cleanup_orphan_indexes` classified each pack as an
+# orphaned local repo and deleted it on the next server start (#419,
+# @MotoMato85). Recognising it here is what lets a pack index be told apart
+# from a genuinely vanished local clone.
+_PACK_CLONE_DIR = "jcm-pack-clones"
+
+
+def is_pack_clone_path(source_root: str) -> bool:
+    """True if `source_root` points into the pack builder's clone directory.
+
+    Matched on a PATH COMPONENT, not a substring: a user directory merely
+    named e.g. `my-jcm-pack-clones-backup` must not be mistaken for one, and
+    a component match is also what makes this correct for the Windows case
+    where the POSIX `/tmp/...` value resolves against the current drive.
+    """
+    if not source_root:
+        return False
+    try:
+        parts = PurePosixPath(source_root.replace("\\", "/")).parts
+    except Exception:
+        return False
+    return _PACK_CLONE_DIR in parts
 
 # Keys stored in the meta table
 _META_KEYS = [
@@ -2335,6 +2361,55 @@ class SQLiteIndexStore:
         except Exception:
             logger.debug("Failed to set coverage for %s/%s", owner, name, exc_info=True)
 
+    def stamp_parser_generation(self, owner: str, name: str, generation: int) -> bool:
+        """Record that this index's symbols were produced by `generation`.
+
+        v1.108.259 (#395). Written ONLY by a bounded refresh campaign that has
+        re-parsed every file in the corpus, which is the same thing a full save
+        earns the stamp for, arrived at in slices instead of in one event.
+
+        ⚠⚠ The stamp is a CLAIM about every symbol in the index, so the caller
+        must have verified full coverage before calling. `index_store` states the
+        rule this upholds: an incremental save deliberately leaves the stamp
+        alone, because a partially re-parsed index must keep claiming the older
+        generation. A campaign that stamps early is that bug with a scheduler in
+        front of it.
+
+        Refuses to move the stamp BACKWARDS. A lower generation is either a
+        caller bug or a downgrade, and neither is a reason to un-claim work that
+        was really done.
+
+        Returns True when the stamp was written.
+        """
+        safe_owner = self._safe_repo_component(owner, "owner")
+        safe_name = self._safe_repo_component(name, "name")
+        db_path = self._db_path(safe_owner, safe_name)
+        if not db_path.exists():
+            return False
+        try:
+            conn = self._connect(db_path)
+            try:
+                current = int(self._read_meta(conn).get("parser_generation", "0") or 0)
+                if generation <= current:
+                    return False
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                    ("parser_generation", str(int(generation))),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            with _cache_lock:
+                for key, entry in _index_cache.items():
+                    if key[0] == owner and key[1] == name:
+                        entry.code_index.parser_generation = int(generation)
+            return True
+        except Exception:
+            logger.debug(
+                "Failed to stamp parser_generation for %s/%s", owner, name, exc_info=True
+            )
+            return False
+
     def list_repos(self) -> list[dict]:
         """List all indexed repositories (scans .db files only)."""
         _pairs = parse_path_map()
@@ -2486,6 +2561,15 @@ class SQLiteIndexStore:
             source_root = entry.get("source_root", "")
             if not source_root:
                 continue  # Remote repo — no filesystem path to validate
+            if is_pack_clone_path(source_root):
+                # ⚠ A starter-pack index, NOT a vanished local clone. Its
+                # source_root is the pack builder's CI path and is absent on
+                # every user machine by construction, so the is_dir() test
+                # below would delete it every single server start (#419).
+                # `heal_pack_index_paths()` normally blanks these first; this
+                # guard is the backstop for a store that has not been healed
+                # yet — the order of those two must never become load-bearing.
+                continue
             try:
                 if not Path(source_root).is_dir():
                     repo_id = entry["repo"]
@@ -2505,6 +2589,54 @@ class SQLiteIndexStore:
             except Exception:
                 logger.debug("Orphan check failed for %s", source_root, exc_info=True)
         return deleted
+
+    def heal_pack_index_paths(self) -> int:
+        """Blank the builder's clone paths on already-installed pack indexes.
+
+        Fixing `install-pack` only helps the NEXT install. Every pack already
+        on disk still carries `/tmp/jcm-pack-clones/...` in its meta, and
+        re-installing is not a remedy a user knows to apply — the marker
+        survives deletion, so the pack still reports itself installed while
+        nothing is queryable (#419, @MotoMato85). This repairs them in place.
+
+        Blanking is the correct repair rather than a special case elsewhere:
+        an empty `source_root` is exactly what the store already means by "no
+        local clone to validate", which is the truth for a downloaded pack. It
+        also takes packs out of `watch-all`, which was picking every one of
+        them up and logging a failed index per pack.
+
+        Returns the number of indexes repaired.
+        """
+        healed = 0
+        for entry in self.list_repos():
+            source_root = entry.get("source_root", "")
+            if not is_pack_clone_path(source_root):
+                continue
+            repo_id = entry.get("repo", "")
+            parts = repo_id.split("/", 1)
+            if len(parts) != 2:
+                continue
+            owner, name = parts
+            db_path = self._db_path(owner, name)
+            if not db_path.exists():
+                continue
+            try:
+                conn = self._connect(db_path)
+                try:
+                    conn.execute(
+                        "UPDATE meta SET value = '' WHERE key IN ('source_root', 'git_root')"
+                    )
+                finally:
+                    conn.close()
+                healed += 1
+                logger.info(
+                    "Repaired starter-pack index %s (cleared builder path: %s)",
+                    repo_id,
+                    source_root,
+                )
+            except Exception:
+                logger.debug("Pack path repair failed for %s", repo_id, exc_info=True)
+        return healed
 
     def get_symbol_content(
         self, owner: str, name: str, symbol_id: str,

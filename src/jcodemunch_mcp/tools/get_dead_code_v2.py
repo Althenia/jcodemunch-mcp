@@ -23,6 +23,9 @@ from ..storage import IndexStore
 from ..parser.imports import resolve_specifier
 from ._utils import resolve_repo as _resolve_repo
 from ._call_graph import _word_match, build_symbols_by_file
+# One matcher, not two: entry_point_patterns must mean the same thing in
+# both dead-code tools or #436 gets replaced by a subtler version of itself.
+from .find_dead_code import _matches_any_pattern, unmatched_patterns
 from ..parser.context._route_utils import ENTRY_POINT_DECORATOR_RE
 
 
@@ -510,6 +513,7 @@ def get_dead_code_v2(
     file_pattern: Optional[str] = None,
     storage_path: Optional[str] = None,
     degeneracy_cutoff: Optional[float] = None,
+    entry_point_patterns: Optional[list[str]] = None,
 ) -> dict:
     """Find likely-dead functions and methods using three independent signals.
 
@@ -549,18 +553,42 @@ def get_dead_code_v2(
 
     if index is None:
         return {"error": f"No index found for {repo!r}. Run index_folder first."}
+
+    # v1.108.275 (#446). Computed BEFORE the call-graph-only branch, because that
+    # branch returns early and shares the hazard.
+    _unmatched = unmatched_patterns(entry_point_patterns, index.source_files)
+
     if not index.imports:
         # 1.80.9+: when there's no import graph (single-file libs like
         # pre-bundled lodash 4.x, monolithic IIFEs, etc.), fall through
         # to call-graph-only mode rather than erroring out. Reports
         # symbols whose names appear nowhere in any indexed function's
         # call_references.
-        return _call_graph_only_dead_code(
+        _fallback = _call_graph_only_dead_code(
             index, owner, name, t0,
             include_tests=include_tests,
             max_results=max_results,
             file_pattern=file_pattern,
         )
+        # ⚠⚠ v1.108.275 (#446). This exit never received `entry_point_patterns` and
+        # still does not use them — call-graph-only mode has no notion of a live
+        # ROOT FILE, so there is nothing for a path pattern to seed. That is
+        # defensible; **silently accepting a parameter and ignoring it is not.**
+        # A caller who passes patterns here and reads an ordinary answer has no way
+        # to learn they did nothing.
+        if entry_point_patterns:
+            _fallback["entry_point_patterns_ignored"] = True
+            _fallback["entry_point_patterns_warning"] = (
+                "entry_point_patterns was supplied but this repository has no import "
+                "graph, so analysis fell back to call-graph-only mode, which has no "
+                "file-level entry-point concept. The patterns were not applied."
+                + (
+                    f" Separately, {len(_unmatched)} of them match no indexed file "
+                    f"at all: {', '.join(_unmatched[:5])}."
+                    if _unmatched else ""
+                )
+            )
+        return _fallback
 
     source_files = frozenset(index.source_files)
     alias_map = getattr(index, "alias_map", {}) or {}
@@ -574,9 +602,29 @@ def get_dead_code_v2(
     # ``package.json`` (issue: sverklo bench v1 — Express has no
     # filename-style entry point).
     pkg_entries = _package_json_entries(index, store, owner, name)
-    entry_point_count = sum(1 for f in index.source_files if _is_entry_point(f)) + len(pkg_entries)
+
+    # (c) caller-declared roots. Both warnings below tell the caller to pass
+    # entry_point_patterns; before v1.108.271 this function had no such
+    # parameter at any layer, so that advice could not be followed and the
+    # degenerate path offered a remedy that did not exist (#436). Matching
+    # reuses find_dead_code's `_matches_any_pattern` rather than a second
+    # implementation, so the two tools cannot disagree about what a pattern
+    # means.
+    declared_entries: set[str] = set()
+    if entry_point_patterns:
+        declared_entries = {
+            f for f in index.source_files
+            if _matches_any_pattern(f, entry_point_patterns)
+        }
+
+    extra_entries = pkg_entries | declared_entries
+    entry_point_count = (
+        sum(1 for f in index.source_files
+            if _is_entry_point(f) or f in declared_entries)
+        + len(pkg_entries - declared_entries)
+    )
     reachable_files = _reachable_from_entry_points(
-        list(index.source_files), rev, forward, extra_entries=pkg_entries
+        list(index.source_files), rev, forward, extra_entries=extra_entries
     )
 
     # Pre-compute barrel exports (Signal 3 input). Recursively follows CJS
@@ -691,7 +739,7 @@ def get_dead_code_v2(
 
         # Skip entry-point files entirely (filename heuristic + package.json
         # main fields).
-        if _is_entry_point(sym_file) or sym_file in pkg_entries:
+        if _is_entry_point(sym_file) or sym_file in extra_entries:
             continue
 
         # Skip test files unless requested
@@ -820,8 +868,13 @@ def get_dead_code_v2(
                 "the repository has no dead code."
                 if ceiling < min_confidence else "."
             )
-            + " Pass entry_point_patterns to make unreachable_file discriminate, or "
-            "lower min_confidence to see the weaker verdicts."
+            + (
+                " Pass entry_point_patterns to declare framework-specific roots, or "
+                "lower min_confidence to see the weaker verdicts."
+                if not entry_point_patterns else
+                " entry_point_patterns was supplied and did not rescue this; the "
+                "remaining lever is lowering min_confidence."
+            )
         )
     if entry_point_count == 0:
         result["framework_warning"] = (
@@ -829,6 +882,28 @@ def get_dead_code_v2(
             "Signal 1 (unreachable_file) fires for every symbol, inflating dead code counts. "
             "Pass entry_point_patterns to identify framework-specific roots "
             "(e.g. handler functions for AWS Lambda, route modules for FastAPI)."
+            if not entry_point_patterns else
+            "entry_point_patterns was supplied but matched no indexed file, so "
+            "Signal 1 still fires for every symbol. Check the patterns against "
+            "repo-relative paths."
+        )
+
+    # ⚠⚠ v1.108.275 (#446). The message above was RIGHT and almost never fired: it
+    # is gated on `entry_point_count == 0`, so any repo carrying one ordinary
+    # main.py/app.py made the count non-zero and the caller heard nothing about
+    # patterns that matched nothing. **A correct warning behind the wrong gate reads
+    # as "no problem found".** This one is ungated and names the offenders.
+    if _unmatched:
+        result["entry_point_patterns_unmatched"] = _unmatched
+        result["entry_point_patterns_warning"] = (
+            f"{len(_unmatched)} of {len(entry_point_patterns)} entry_point_patterns "
+            f"matched no indexed file, so they declared no roots: "
+            f"{', '.join(_unmatched[:5])}"
+            + (f" (+{len(_unmatched) - 5} more)" if len(_unmatched) > 5 else "")
+            + ". Patterns are matched with fnmatch against repo-relative paths: "
+            "brace alternation ({ts,js}) is NOT expanded, and ** does not match "
+            "zero directories (plugins/**/*.ts misses plugins/auth.ts). "
+            "List each extension separately and add the flat form."
         )
     return result
 

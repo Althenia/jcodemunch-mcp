@@ -1,6 +1,6 @@
 """``jcodemunch-mcp receipt`` — token-economy ledger.
 
-Parses ``~/.claude/projects/**/*.jsonl`` transcripts, extracts every
+Parses Claude Code's ``<projects-root>/**/*.jsonl`` transcripts, extracts every
 ``mcp__jcodemunch__*`` tool call + its result, applies per-tool savings
 multipliers calibrated against the published RAG benchmarks, and prints
 an honest dollar-denominated ROI ledger.
@@ -119,7 +119,42 @@ _BYTES_PER_TOKEN = 4
 
 
 def _projects_root() -> Path:
-    return Path.home() / ".claude" / "projects"
+    """The default profile's projects root.
+
+    Kept for callers that want the one canonical path; the ledger itself scans
+    ``_projects_roots()``, which is a union (jcm#421).
+    """
+    from ..storage.transcript_roots import default_root
+    return default_root()
+
+
+def _projects_roots(explicit: Optional[list[Path]] = None) -> list[Path]:
+    """Every transcript root to scan.
+
+    Claude Code writes transcripts under the *active* profile's config dir, so a
+    box running two ``CLAUDE_CONFIG_DIR`` profiles has two disjoint trees and no
+    single root covers both (jcm#421 measured 12 of 348 calls counted). With no
+    ``--projects-root``, scan the union of the default root, ``CLAUDE_CONFIG_DIR``,
+    and the roots the server and hooks registered.
+
+    ``--projects-root`` stays an **override** — it is now repeatable, so it can
+    name every profile, but naming any root means "scan exactly these". Making it
+    additive instead would break the one thing it was already good for: pinning a
+    scan to a known tree.
+    """
+    if explicit:
+        out: list[Path] = []
+        seen: set[str] = set()
+        for item in explicit:
+            path = Path(os.path.expanduser(str(item)))
+            key = str(path).casefold() if os.name == "nt" else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(path)
+        return out
+    from ..storage.transcript_roots import known_roots
+    return known_roots()
 
 
 def _index_root() -> Path:
@@ -197,14 +232,59 @@ def iter_calls(
     ``until`` is exclusive so adjacent calendar windows can't double-count
     a call that lands exactly on the boundary.
     """
-    if not projects_root.exists():
-        return
+    yield from iter_calls_multi([projects_root], since=since, until=until)
 
-    for jsonl in sorted(projects_root.rglob("*.jsonl")):
+
+# A transcript whose last write predates the window start cannot hold an event
+# stamped inside it, so we can skip the file without opening it. The margin
+# absorbs coarse filesystem timestamps and small clock skew; the cost of being
+# generous is one re-parsed file, the cost of being tight is a lost call.
+_MTIME_SKIP_MARGIN = _dt.timedelta(hours=1)
+
+
+def iter_calls_multi(
+    roots: Iterable[Path],
+    *,
+    since: Optional[_dt.datetime] = None,
+    until: Optional[_dt.datetime] = None,
+) -> Iterable[dict]:
+    """``iter_calls`` over a union of transcript roots (jcm#421).
+
+    Sessions are de-duplicated by file stem — the session UUID — so a root that
+    is a symlink, a copy, or an ancestor of another contributes each session
+    once. Scanning several roots multiplies the walk, so files whose mtime
+    predates ``since`` are skipped unopened; jMunch Console gives this
+    subprocess 60 seconds before it drops its Savings panel to fixtures.
+    """
+    mtime_floor: Optional[float] = None
+    if since is not None:
+        mtime_floor = (since - _MTIME_SKIP_MARGIN).timestamp()
+
+    seen_sessions: set[str] = set()
+    for root in roots:
         try:
-            yield from _iter_calls_in_file(jsonl, since=since, until=until)
+            if not root.exists():
+                continue
+            files = sorted(root.rglob("*.jsonl"))
         except OSError:
             continue
+        for jsonl in files:
+            key = jsonl.stem
+            if key in seen_sessions:
+                continue
+            try:
+                if mtime_floor is not None and jsonl.stat().st_mtime < mtime_floor:
+                    # Deliberately does NOT claim the stem: if a later root
+                    # holds a fresher copy of the same session, that one must
+                    # still be read.
+                    continue
+            except OSError:
+                continue
+            seen_sessions.add(key)
+            try:
+                yield from _iter_calls_in_file(jsonl, since=since, until=until)
+            except OSError:
+                continue
 
 
 def _iter_calls_in_file(
@@ -410,7 +490,12 @@ def render_text(
     out.write(f"  Tokens delivered (actual):     {totals['actual_tokens']:>12,}\n")
     out.write(f"  Tokens you would have spent:   {totals['baseline_tokens']:>12,}\n")
     out.write(f"                                 {'-' * 12}\n")
-    out.write(f"  Net savings:                   {totals['savings_tokens']:>12,} tokens\n\n")
+    out.write(f"  Net savings:                   {totals['savings_tokens']:>12,} tokens\n")
+    # Call-count-invariant companion to the total. The total scales with calls
+    # by construction (baseline = actual x multiplier, per call), so a rising
+    # total can mean more calls rather than better ones. This figure cannot.
+    per_call = totals["savings_tokens"] / totals["calls"] if totals["calls"] else 0
+    out.write(f"  Per call:                      {per_call:>12,.0f} tokens/call\n\n")
 
     rate = _MODEL_PRICES_USD_PER_MTOK.get(model.lower(), _MODEL_PRICES_USD_PER_MTOK[_DEFAULT_MODEL])
     primary_dollars = dollar_savings(totals["savings_tokens"], model)
@@ -443,6 +528,9 @@ def render_text(
     out.write("  Methodology: per-tool savings multipliers calibrated against\n")
     out.write("  published RAG benchmarks (Express/FastAPI/Gin). Run with --explain\n")
     out.write("  to see the full multiplier table; --export csv|json for raw data.\n")
+    out.write("  Read the total WITH the call count: savings is computed per call,\n")
+    out.write("  so it rises with calls by construction and is not cost-per-task.\n")
+    out.write("  Tool calls are themselves a cost carrier. --explain has the detail.\n")
     out.write("  Provenance: basis = measured — committed, drift-guarded artifacts\n")
     out.write("  at benchmarks/provenance/measured.json (tiktoken methodology +\n")
     out.write("  CI-gated replay retrieval golden). --export json carries the block.\n")
@@ -458,6 +546,18 @@ def render_explain() -> str:
     out.write("Per-tool savings multipliers. For each call:\n")
     out.write("  baseline_tokens = actual_tokens × multiplier\n")
     out.write("  savings_tokens  = baseline_tokens − actual_tokens\n\n")
+    out.write("⚠ Savings is computed PER CALL, so the total rises with the\n")
+    out.write("number of calls by construction. Doubling the calls doubles the\n")
+    out.write("reported savings even when the work done is identical. The total\n")
+    out.write("therefore cannot distinguish 'did more with less' from 'made more\n")
+    out.write("calls', and it is not a cost-per-task figure.\n\n")
+    out.write("This matters because token cost is not the only carrier. arXiv\n")
+    out.write("2608.01347 measures verification loops as a separate, TOOL-borne\n")
+    out.write("carrier: the runs with the most redundant verification cost 18x\n")
+    out.write("the clean-run median and made 2.5x the tool calls, at no gain in\n")
+    out.write("success rate. A workload can cut tokens per call and still cost\n")
+    out.write("more. Read the per-call figure alongside the total, and read the\n")
+    out.write("call count as a cost, not as evidence of value.\n\n")
     out.write("Calibrated against published RAG benchmarks\n")
     out.write("(benchmarks/rag_baseline_results.md) which show 30–56×\n")
     out.write("retrieval savings on Express/FastAPI/Gin. Multipliers below\n")
@@ -509,6 +609,7 @@ def render_json(
     meter: Optional[dict] = None,
     by_day: Optional[list[dict]] = None,
     window: Optional[dict] = None,
+    roots: Optional[list[Path]] = None,
 ) -> str:
     from ..retrieval.provenance import measured_provenance
 
@@ -521,6 +622,11 @@ def render_json(
     }
     if window:
         payload["window"] = window
+    if roots:
+        # What was actually walked. A consumer that sees a suspiciously low
+        # call count can tell "one profile scanned" from "no calls made"
+        # without guessing (jcm#421).
+        payload["transcript_roots"] = [str(r) for r in roots]
     if by_day is not None:
         payload["by_day"] = by_day
     if meter:
@@ -614,8 +720,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--projects-root",
         type=Path,
+        action="append",
         default=None,
-        help="Override Claude Code projects directory (default ~/.claude/projects).",
+        metavar="DIR",
+        help="Claude Code projects directory to scan. Repeatable — pass it once "
+             "per profile. Overrides discovery: with no --projects-root, the "
+             "default root, CLAUDE_CONFIG_DIR, and roots seen in earlier "
+             "sessions are all scanned.",
+    )
+    parser.add_argument(
+        "--roots",
+        action="store_true",
+        help="Print the transcript roots that would be scanned, then exit.",
     )
     args = parser.parse_args(argv)
 
@@ -627,7 +743,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         sys.stdout.write(render_rates())
         return 0
 
-    root = args.projects_root or _projects_root()
+    roots = _projects_roots(args.projects_root)
+
+    if args.roots:
+        sys.stdout.write(json.dumps({"roots": [str(r) for r in roots]}, indent=2) + "\n")
+        return 0
+
     since, until = args.since, args.until
     explicit_window = since is not None or until is not None
     if since is not None and until is not None and until <= since:
@@ -636,7 +757,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not explicit_window and args.days > 0:
         since = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=args.days)
 
-    calls = list(iter_calls(root, since=since, until=until))
+    calls = list(iter_calls_multi(roots, since=since, until=until))
     agg = aggregate(calls)
     meter = lifetime_meter()
 
@@ -657,6 +778,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     meter=meter,
                     by_day=aggregate_by_day(calls, model=args.model) if args.by_day else None,
                     window=window,
+                    roots=roots,
                 ),
                 encoding="utf-8",
             )

@@ -2,13 +2,13 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.jgravelle/jcodemunch-mcp",
   "title": "jCodemunch MCP",
-  "description": "Token-efficient code exploration via tree-sitter AST parsing. 70+ languages, 95%+ token savings.",
-  "version": "1.108.249",
+  "description": "Token-efficient code exploration via tree-sitter AST parsing. 70+ languages, 86-99% token savings.",
+  "version": "1.108.279",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "jcodemunch-mcp",
-      "version": "1.108.249",
+      "version": "1.108.279",
       "transport": {
         "type": "stdio"
       }

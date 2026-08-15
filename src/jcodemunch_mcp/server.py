@@ -246,15 +246,58 @@ _COUNTER_FRONT_DOOR: frozenset[str] = _counter.FRONT_DOOR
 _RAW_CATALOG: "Optional[list]" = None
 
 
-def _effective_surface() -> str:
-    """Active tool surface. 'counter' collapses list_tools to the front door;
-    anything else (default 'full') preserves existing tiered behavior unchanged.
-    Env JCODEMUNCH_TOOL_SURFACE wins over config 'tool_surface'.
+# The only two tool surfaces that exist. Anything else has always BEHAVED as
+# "full" (only "counter" is ever special-cased); v1.108.260 makes the reported
+# value agree with that instead of echoing whatever was typed.
+VALID_TOOL_SURFACES = ("counter", "full")
+_UNRECOGNIZED_SURFACES_LOGGED: set = set()
+
+
+def _surface_resolution() -> tuple:
+    """(effective, requested, recognized) for the active tool surface.
+
+    v1.108.260 (#424 follow-up). `JCODEMUNCH_TOOL_SURFACE=countr` used to report
+    itself back verbatim while silently serving the full 91-tool surface, because
+    only "counter" is ever special-cased. Someone debugging "why didn't my token
+    cost drop" then read a receipt that CONFIRMED their typo.
+
+    ⚠ Fifth occurrence of the diagnostic-disagrees-with-the-runtime class (see
+    .250 and .255). The reported value must be what is actually in force.
+
+    ⚠ Resolving to "full" is not enough on its own: silently normalising hides
+    the typo in the other direction. The requested value is carried alongside so
+    the receipt can say the setting was REJECTED, not merely that something else
+    is active.
     """
     env = os.environ.get("JCODEMUNCH_TOOL_SURFACE")
     if env:
-        return env.strip().lower()
-    return (config_module.get("tool_surface", "full") or "full").strip().lower()
+        requested = env.strip().lower()
+    else:
+        requested = (config_module.get("tool_surface", "full") or "full").strip().lower()
+
+    if requested in VALID_TOOL_SURFACES:
+        return requested, requested, True
+
+    if requested not in _UNRECOGNIZED_SURFACES_LOGGED:
+        _UNRECOGNIZED_SURFACES_LOGGED.add(requested)
+        logger.warning(
+            "Unrecognized tool_surface %r; using 'full'. Valid values: %s. "
+            "(Set via JCODEMUNCH_TOOL_SURFACE or the 'tool_surface' config key.)",
+            requested, ", ".join(VALID_TOOL_SURFACES),
+        )
+    return "full", requested, False
+
+
+def _effective_surface() -> str:
+    """Active tool surface. 'counter' collapses list_tools to the front door;
+    'full' (the default) preserves existing tiered behavior unchanged.
+    Env JCODEMUNCH_TOOL_SURFACE wins over config 'tool_surface'.
+
+    ⚠ Always one of VALID_TOOL_SURFACES. An unrecognized value resolves to
+    "full", which is what it has always DONE; see `_surface_resolution` for why
+    it used to be reported differently.
+    """
+    return _surface_resolution()[0]
 
 
 def _counter_front_door_tools() -> list:
@@ -401,8 +444,9 @@ def _tool_surface_stats(top_n: int = 15) -> dict:
     visible_total = sum(visible.values())
     catalog_total = sum(catalog.values())
     heaviest = dict(sorted(visible.items(), key=lambda kv: -kv[1])[:top_n])
-    return {
-        "surface": _effective_surface(),
+    _surface, _requested, _recognized = _surface_resolution()
+    out = {
+        "surface": _surface,
         "profile": _effective_profile(),
         "visible_tools": len(visible),
         "catalog_tools": len(catalog),
@@ -412,6 +456,17 @@ def _tool_surface_stats(top_n: int = 15) -> dict:
         "heaviest_tools": heaviest,
         "estimator": "bytes/4",
     }
+    # Omit-when-clean: a correct setting pays nothing. An unrecognized one is
+    # named, because resolving to "full" without saying so hides the typo in the
+    # other direction.
+    if not _recognized:
+        out["surface_requested"] = _requested
+        out["surface_unrecognized"] = True
+        out["surface_note"] = (
+            f"tool_surface {_requested!r} is not recognized and was ignored; "
+            f"'full' is in force. Valid values: {', '.join(VALID_TOOL_SURFACES)}."
+        )
+    return out
 
 
 # --- Runtime session tier state -------------------------------------------- #
@@ -735,8 +790,13 @@ _COMPACT_STRIP_PARAMS: dict[str, set[str]] = {
     "index_dependency": {"ecosystem", "max_files"},
     "find_importers": {"cross_repo"},
     "get_dependency_graph": {"cross_repo"},
-    "index_repo": {"extra_ignore_patterns", "incremental"},
-    "index_folder": {"extra_ignore_patterns", "incremental"},
+    # v1.108.269 (#429): `max_size` joins them on the same rule. It is an escape
+    # hatch for a repo with one oversize file, not a routine indexing control —
+    # and the response now NAMES the withheld files in `warnings`, so a caller
+    # who needs it is told the param exists at the moment it becomes relevant.
+    # Honoured under compact all the same; only the schema property is hidden.
+    "index_repo": {"extra_ignore_patterns", "incremental", "max_size"},
+    "index_folder": {"extra_ignore_patterns", "incremental", "max_size"},
 }
 
 # Params whose enum is demoted to a plain string filter under compact_schemas.
@@ -1194,6 +1254,11 @@ def _build_tools_list() -> list[Tool]:
                         "type": "boolean",
                         "description": "When true and an existing index exists, only re-index changed files.",
                         "default": True
+                    },
+                    "max_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Per-file byte cap for this run, overriding config and the 512000-byte default. Files over the cap are skipped entirely and their symbols never enter the index; the response names them in `warnings`. Omit to use config / JCODEMUNCH_MAX_FILE_SIZE."
                     }
                 },
                 "required": ["url"]
@@ -1239,6 +1304,11 @@ def _build_tools_list() -> list[Tool]:
                         "enum": ["config", "local", "git"],
                         "description": "Repo-identity strategy. `config` (default): respect existing index. `local`: path-keyed. `git`: git-root-keyed (monorepo subdir merging).",
                         "default": "config"
+                    },
+                    "max_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Per-file byte cap for this run, overriding config and the 512000-byte default. Files over the cap are skipped entirely and their symbols never enter the index; the response names them in `warnings`. Per-call only — for a repo with a permanently oversize file, set `max_file_size` in its .jcodemunch.jsonc instead. Omit to use config / JCODEMUNCH_MAX_FILE_SIZE."
                     }
                 },
                 "required": ["path"]
@@ -2860,7 +2930,13 @@ def _build_tools_list() -> list[Tool]:
                 "one-line recommended_action. Verdict tiers: safe_to_delete / test_coverage_only / "
                 "internal_only / internal_uses_blocking / external_uses_blocking / cross_repo_blocking "
                 "/ runtime_observed / entry_point. Top-5 blockers ranked by severity. Read-only — "
-                "never mutates the codebase."
+                "never mutates the codebase. "
+                "ALREADY CONSULTED, do not re-run to confirm this verdict: find_dead_code, "
+                "find_importers, check_references. "
+                "Response carries `stop_rule.terminal`: true means no further jcodemunch call "
+                "changes this verdict, so stop checking and decide. It does NOT mean safe — a "
+                "blocking verdict is terminal too. When false, `stop_rule.would_change_verdict` "
+                "names the specific action that would move it."
             ),
             inputSchema={
                 "type": "object",
@@ -2893,7 +2969,13 @@ def _build_tools_list() -> list[Tool]:
                 "cyclomatic complexity, test-coverage presence, and runtime traffic into a single "
                 "verdict + one-line recommended_action. Verdict tiers: safe_to_edit / untested / "
                 "complexity_risk / signature_impact / runtime_critical. Top-5 blockers ranked by "
-                "severity. Read-only — never mutates the codebase."
+                "severity. Read-only — never mutates the codebase. "
+                "ALREADY CONSULTED, do not re-run to confirm this verdict: find_importers, "
+                "check_references. "
+                "Response carries `stop_rule.terminal`: true means no further jcodemunch call "
+                "changes this verdict, so stop checking and decide. It does NOT mean safe — a "
+                "blocking verdict is terminal too. When false, `stop_rule.would_change_verdict` "
+                "names the specific action that would move it."
             ),
             inputSchema={
                 "type": "object",
@@ -3072,6 +3154,11 @@ def _build_tools_list() -> list[Tool]:
                         "default": 0.90,
                         "exclusiveMinimum": 0.5,
                         "maximum": 1.0,
+                    },
+                    "entry_point_patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns for files to treat as live roots, for frameworks the filename heuristic cannot see (e.g. 'handlers/*.py' for AWS Lambda, 'route.ts' for Next.js App Router). Matched with fnmatch against the repo-relative path AND against the bare filename, so 'route.ts' catches the file at any depth. NOTE: '**' is NOT recursive here — 'handlers/**/*.py' will not match 'handlers/h.py'. Use 'handlers/*.py' for one level, or a bare filename to match anywhere. Same matcher as find_dead_code.",
                     },
                 },
                 "required": ["repo"],
@@ -5122,8 +5209,84 @@ def _record_response_tokens(text: str) -> None:
         logger.debug("Response token recording failed", exc_info=True)
 
 
+def _response_text_bytes(result: "list[TextContent] | CallToolResult") -> int:
+    """UTF-8 byte size of everything a result would put on the wire."""
+    content = getattr(result, "content", result)
+    if not isinstance(content, list):
+        return 0
+    total = 0
+    for item in content:
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            total += len(text.encode("utf-8", errors="replace"))
+    return total
+
+
+def _enforce_response_cap(
+    name: str, result: "list[TextContent] | CallToolResult"
+) -> "list[TextContent] | CallToolResult":
+    """Refuse a single response larger than the configured ceiling (#425).
+
+    ⚠ Applied in the wrapper around the dispatcher rather than inside it, so it
+    is immune to early returns BY CONSTRUCTION — the same reason
+    ``evidence/producers.mint()`` lives at a chokepoint. The dispatcher has more
+    than a dozen ``return`` sites across the MUNCH-encoded, JSON, in-band-error
+    and front-door paths; a check placed at any one of them is a check the next
+    new branch will not have.
+
+    ⚠ It REFUSES rather than truncating. A shortened body is indistinguishable
+    from a complete one to the caller, so silently returning less is the one
+    outcome worse than an error here. The error names the actual size, the
+    limit, and the key that moves it.
+
+    An already-failing result is passed through untouched: capping an error
+    would replace a specific diagnosis with a generic one.
+    """
+    try:
+        from .security import get_max_response_bytes
+        limit = get_max_response_bytes()
+        if limit <= 0:
+            return result  # explicitly uncapped
+        size = _response_text_bytes(result)
+        if size <= limit:
+            return result
+        if getattr(result, "isError", False):
+            return result
+        logger.warning(
+            "response_cap: %s produced %d bytes, over the %d-byte limit", name, size, limit
+        )
+        return _error_call_result(json.dumps({
+            "error": (
+                f"Response too large: {name} produced {size:,} bytes, over the "
+                f"{limit:,}-byte single-response limit."
+            ),
+            "tool": name,
+            "response_bytes": size,
+            "response_max_bytes": limit,
+            "hint": (
+                "Narrow the request (line ranges, filters, a smaller token_budget), "
+                "or raise `response_max_bytes` in config.jsonc / "
+                "JCODEMUNCH_RESPONSE_MAX_BYTES. This is a RESPONSE limit and is "
+                "independent of `max_file_size`, which governs indexing."
+            ),
+        }, separators=(",", ":")))
+    except Exception:
+        # A cap that can fail closed would be worse than no cap.
+        logger.debug("Response cap check failed; passing result through", exc_info=True)
+        return result
+
+
 @server.call_tool(validate_input=False)
 async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
+    """Dispatch a tool call, then bound the reply it produced.
+
+    Kept as the registered entry point (and the name the front door re-dispatches
+    through) so every route into the dispatcher passes the cap.
+    """
+    return _enforce_response_cap(name, await _call_tool_impl(name, arguments))
+
+
+async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     """Handle tool calls."""
     _signal_handshake()
     storage_path = os.environ.get("CODE_INDEX_PATH")
@@ -5261,6 +5424,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                 incremental=arguments.get("incremental", True),
                 extra_ignore_patterns=arguments.get("extra_ignore_patterns"),
                 progress_cb=_progress_cb,
+                max_size=arguments.get("max_size"),
             )
             _result_cache_invalidate()
         elif name == "index_folder":
@@ -5278,6 +5442,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     paths=arguments.get("paths"),
                     identity_mode=arguments.get("identity_mode", "config"),
                     progress_cb=_progress_cb,
+                    max_size=arguments.get("max_size"),
                 )
             )
             _result_cache_invalidate()
@@ -5975,6 +6140,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
                     file_pattern=arguments.get("file_pattern"),
                     storage_path=storage_path,
                     degeneracy_cutoff=arguments.get("degeneracy_cutoff"),
+                    entry_point_patterns=arguments.get("entry_point_patterns"),
                 )
             )
         elif name == "get_extraction_candidates":
@@ -6980,8 +7146,33 @@ async def _run_server_with_watcher(
 async def run_stdio_server():
     """Run the MCP server over stdio (default)."""
     import sys
+
+    import anyio
+
     from mcp.server.stdio import stdio_server
+
+    from .stdio_guard import claim_stdout
+
+    # Suite parity with jdoc#110. Take the real stdout for JSON-RPC and point
+    # fd 1 at stderr BEFORE anything else runs, so no library, thread or child
+    # process can reach the framed stream. `tools/embed_repo.py` builds a
+    # SentenceTransformer inside a tool call, and a first embed on a machine
+    # without the model cached downloads it mid-request.
+    #
+    # ⚠ This does NOT retire the handshake watchdog below. Chatter written by a
+    # launcher BEFORE this process starts — the uvx case that cost a paying
+    # client 5h+ — is already in the pipe and cannot be retracted after exec.
+    _private_stdout, _stdout_swapped = claim_stdout()
+
     print(f"jcodemunch-mcp {__version__} by jgravelle · https://github.com/jgravelle/jcodemunch-mcp", file=sys.stderr)
+    if not _stdout_swapped:
+        # ⚠ Worth saying out loud: this is the configuration where a stray
+        # library write can still corrupt a response.
+        print(
+            "[jcodemunch-mcp] could not isolate stdout for JSON-RPC; library "
+            "output on stdout may corrupt framing",
+            file=sys.stderr,
+        )
     logger.info(
         "startup version=%s transport=stdio storage=%s ai_summaries=%s",
         __version__,
@@ -7039,7 +7230,10 @@ async def run_stdio_server():
     _watchdog_task = asyncio.create_task(_handshake_watchdog())
 
     try:
-        async with stdio_server() as (read_stream, write_stream):
+        _stdout_arg = (
+            anyio.wrap_file(_private_stdout) if _private_stdout is not None else None
+        )
+        async with stdio_server(stdout=_stdout_arg) as (read_stream, write_stream):
             await server.run(
                 read_stream,
                 write_stream,
@@ -8077,7 +8271,7 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
         try:
             storage.mkdir(parents=True, exist_ok=True)
             probe = storage / ".jcm_probe"
-            probe.write_text("ok")
+            probe.write_text("ok", encoding="utf-8")
             probe.unlink()
             print(f"  {green(CHECK)} index storage writable: {storage}")
         except PermissionError as e:
@@ -8170,13 +8364,18 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
         # ── Hook check ─────────────────────────────────────────────────────────
         section("Hooks check")
         _settings_path = Path.home() / ".claude" / "settings.json"
-        _expected_hooks = {
-            "hook-pretooluse": ("PreToolUse", "Read"),
-            "hook-posttooluse": ("PostToolUse", "Edit|Write"),
-            "hook-precompact": ("PreCompact", ""),
-            "hook-taskcomplete": ("TaskCompleted", ""),
-            "hook-subagent-start": ("SubagentStart", ""),
-        }
+        # DERIVED from the installer, never hand-listed. A hand-maintained copy
+        # reports a hook `init` really installs as "not installed", i.e. the
+        # diagnostic disagreeing with the runtime; `hook-sessionstart` was
+        # omitted from the copy the day it shipped.
+        from .cli.init import _enforcement_hooks, _extract_jcm_subcommand
+        _expected_hooks = {}
+        for _event, _rules in _enforcement_hooks().items():
+            for _rule in _rules:
+                for _h in _rule.get("hooks", []):
+                    _sub = _extract_jcm_subcommand(_h.get("command", ""))
+                    if _sub:
+                        _expected_hooks[_sub] = (_event, _rule.get("matcher", ""))
         if _settings_path.exists():
             try:
                 _settings = json.loads(_settings_path.read_text(encoding="utf-8"))
@@ -8185,11 +8384,15 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
             _installed_hooks = _settings.get("hooks", {})
             _found_any = False
             for _hook_cmd, (_event, _matcher) in _expected_hooks.items():
-                _marker = f"jcodemunch-mcp {_hook_cmd}"
+                # Compare SUBCOMMANDS, not a `jcodemunch-mcp <sub>` substring.
+                # `_hook_invocation()` writes an absolute path whenever
+                # `shutil.which` resolves, so the substring never matched an
+                # `C:/.../jcodemunch-mcp.EXE hook-pretooluse` install and the
+                # check reported every hook missing on a correctly-installed box.
                 _present = False
                 for _rule in _installed_hooks.get(_event, []):
                     for _h in _rule.get("hooks", []):
-                        if _marker in _h.get("command", ""):
+                        if _extract_jcm_subcommand(_h.get("command", "")) == _hook_cmd:
                             _present = True
                             break
                 if _present:
@@ -8260,8 +8463,125 @@ def _can_import(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
 
+def _format_refresh(out: dict) -> str:
+    """Human-readable rendering of a `refresh` run or status (#395).
+
+    States what remains and what it will cost, because the operator's actual
+    question is "can I fit the rest of this in tonight's window", and a percent
+    alone does not answer it.
+    """
+    if not out.get("success"):
+        return f"error: {out.get('error')}"
+
+    lines = [f"repo: {out.get('repo')}"]
+
+    if "campaign" in out:  # --status
+        gen, target = out.get("parser_generation"), out.get("parser_generation_target")
+        if gen is None:
+            return "\n".join(lines + ["no index for this path; run `jcodemunch-mcp index` first"])
+        lines.append(f"parser generation: {gen} (current: {target})")
+        if out.get("needs_refresh"):
+            lines.append(f"NEEDS REFRESH: {out.get('needs_refresh_reason')}")
+        c = out.get("campaign")
+        if not c:
+            lines.append("no campaign in progress")
+            return "\n".join(lines)
+        lines.append(
+            f"campaign ({c.get('reason')}): {c.get('completed_files')}/{c.get('total_files')} "
+            f"files, {c.get('percent')}% done, {c.get('remaining_files')} remaining"
+        )
+        lines.append(f"slices run: {c.get('slices_run')}, last run: {c.get('last_run_at')}")
+        if c.get("complete"):
+            lines.append("complete" + (", generation stamped" if c.get("stamped") else ""))
+        if c.get("errors"):
+            lines.append(f"recent errors: {len(c['errors'])} (see --json)")
+        return "\n".join(lines)
+
+    done, total = out.get("completed_files", 0), out.get("total_files", 0)
+    lines.append(
+        f"this run: {out.get('files_this_run')} files in {out.get('duration_seconds')}s "
+        f"({out.get('stopped_because')})"
+    )
+    lines.append(f"progress: {done}/{total} files, {out.get('remaining_files')} remaining")
+
+    per_file = (out.get("duration_seconds") or 0) / max(out.get("files_this_run") or 0, 1)
+    remaining = out.get("remaining_files") or 0
+    if remaining and per_file > 0:
+        lines.append(
+            f"estimated remaining work: ~{round(per_file * remaining / 60.0, 1)} min "
+            f"at this run's rate"
+        )
+    if out.get("corpus_drifted"):
+        lines.append(
+            f"corpus grew by {out['corpus_drifted']} file(s) during the campaign; "
+            f"they were appended and the generation stamp is deferred"
+        )
+    if out.get("complete"):
+        lines.append(
+            "campaign complete"
+            + (f", parser generation stamped to {out.get('parser_generation')}"
+               if out.get("stamped")
+               else f", NOT stamped ({out.get('stamp_skipped_reason')})")
+        )
+    else:
+        lines.append("run again to continue")
+    if out.get("errors"):
+        lines.append(f"errors: {len(out['errors'])} (see --json)")
+    return "\n".join(lines)
+
+
+def _force_utf8_stdio() -> None:
+    """Make CLI output UTF-8 regardless of the platform locale (v1.108.262).
+
+    ⚠⚠ On Windows, `sys.stdout` is the **console** stream (already UTF-8) when
+    attached to a terminal and the **locale** stream (cp1252) when piped or
+    redirected. So a command that prints any character cp1252 cannot encode
+    works interactively and dies the moment anyone consumes it:
+
+        jcodemunch-mcp receipt --explain            # fine
+        jcodemunch-mcp receipt --explain | more     # UnicodeEncodeError, no output
+
+    Measured: `receipt --explain` writes U+2212 MINUS SIGN and `render_diagram`
+    writes U+2713 CHECK MARK. That is a hard traceback out of a shipped command,
+    in the one configuration nobody exercises by hand and every script uses.
+    Sibling of the cp1252 DECODE class swept in v1.108.230; that sweep covered
+    subprocess input and left output alone.
+
+    Fixed at the entry point rather than per string, because the next non-ASCII
+    character someone adds must not reintroduce this.
+
+    ⚠ The MCP stdio transport is unaffected: it wraps `sys.stdout.buffer` in its
+    own TextIOWrapper, so it never reads the text layer being reconfigured here.
+    Verified before this shipped.
+
+    ⚠ `errors="replace"` is deliberate. Filesystem paths can carry surrogates
+    from a `surrogateescape` decode, and those raise even under UTF-8. Mangling
+    one character in a display string beats killing the command.
+
+    ⚠ `PYTHONIOENCODING` is honoured as an explicit opt-out: if the operator
+    named an encoding, that is a decision, not an accident.
+    """
+    if os.environ.get("PYTHONIOENCODING"):
+        return
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # replaced by a test harness or a captured buffer
+            continue
+        current = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if current in ("utf8", "utf8mb4"):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # A stream that refuses reconfiguration is not a reason to refuse to
+            # run; the command simply keeps the behaviour it had before.
+            logger.debug("Could not force UTF-8 on sys.%s", stream_name, exc_info=True)
+
+
 def main(argv: Optional[list[str]] = None):
     """Main entry point."""
+    _force_utf8_stdio()
     from .security import verify_package_integrity
     verify_package_integrity()
 
@@ -8961,6 +9281,37 @@ def main(argv: Optional[list[str]] = None):
     file_risk_parser.add_argument("--storage-path", default=None,
         help="Override index storage location.")
 
+    # --- refresh (#395) ---
+    refresh_parser = subparsers.add_parser(
+        "refresh",
+        help="Re-parse an indexed repo in bounded, resumable slices. For fleets "
+             "where a full re-index is a scheduled maintenance event.",
+    )
+    refresh_parser.add_argument("path", nargs="?", default=".",
+        help="Path to the indexed folder. Defaults to '.' (cwd).")
+    refresh_parser.add_argument("--max-seconds", type=float, default=None,
+        help="Wall-clock budget for THIS run (default 300). The run stops at the "
+             "budget and persists its place; run again to continue.")
+    refresh_parser.add_argument("--max-files", type=int, default=None,
+        help="File budget for THIS run (default 250).")
+    refresh_parser.add_argument("--pause-ms", type=int, default=0,
+        help="Sleep between batches, in ms. This is the knob that lowers the DUTY "
+             "CYCLE; the budgets bound when a run ends, not what it costs while "
+             "it runs.")
+    refresh_parser.add_argument("--batch-size", type=int, default=25,
+        help="Files per index_folder call (default 25).")
+    refresh_parser.add_argument("--ai-summaries", action="store_true",
+        help="Generate AI summaries during refresh. OFF by default: a scheduled "
+             "background job must not bill a paid summarizer without being asked.")
+    refresh_parser.add_argument("--status", action="store_true",
+        help="Report campaign progress and exit without doing any work.")
+    refresh_parser.add_argument("--reset", action="store_true",
+        help="Discard any in-progress campaign and re-enumerate the corpus.")
+    refresh_parser.add_argument("--json", action="store_true",
+        help="Emit JSON instead of human-readable text.")
+    refresh_parser.add_argument("--storage-path", default=None,
+        help="Override index storage location.")
+
     # --- health ---
     health_parser = subparsers.add_parser(
         "health",
@@ -9062,8 +9413,13 @@ def main(argv: Optional[list[str]] = None):
         help="Print the per-tool savings multiplier table + methodology, then exit.")
     receipt_parser.add_argument("--rates", action="store_true",
         help="Print the model input-price table as JSON, then exit (scans nothing).")
-    receipt_parser.add_argument("--projects-root", default=None,
-        help="Override Claude Code projects directory (default ~/.claude/projects).")
+    receipt_parser.add_argument("--projects-root", action="append", default=None,
+        metavar="DIR",
+        help="Claude Code projects directory to scan. Repeatable — pass it once per "
+             "profile. Overrides discovery: with no --projects-root, the default root, "
+             "CLAUDE_CONFIG_DIR, and roots seen in earlier sessions are all scanned.")
+    receipt_parser.add_argument("--roots", action="store_true",
+        help="Print the transcript roots that would be scanned, then exit.")
 
     # --- reflect ---
     reflect_parser = subparsers.add_parser(
@@ -9118,6 +9474,12 @@ def main(argv: Optional[list[str]] = None):
     subparsers.add_parser(
         "hook-subagent-start",
         help="SubagentStart hook: inject condensed repo orientation for spawned agents (reads stdin)",
+    )
+
+    # --- hook-sessionstart ---
+    subparsers.add_parser(
+        "hook-sessionstart",
+        help="SessionStart hook: re-inject the session snapshot after compaction/resume (reads stdin)",
     )
 
     # --- watch-claude ---
@@ -9270,7 +9632,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "health", "file-risk", "observatory", "keyring", "auth", "surface"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "hook-sessionstart", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "refresh", "health", "file-risk", "observatory", "keyring", "surface"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
@@ -9732,6 +10094,37 @@ def main(argv: Optional[list[str]] = None):
             argv += ["--storage-path", args.storage_path]
         sys.exit(file_risk_main(argv))
 
+    if args.command == "refresh":
+        from .tools.refresh import run as _refresh_run, status as _refresh_status
+        # Dispatched above the shared load_config() in main(), so load config
+        # here. See #426: get() now loads lazily, but an explicit call keeps
+        # this handler's behaviour independent of that.
+        config_module.load_config()
+        if args.status:
+            _out = _refresh_status(args.path, storage_path=args.storage_path)
+        else:
+            _out = _refresh_run(
+                args.path,
+                max_files=args.max_files,
+                max_seconds=args.max_seconds,
+                pause_ms=args.pause_ms,
+                batch_size=args.batch_size,
+                reset=args.reset,
+                storage_path=args.storage_path,
+                use_ai_summaries=args.ai_summaries,
+            )
+        if args.json:
+            # Module-level `json` (line 9), NOT the `_json` alias other branches
+            # use. Several handlers further down do `import json as _json`, which
+            # makes `_json` a LOCAL for the whole of main() -- so referencing it
+            # from a branch that runs BEFORE those imports raises
+            # UnboundLocalError, not NameError. Shipped broken in v1.108.259 and
+            # caught by ruff F821, which nobody read for four releases.
+            print(json.dumps(_out, indent=2))
+        else:
+            print(_format_refresh(_out))
+        sys.exit(0 if _out.get("success") else 1)
+
     if args.command == "health":
         from .cli.health import main as health_main
         argv = [args.repo, "--days", str(args.days)]
@@ -9816,8 +10209,10 @@ def main(argv: Optional[list[str]] = None):
             argv += ["--explain"]
         if args.rates:
             argv += ["--rates"]
-        if args.projects_root:
-            argv += ["--projects-root", args.projects_root]
+        for _root in (args.projects_root or []):
+            argv += ["--projects-root", _root]
+        if args.roots:
+            argv += ["--roots"]
         sys.exit(receipt_main(argv))
 
     if args.command == "hook-precompact":
@@ -9831,6 +10226,10 @@ def main(argv: Optional[list[str]] = None):
     if args.command == "hook-subagent-start":
         from .cli.hooks import run_subagentstart
         sys.exit(run_subagentstart())
+
+    if args.command == "hook-sessionstart":
+        from .cli.hooks import run_sessionstart
+        sys.exit(run_sessionstart())
 
     # Apply config defaults for watcher keys: CLI args > config > env vars.
     # config.load_config() is called inside each subcommand handler, but we need
@@ -10076,6 +10475,15 @@ def main(argv: Optional[list[str]] = None):
 
             storage_path = os.environ.get("CODE_INDEX_PATH")
             store = IndexStore(base_path=storage_path)
+            # ⚠ ORDER IS DELIBERATE: repair starter-pack indexes BEFORE the
+            # orphan sweep. Packs ship with the builder's `/tmp/jcm-pack-clones`
+            # path in their meta, which the sweep read as a vanished local repo
+            # and deleted on every start (#419). The sweep also skips them
+            # independently, so a failure here degrades to "not repaired",
+            # never to "deleted".
+            healed = store.heal_pack_index_paths()
+            if healed:
+                logger.info("Repaired %d starter-pack index(es)", healed)
             cleaned = store.cleanup_orphan_indexes()
             store.close()
             if cleaned:
@@ -10136,6 +10544,18 @@ def main(argv: Optional[list[str]] = None):
             atexit.register(_unregister_process)
         except Exception:
             logger.debug("process registry: register failed", exc_info=True)
+
+        # Transcript root registry (jcm#421): Claude Code writes this session's
+        # transcript under CLAUDE_CONFIG_DIR, which the client passes down to us
+        # as a spawned child. Recording it here is what lets `receipt` count a
+        # profile other than the default one — it scanned a hardcoded
+        # ~/.claude/projects and reported 12 of 348 calls on a three-profile
+        # box. No-op on the default profile; never allowed to block startup.
+        try:
+            from .storage.transcript_roots import register_session_root
+            register_session_root()
+        except Exception:
+            logger.debug("transcript root registry: register failed", exc_info=True)
 
         # Import the native embedding backend here, on the main thread, before
         # any event loop starts. Deferring it to the first embed call runs it
