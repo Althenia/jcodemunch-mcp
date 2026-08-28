@@ -2,6 +2,7 @@
 
 import logging
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -13,6 +14,7 @@ from ..security import validate_path, is_secret_file
 from ..storage import IndexStore
 from ..storage.index_store import _file_hash, _get_git_head, _get_git_branch
 from ._indexing_pipeline import parse_and_prepare_incremental
+from .resolve_repo import _independent_repo_between
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,89 @@ def _sibling_checkout_error(file_path: Path, store: IndexStore) -> Optional[str]
         return None
 
 
+def _paths_changed_between(source_root: Path, old_head: str, new_head: str) -> Optional[set[str]]:
+    """Repo-relative posix paths that differ between two commits, or None.
+
+    ``None`` means the question could not be answered — a git failure, a missing
+    commit, a tree that is not a repository. It is NEVER an empty set: callers
+    must treat unknown as "cannot prove", not as "nothing changed".
+
+    ``--relative`` scopes the answer to ``source_root``, so a monorepo subtree
+    index is not held back by a commit that touched a sibling it never indexed.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "--relative", old_head, new_head],
+            cwd=str(source_root),
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        logger.debug("git diff failed for %s", source_root, exc_info=True)
+        return None
+    if result.returncode != 0:
+        logger.debug(
+            "git diff %s..%s returned %s for %s",
+            old_head[:12], new_head[:12], result.returncode, source_root,
+        )
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _head_may_advance(
+    index, source_root: Path, stored_head: str, live_head: str, refreshed_rel: str,
+) -> bool:
+    """May this single-file refresh record ``live_head`` as the corpus's head?
+
+    Only when refreshing this one file is what brought the corpus into line with
+    ``live_head``: every other path that moved between the two commits must be
+    one the index does not carry and would not index.
+
+    ⚠⚠ **The write is not the defect; what has been proven before it is.**
+    ``index_folder``'s ``_refresh_git_head_if_advanced`` performs the identical
+    write on a no-change run (#330), and it is correct there because that run
+    walked the corpus and established that nothing indexed had changed.
+    ``index_file`` establishes something far weaker — that ONE requested file now
+    matches — and then advanced the repository-level head anyway, clearing
+    ``repo_is_stale`` for every file that moved in the same commit and was never
+    refreshed (#493). Nothing errored: the served content was simply the old
+    commit's, reported ``fresh``.
+
+    ⚠ Unknown resolves to False. A head left behind reads ``stale`` for a
+    repository that may in fact match, which costs a re-index; a head advanced
+    without proof reads ``fresh`` for one that does not, which costs a wrong
+    answer with no signal attached. Same asymmetry as v1.108.209's rule that
+    ``classify()`` must never answer ``fresh`` for a comparison it could not
+    make.
+    """
+    if not live_head:
+        return False
+    if not stored_head:
+        # No baseline to diff against, so nothing can be proven. The index keeps
+        # its empty head and `repo_is_stale` keeps reporting False for want of a
+        # SHA, exactly as before this call; a full `index_folder` sets it.
+        return False
+    if stored_head == live_head:
+        return True  # nothing moved; the write is a no-op
+
+    changed = _paths_changed_between(source_root, stored_head, live_head)
+    if changed is None:
+        return False
+
+    indexed_paths = set(getattr(index, "source_files", None) or ())
+    for path in changed:
+        if path == refreshed_rel:
+            continue
+        if path in indexed_paths:
+            return False  # a file we carry moved and we did not re-read it
+        if get_language_for_path(path) is not None:
+            # Not in the corpus but the indexer would take it: an added source
+            # file. Advancing here would report a complete index over a corpus
+            # that is missing a file, which is an absence claim we cannot back.
+            return False
+    return True
+
+
 def index_file(
     path: str,
     use_ai_summaries: bool = True,
@@ -94,6 +179,9 @@ def index_file(
     repos = store.list_repos()
     best_match: Optional[dict] = None
     best_root_len = -1
+    # Candidates rejected for belonging to a different repository, kept so the
+    # refusal can say WHICH repository rather than "no index contains this".
+    _blocked_by_boundary: list[tuple[str, Path]] = []
 
     for repo_entry in repos:
         source_root = repo_entry.get("source_root", "")
@@ -101,11 +189,24 @@ def index_file(
             continue
         try:
             root_path = Path(source_root).resolve()
-            if file_path.is_relative_to(root_path) and len(str(root_path)) > best_root_len:
-                best_match = repo_entry
-                best_root_len = len(str(root_path))
+            if not file_path.is_relative_to(root_path):
+                continue
         except (ValueError, OSError):
             continue
+        # #509: containment is a FILESYSTEM fact; attribution needs a REPOSITORY
+        # one. `resolve_repo` stopped matching on containment alone in #492 and
+        # this path still did — where the consequence is a WRITE into an index
+        # built from a different repository, not merely a wrong read.
+        #
+        # ⚠ Imported, not reimplemented. Copying the check is exactly how these
+        # two call sites diverged in the first place.
+        _boundary = _independent_repo_between(file_path, root_path)
+        if _boundary is not None:
+            _blocked_by_boundary.append((repo_entry.get("repo", ""), _boundary))
+            continue
+        if len(str(root_path)) > best_root_len:
+            best_match = repo_entry
+            best_root_len = len(str(root_path))
 
     if best_match is None:
         sibling_error = _sibling_checkout_error(file_path, store)
@@ -114,6 +215,20 @@ def index_file(
                 "success": False,
                 "error": sibling_error,
                 "skipped": "different_working_tree",
+            }
+        if _blocked_by_boundary:
+            _enclosing, _repo_root = _blocked_by_boundary[0]
+            return {
+                "success": False,
+                "error": (
+                    f"{path} belongs to the git repository at {_repo_root}, which "
+                    f"has no index of its own. It is inside the indexed folder "
+                    f"for '{_enclosing}', but that is a different repository with "
+                    f"a different history — writing this file into it would "
+                    f"attribute one repository's source to another. Run "
+                    f"index_folder on {_repo_root} first."
+                ),
+                "skipped": "different_repository",
             }
         return {
             "success": False,
@@ -125,6 +240,17 @@ def index_file(
 
     owner, name = best_match["repo"].split("/", 1)
     source_root = Path(best_match["source_root"]).resolve()
+
+    # #508: `config.get(key, repo=...)` reads an overlay that only
+    # `load_project_config` populates, and nothing on this path called it — so
+    # every `repo=` below (is_secret_file, context_providers, language gating)
+    # silently resolved to GLOBAL config and the project's settings were inert.
+    # `index_folder` loads it for the same reason at its own walk root.
+    #
+    # ⚠ A parameter that is present and does nothing is indistinguishable from
+    # the defect it was added to fix (#491 threaded the keyword; this is the
+    # path where it never reached anything).
+    _config.load_project_config(str(source_root))
 
     # Security validation
     if not validate_path(source_root, file_path):
@@ -138,7 +264,7 @@ def index_file(
     # skip and then prune — the flip-flop in #351. is_secret_file already exempts
     # source modules (e.g. secret_redaction.py) after the same-issue fix, so this
     # only refuses actual credential files (.env, *.pem, secrets/db.yaml, …).
-    if is_secret_file(rel_path):
+    if is_secret_file(rel_path, repo=str(source_root)):
         return {
             "success": False,
             "error": (
@@ -235,7 +361,14 @@ def index_file(
         )
     )
 
-    git_head = _get_git_head(source_root) or ""
+    live_head = _get_git_head(source_root) or ""
+    stored_head = (getattr(base_index, "git_head", "") or "") if base_index else ""
+    # #493: advance the repository-level head only when refreshing this one file
+    # is what brought the corpus into line with it. See _head_may_advance.
+    head_advanced = _head_may_advance(
+        index, source_root, stored_head, live_head, rel_path,
+    )
+    git_head = live_head if head_advanced else stored_head
     ctx_metadata = collect_metadata(active_providers) if active_providers else None
 
     # Determine changed vs new
@@ -248,7 +381,10 @@ def index_file(
             changed_files=changed_files, new_files=new_files, deleted_files=[],
             new_symbols=new_symbols,
             raw_files={rel_path: content},
-            git_head=git_head,
+            # ⚠ The branch-delta path writes `branch_meta`, not the
+            # repository-level `meta` row #493 is about, and carries its own
+            # `base_head`. Left on the live head deliberately; see CHANGELOG.
+            git_head=live_head,
             base_head=base_index.git_head if base_index else "",
             file_hashes={rel_path: file_hash},
             file_mtimes={rel_path: file_mtime},

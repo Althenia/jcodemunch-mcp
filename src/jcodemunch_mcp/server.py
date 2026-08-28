@@ -21,6 +21,7 @@ from mcp.types import Tool, ToolAnnotations, TextContent, Resource, Prompt, Prom
 
 from . import __version__
 from . import config as config_module
+from .embeddings.advice import PROVIDER_HINT as _PROVIDER_HINT
 from . import runtime_identity
 from .tools import _arg_contract
 # Tool modules are imported lazily inside each call_tool() dispatch branch.
@@ -246,10 +247,10 @@ _COUNTER_FRONT_DOOR: frozenset[str] = _counter.FRONT_DOOR
 _RAW_CATALOG: "Optional[list]" = None
 
 
-# The only two tool surfaces that exist. Anything else has always BEHAVED as
-# "full" (only "counter" is ever special-cased); v1.108.260 makes the reported
-# value agree with that instead of echoing whatever was typed.
-VALID_TOOL_SURFACES = ("counter", "full")
+# One authority for surface resolution: counter.resolve_tool_surface (pure,
+# also readable from the out-of-process hooks without paying this module's
+# import). v1.108.260 made the reported value agree with what is served.
+VALID_TOOL_SURFACES = _counter.VALID_TOOL_SURFACES
 _UNRECOGNIZED_SURFACES_LOGGED: set = set()
 
 
@@ -269,14 +270,12 @@ def _surface_resolution() -> tuple:
     the receipt can say the setting was REJECTED, not merely that something else
     is active.
     """
-    env = os.environ.get("JCODEMUNCH_TOOL_SURFACE")
-    if env:
-        requested = env.strip().lower()
-    else:
-        requested = (config_module.get("tool_surface", "full") or "full").strip().lower()
-
-    if requested in VALID_TOOL_SURFACES:
-        return requested, requested, True
+    effective, requested, recognized = _counter.resolve_tool_surface(
+        os.environ.get("JCODEMUNCH_TOOL_SURFACE"),
+        config_module.get("tool_surface", "full"),
+    )
+    if recognized:
+        return effective, requested, recognized
 
     if requested not in _UNRECOGNIZED_SURFACES_LOGGED:
         _UNRECOGNIZED_SURFACES_LOGGED.add(requested)
@@ -298,6 +297,107 @@ def _effective_surface() -> str:
     it used to be reported differently.
     """
     return _surface_resolution()[0]
+
+
+# --- MCP `instructions` (initialize response) ------------------------------ #
+# The one piece of jcodemunch prose that survives TOOL DEFERRAL. When a host has
+# more tools than its schema budget allows it sends tool NAMES only and withholds
+# the JSONSchemas until a ToolSearch-style lookup fetches them. We ship 91 tools
+# on the default surface, so in a deferred session every description we budget
+# and smell-test (`test_description_smells.py`, the 4,000-token core_compact
+# ceiling) is invisible at exactly the moment steering matters most.
+#
+# The MCP spec delivers `instructions` on a separate track from the tool list, so
+# it arrives whole even then. Two jobs, in this order:
+#   1. Defuse the deferral tax. ONE lookup loads the whole working set for the
+#      session, so the cost is a single round trip and not two calls per use.
+#   2. Say what each tool is FOR as a decision rule, not a feature summary. In a
+#      plain MCP client with no hooks and no skill listing, this string plus the
+#      tool descriptions are the entire steering budget we get.
+#
+# ⚠ Budget: under _MCP_INSTRUCTIONS_MAX_CHARS. Nothing proves a longer one
+# survives un-truncated, and observed sibling servers sit at 660-984.
+# ⚠ Every tool named here must be a real dispatchable name on the surface it is
+# named for; `tests/test_mcp_instructions.py` binds the prose to the catalog so
+# this cannot rot into advertising a tool we do not serve.
+
+_MCP_INSTRUCTIONS_MAX_CHARS = 1000
+
+# Default host prefix for MCP tool names. The real prefix comes from whatever key
+# the user wrote in their MCP config, so this is the common case, not a promise.
+_MCP_TOOL_PREFIX = "mcp__jcodemunch__"
+
+# Named in the order an agent should reach for them, most-used first.
+_INSTRUCTION_TOOLS_FULL: tuple = (
+    ("resolve_repo", "is this repo indexed? Call it first."),
+    ("get_ranked_context", '"how does X work" in ONE budgeted call, not chained hops.'),
+    ("search_symbols", "a symbol by name; search_text for strings and config."),
+    ("get_file_outline", "before opening any file."),
+    ("get_symbol_source", "one id, or an array to batch."),
+    ("find_references", "every use of a name, before a rename or delete."),
+)
+
+_INSTRUCTION_TOOLS_COUNTER: tuple = (
+    ("route", "start here: the task in plain words, back an action to run."),
+    ("menu", "search the catalog when you know roughly what you want."),
+    ("order", "dispatch any action by name: order(action, args). Read-only by default."),
+)
+
+
+def _instruction_tool_names(surface: str) -> list:
+    """Tool names named in the instructions for `surface`, in reach-for order."""
+    rows = _INSTRUCTION_TOOLS_COUNTER if surface == "counter" else _INSTRUCTION_TOOLS_FULL
+    return [name for name, _ in rows]
+
+
+def _tool_search_query(surface: str, prefix: str = _MCP_TOOL_PREFIX) -> str:
+    """The `select:` argument that loads every named tool in one lookup."""
+    names = _instruction_tool_names(surface)
+    return "select:" + ",".join(prefix + n for n in names)
+
+
+def _mcp_instructions(surface: "Optional[str]" = None, prefix: str = _MCP_TOOL_PREFIX) -> str:
+    """The `instructions` string for the initialize response, surface-aware."""
+    surface = surface or _effective_surface()
+    rows = _INSTRUCTION_TOOLS_COUNTER if surface == "counter" else _INSTRUCTION_TOOLS_FULL
+    if surface == "counter":
+        opening = (
+            "This repo can be indexed by jcodemunch. Its whole tool catalog sits "
+            "behind a 3-verb front door. Prefer it over Read/Grep/Glob/Bash for "
+            "code navigation."
+        )
+    else:
+        opening = (
+            "This repo can be indexed by jcodemunch: a prebuilt index of every "
+            "symbol, its file:line span, and who references what. Prefer them "
+            "over Read/Grep/Glob/Bash: one call usually replaces several reads."
+        )
+    lines = [
+        opening,
+        "",
+        "**If these tools are deferred (names shown, schemas withheld), load them "
+        'in ONE lookup:** ToolSearch "%s". One round trip for the session, '
+        "never one at a time." % _tool_search_query(surface, prefix),
+        "",
+    ]
+    lines += ["- %s: %s" % (name, why) for name, why in rows]
+    return "\n".join(lines)
+
+
+def _initialization_options():
+    """`create_initialization_options()` carrying our `instructions` string.
+
+    ⚠ Built per run() rather than passed to `Server(...)` at import: the surface
+    is resolved from env + config, and neither is settled when this module is
+    imported.
+    """
+    opts = server.create_initialization_options()
+    if "instructions" not in type(opts).model_fields:
+        # mcp SDK predates the field (we allow >=1.10.0). Nothing to say, and
+        # nowhere to say it.
+        logger.debug("InitializationOptions has no `instructions` field; skipping")
+        return opts
+    return opts.model_copy(update={"instructions": _mcp_instructions()})
 
 
 def _counter_front_door_tools() -> list:
@@ -974,7 +1074,7 @@ atexit.register(_save_session_state)
 # ---------------------------------------------------------------------------
 # Live journal persistence (#334) — feeds the out-of-process PreCompact hook.
 #
-# The hook (`jcodemunch-mcp hook-precompact`) runs in a separate process from
+# The hook (`jcodemunch-mcp hook-sessionstart`) runs in a separate process from
 # this server, so it sees a fresh, empty SessionJournal. We persist a compact
 # snapshot of the live journal to a small file the hook reads back. Writes are
 # throttled (not every tool call) and best-effort. Disable with
@@ -1125,8 +1225,13 @@ async def _ensure_tool_schemas() -> dict[str, dict]:
     return _TOOL_SCHEMAS
 
 
-# Create server
-server = Server("jcodemunch-mcp")
+# Create server.
+# ⚠ `version` is not optional in practice: omit it and the SDK reports ITS OWN
+# version in `serverInfo`, so every host that shows a server version showed the
+# mcp package number (1.26.0) while we shipped 1.108.x. Nothing errors, nothing
+# logs, and the field is wrong on every handshake. Pinned by
+# tests/test_mcp_instructions.py.
+server = Server("jcodemunch-mcp", version=__version__)
 
 
 # Handshake watchdog: a stderr diagnostic that fires when the client never
@@ -1232,7 +1337,7 @@ def _build_tools_list() -> list[Tool]:
     all_tools = [
         Tool(
             name="index_repo",
-            description="Index a GitHub repository's source code. Fetches files, parses ASTs, extracts symbols, and saves to local storage. Set JCODEMUNCH_USE_AI_SUMMARIES=false to disable AI summaries globally.",
+            description="Index a GitHub repository's source code. Fetches files, parses ASTs, extracts symbols, and saves to local storage. Set JCODEMUNCH_USE_AI_SUMMARIES=false to disable AI summaries globally. github.com URLs only.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1266,7 +1371,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="index_folder",
-            description="Index a local folder of source code. Response surfaces `discovery_skip_counts` and `no_symbols_files` for diagnosing missing files.",
+            description="Index a local folder of source code. Response surfaces `discovery_skip_counts` and `no_symbols_files` for diagnosing missing files. Skips .gitignore and extra_ignore_patterns matches.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1323,6 +1428,8 @@ def _build_tools_list() -> list[Tool]:
                 "at index time, or the summarizer provider wasn't configured yet. "
                 "With force=true (recommended), clears all existing summaries and re-runs "
                 "the full 3-tier pipeline (docstring → AI → signature fallback)."
+            
+                " Requires a configured summarizer provider; without one the pipeline falls back to docstrings and signatures."
             ),
             inputSchema={
                 "type": "object",
@@ -1584,6 +1691,8 @@ def _build_tools_list() -> list[Tool]:
                 "call ToolSearch to load their schemas first."
                 if config_module.get("discovery_hint", True)
                 else "List all indexed repositories."
+            
+                " Lists only indexes under the active storage_path."
             ),
             inputSchema={
                 "type": "object",
@@ -1602,7 +1711,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="resolve_repo",
-            description="Resolve a filesystem path to its indexed repo identifier. O(1) lookup — faster than list_repos for finding a single repo. Accepts repo root, worktree, subdirectory, or file path.",
+            description="Resolve a filesystem path to its indexed repo identifier. O(1) lookup — faster than list_repos for finding a single repo. Accepts repo root, worktree, subdirectory, or file path. Pass an absolute path; a relative one resolves against the server's working directory.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1645,7 +1754,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_file_outline",
-            description="Get all symbols (functions, classes, methods) in a file with full signatures (including parameter names) and summaries. Use signatures to review naming at parameter granularity without reading the full file. Pass repo and file_path (e.g. 'src/main.py').",
+            description="Get all symbols (functions, classes, methods) in a file with full signatures (including parameter names) and summaries. Use signatures to review naming at parameter granularity without reading the full file. Pass repo and file_path (e.g. 'src/main.py'). Indexed symbols only, so an unparsed file returns empty.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1736,7 +1845,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_file_content",
-            description="Get cached source for a file, optionally sliced to a line range.",
+            description="Get cached source for a file, optionally sliced to a line range. Reads the indexed copy, not the working tree.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1762,7 +1871,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="search_symbols",
-            description="Search for symbols matching a query across the entire indexed repository. Returns matches with signatures and summaries.",
+            description="Search for symbols matching a query across the entire indexed repository. Returns matches with signatures and summaries. Searches the index, not the working tree.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1835,7 +1944,7 @@ def _build_tools_list() -> list[Tool]:
                     },
                     "semantic": {
                         "type": "boolean",
-                        "description": "Enable semantic (embedding-based) search. Requires an embedding provider: JCODEMUNCH_EMBED_MODEL (sentence-transformers), GOOGLE_API_KEY+GOOGLE_EMBED_MODEL (Gemini), or OPENAI_API_KEY+OPENAI_EMBED_MODEL (OpenAI). When false (default) there is zero performance impact.",
+                        "description": "Enable semantic (embedding-based) search. " + _PROVIDER_HINT + " When false (default) there is zero performance impact.",
                         "default": False
                     },
                     "semantic_weight": {
@@ -1882,7 +1991,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="search_text",
-            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values). Supports regex (is_regex=true) and context lines around matches (context_lines=N, like grep -C).",
+            description="Full-text search across indexed file contents. Useful when symbol search misses (e.g., string literals, comments, config values). Supports regex (is_regex=true) and context lines around matches (context_lines=N, like grep -C). Searches the indexed copy, not the working tree.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1924,7 +2033,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_repo_outline",
-            description="Get a high-level overview of an indexed repository: directories, file counts, language breakdown, symbol counts. Lighter than get_file_tree.",
+            description="Get a high-level overview of an indexed repository: directories, file counts, language breakdown, symbol counts. Lighter than get_file_tree. Directories only, not files.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1938,7 +2047,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="find_importers",
-            description="Find all files that import a given file. Answers 'what uses this file?'. has_importers=false on a result means that importer is itself unreachable (dead code chain). Supports dbt {{ ref() }} edges. Use file_paths for batch queries. Set cross_repo=true to also find importers in other indexed repos.",
+            description="Find all files that import a given file. Answers 'what uses this file?'. has_importers=false on a result means that importer is itself unreachable (dead code chain). Supports dbt {{ ref() }} edges. Use file_paths for batch queries. Set cross_repo=true to also find importers in other indexed repos. Import edges only; textual uses are not reported.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1972,7 +2081,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="check_references",
-            description="Check if an identifier is referenced anywhere: imports + file content. Combines find_references and search_text into one call. Returns is_referenced (bool) for quick dead-code detection. Accepts multiple identifiers in one call via identifiers param.",
+            description="Check if an identifier is referenced anywhere: imports + file content. Combines find_references and search_text into one call. Returns is_referenced (bool) for quick dead-code detection. Accepts multiple identifiers in one call via identifiers param. Content matches are capped at max_content_results (default 20), and a match inside a comment or string still counts as referenced.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1996,7 +2105,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="search_columns",
-            description="Search column metadata across indexed models. Works with any ecosystem provider that emits column data (dbt, SQLMesh, database catalogs, etc.). Returns model name, file path, column name, and description. Use instead of grep/search_text for column discovery — 77% fewer tokens.",
+            description="Search column metadata across indexed models. Works with any ecosystem provider that emits column data (dbt, SQLMesh, database catalogs, etc.). Returns model name, file path, column name, and description. Use instead of grep/search_text for column discovery — 77% fewer tokens. Covers only providers that emit column metadata into the index, and returns at most max_results (default 20).",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2028,6 +2137,7 @@ def _build_tools_list() -> list[Tool]:
                 "Multi-symbol bundles deduplicate shared imports. "
                 "Set token_budget to cap response size; use budget_strategy to control what's kept. "
                 "Supports fqn (PHP FQN via PSR-4) as alternative to symbol_id."
+            
             ),
             inputSchema={
                 "type": "object",
@@ -2085,7 +2195,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_session_stats",
-            description="Get token savings stats for the current MCP session. Returns tokens saved and cost avoided (this session and all-time), per-tool breakdown, session duration, and cumulative totals. Use to see how much jCodeMunch has saved you.",
+            description="Get token savings stats for the current MCP session. Returns tokens saved and cost avoided (this session and all-time), per-tool breakdown, session duration, and cumulative totals. Use to see how much jCodeMunch has saved you. Savings are modelled estimates from the committed benchmark artifacts (cited in savings_provenance), not per-call measurements.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -2126,7 +2236,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="check_embedding_drift",
-            description="Pin (or re-check) a 16-string canary against the active embedding provider. On first run with capture=True (or force=True), embeds CANARY_STRINGS and persists the vectors to ~/.code-index/embed_canary.json. Subsequent calls re-embed those strings and report cosine drift; alarm fires when max drift exceeds threshold (default 0.05 = cos sim < 0.95). Use after upgrading providers, when retrieval quality drops unexpectedly, or as a periodic background check.",
+            description="Pin (or re-check) a 16-string canary against the active embedding provider. On first run with capture=True (or force=True), embeds CANARY_STRINGS and persists the vectors to ~/.code-index/embed_canary.json. Subsequent calls re-embed those strings and report cosine drift; alarm fires when max drift exceeds threshold (default 0.05 = cos sim < 0.95). Use after upgrading providers, when retrieval quality drops unexpectedly, or as a periodic background check. Requires an active embedding provider. The first run only captures the baseline; drift is reported from the second run onward.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2150,7 +2260,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="tune_weights",
-            description="Learn per-repo retrieval weights from the v1.78.0 ranking ledger. Computes confidence correlations for the semantic and identity-match channels and writes overrides to ~/.code-index/tuning.jsonc. search_symbols reads those overrides at query time when the caller doesn't pass an explicit semantic_weight. Learns from a recency window of the ledger (default 90 days) so stale events can't anchor the weights. Safe to re-run; idempotent for stable signal.",
+            description="Learn per-repo retrieval weights from the v1.78.0 ranking ledger. Computes confidence correlations for the semantic and identity-match channels and writes overrides to ~/.code-index/tuning.jsonc. search_symbols reads those overrides at query time when the caller doesn't pass an explicit semantic_weight. Learns from a recency window of the ledger (default 90 days) so stale events can't anchor the weights. Safe to re-run; idempotent for stable signal. Requires perf_telemetry_enabled and the ranking ledger it writes; without that history there is nothing to learn from.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2183,7 +2293,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_session_context",
-            description="Get the current session context — files accessed, searches performed, and edits registered during this MCP session. Use to avoid re-reading the same files.",
+            description="Get the current session context — files accessed, searches performed, and edits registered during this MCP session. Use to avoid re-reading the same files. Truncated to max_files (default 50) and max_queries (default 20), and covers this server process only.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2202,7 +2312,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_session_snapshot",
-            description="Get a compact session snapshot for context continuity. Returns a ~200 token markdown summary of files explored, edits made, searches performed, and dead ends. Designed for injection after context compaction to restore session orientation.",
+            description="Get a compact session snapshot for context continuity. Returns a ~200 token markdown summary of files explored, edits made, searches performed, and dead ends. Designed for injection after context compaction to restore session orientation. Truncated to max_files (10), max_searches (5) and max_edits (10); it is a summary, not a full session log.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2376,6 +2486,8 @@ def _build_tools_list() -> list[Tool]:
                 "Designed for session-start context injection: call once when you "
                 "open a repo, get oriented to the load-bearing changes without cold "
                 "exploration."
+            
+                " Truncated to max_changed_files (5), max_hotspots (3) and max_dead_code (3), and the change section needs local git history."
             ),
             inputSchema={
                 "type": "object",
@@ -2409,7 +2521,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="plan_turn",
-            description="Plan the next turn by analyzing query against the codebase. Returns confidence level (high/medium/low), recommended symbols/files, and guidance. Use as opening move for any task.",
+            description="Plan the next turn by analyzing query against the codebase. Returns confidence level (high/medium/low), recommended symbols/files, and guidance. Use as opening move for any task. Recommends at most max_recommended symbols (default 5) and ranks only what the index holds.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2443,7 +2555,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="register_edit",
-            description="Register file edits to invalidate caches. Call after editing files to clear BM25 cache and search result cache for the repo.",
+            description="Register file edits to invalidate caches. Call after editing files to clear BM25 cache and search result cache for the repo. Clears caches only. It does not re-index unless reindex=true, so search results stay stale until you do.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2467,7 +2579,9 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="test_summarizer",
-            description="Verify AI summarizer config and connectivity.",
+            description=(
+                "Diagnostic probe: send one request to the configured AI summarizer and report status, provider, timing, and any error detail. Call it to confirm summarization is wired up before indexing a large repo. It checks connectivity only; a healthy probe says nothing about summary quality. Disabled in the shipped default config, so enable it before calling."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2487,6 +2601,8 @@ def _build_tools_list() -> list[Tool]:
                 "redundancy between global and project configs, bloat patterns, and scope leaks. "
                 "Cross-references against the jcodemunch index to catch references to renamed or deleted "
                 "symbols and files that no other linter can detect."
+            
+                " Reports findings only; it never edits a config file. Stale-reference detection needs the repo indexed."
             ),
             inputSchema={
                 "type": "object",
@@ -2581,7 +2697,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_symbol_diff",
-            description="Diff symbol sets between two indexed snapshots. Shows added, removed, and changed symbols. Branch workflow: index branch A as repo-main, index branch B as repo-feature, then diff.",
+            description="Diff symbol sets between two indexed snapshots. Shows added, removed, and changed symbols. Branch workflow: index branch A as repo-main, index branch B as repo-feature, then diff. Compares by (name, kind), so a renamed symbol appears as one removal plus one addition, not a rename.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2593,7 +2709,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="get_class_hierarchy",
-            description="Get the full inheritance hierarchy for a class: ancestors (base classes via extends/implements) and descendants (subclasses/implementors). Works across Python, Java, TypeScript, C#, and any language where class signatures contain 'extends' or 'implements'.",
+            description="Get the full inheritance hierarchy for a class: ancestors (base classes via extends/implements) and descendants (subclasses/implementors). Works across Python, Java, TypeScript, C#, and any language where class signatures contain 'extends' or 'implements'. Bases are resolved from indexed signature text, so a dynamically assigned or generated base class is not found.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2618,7 +2734,7 @@ def _build_tools_list() -> list[Tool]:
         ),
         Tool(
             name="suggest_queries",
-            description="Suggest search queries, entry-point files, and index stats. Good first call on an unfamiliar repo — surfaces most-imported files, top keywords, and ready-to-run example queries.",
+            description="Suggest search queries, entry-point files, and index stats. Good first call on an unfamiliar repo — surfaces most-imported files, top keywords, and ready-to-run example queries. Suggestions come from index statistics rather than your task, so treat them as starting points.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2696,6 +2812,8 @@ def _build_tools_list() -> list[Tool]:
                 "mention this name; callees = imported symbols mentioned in this symbol's body. "
                 "Useful for understanding how a symbol fits into the call graph before refactoring. "
                 "For a 'what breaks if I delete this?' answer, use get_impact_preview instead."
+            
+                " Detection is name-based, so same-name symbols in different modules can merge and dynamic dispatch is missed."
             ),
             inputSchema={
                 "type": "object",
@@ -2731,6 +2849,8 @@ def _build_tools_list() -> list[Tool]:
                 "returning affected symbols grouped by file with call-chain paths. "
                 "Use this before deleting or renaming a symbol to understand full impact. "
                 "For a structured caller/callee tree, use get_call_hierarchy instead."
+            
+                " Walks the same name-matched call graph, so a caller reached only by dynamic dispatch or reflection is missing."
             ),
             inputSchema={
                 "type": "object",
@@ -2825,6 +2945,8 @@ def _build_tools_list() -> list[Tool]:
                 "Returns every strongly-connected component (set of files that mutually import "
                 "each other, directly or transitively). Run this to identify architectural "
                 "problems before a refactor, or to understand why a module is hard to test in isolation."
+            
+                " Detects cycles in the file-level import graph only; it says nothing about call-level or runtime cycles."
             ),
             inputSchema={
                 "type": "object",
@@ -2845,6 +2967,8 @@ def _build_tools_list() -> list[Tool]:
                 "Ce = files this module imports (dependencies). "
                 "Instability I = Ce/(Ca+Ce): 0 = stable, 1 = unstable. "
                 "Use to identify fragile modules and guide refactoring priorities."
+            
+                " Counts import edges only, so a module coupled through configuration, strings, or dependency injection reads as stable."
             ),
             inputSchema={
                 "type": "object",
@@ -2869,6 +2993,8 @@ def _build_tools_list() -> list[Tool]:
                 "Layer rules can be passed directly or defined in .jcodemunch.jsonc under "
                 "'architecture.layers'. Use to enforce clean architecture and detect "
                 "dependency-direction violations (e.g. API layer importing DB layer directly)."
+            
+                " Files that match no declared layer are skipped, so coverage depends on your layer rules."
             ),
             inputSchema={
                 "type": "object",
@@ -2898,6 +3024,8 @@ def _build_tools_list() -> list[Tool]:
                 "Returns safe=true when no collisions are found. "
                 "Run this before any rename/refactor to avoid silent breakage. "
                 "For a full rename plan with edits, use plan_refactoring."
+            
+                " Scoped to the symbol's own file and its importers; a collision in a file that uses the name without importing it is not detected."
             ),
             inputSchema={
                 "type": "object",
@@ -3065,6 +3193,8 @@ def _build_tools_list() -> list[Tool]:
                 "affected file — directly compatible with Edit tool. Handles import rewrites, "
                 "collision detection, new file generation, and multi-file coordination. "
                 "Use BEFORE executing any multi-file refactoring to get a complete edit plan in one call."
+            
+                " Returns a plan only and never writes a file. Apply the returned blocks yourself, then re-index."
             ),
             inputSchema={
                 "type": "object",
@@ -3479,6 +3609,8 @@ def _build_tools_list() -> list[Tool]:
                 "and unstable module count. "
                 "Designed to be the first tool called in any new session — one call gives a complete "
                 "picture to guide follow-up analysis."
+            
+                " The dead-code percentage is a heuristic estimate, and the hotspot ranking needs local git history."
             ),
             inputSchema={
                 "type": "object",
@@ -3595,6 +3727,8 @@ def _build_tools_list() -> list[Tool]:
                 "PageRank or in-degree centrality on the import graph. Useful for "
                 "orientation: surfaces the symbols that most of the codebase depends on. "
                 "New tool: use after indexing to understand repo architecture at a glance."
+            
+                " Ranks at most top_n symbols (default 20) over the import graph, so a symbol reached only dynamically scores zero."
             ),
             inputSchema={
                 "type": "object",
@@ -3754,6 +3888,8 @@ def _build_tools_list() -> list[Tool]:
                 "Exact symbol names in the query (qualified, CamelCase, snake_case) are pinned ahead "
                 "of the ranking; include identifiers verbatim. "
                 "Use when you want 'the best N tokens of context for this task' without specifying exact symbols."
+            
+                " Truncates at token_budget."
             ),
             inputSchema={
                 "type": "object",
@@ -3809,6 +3945,8 @@ def _build_tools_list() -> list[Tool]:
                 "Task-aware single-call orchestrator. Auto-classifies task into "
                 "explore/debug/refactor/extend/audit/review intent, runs the right sub-tools, "
                 "returns one source-attributed capsule under token_budget."
+            
+                " Bounded by token_budget; see intent_detected."
             ),
             inputSchema={
                 "type": "object",
@@ -3890,8 +4028,7 @@ def _build_tools_list() -> list[Tool]:
                 "Optional warm-up: search_symbols with semantic=true lazily embeds missing "
                 "symbols on first use, but embed_repo warms the cache upfront so the first "
                 "semantic query returns immediately. "
-                "Requires an embedding provider (JCODEMUNCH_EMBED_MODEL, "
-                "GOOGLE_API_KEY+GOOGLE_EMBED_MODEL, or OPENAI_API_KEY+OPENAI_EMBED_MODEL)."
+                + _PROVIDER_HINT
             ),
             inputSchema={
                 "type": "object",
@@ -3922,6 +4059,8 @@ def _build_tools_list() -> list[Tool]:
                 "manifest files (pyproject.toml, package.json, go.mod, Cargo.toml, etc.). "
                 "Use to visualize how your indexed repos are interconnected. "
                 "Pass repo to filter to a single repo's perspective."
+            
+                " Edges come from package names in manifest files, so a path or git dependency with no manifest entry is invisible."
             ),
             inputSchema={
                 "type": "object",
@@ -4004,6 +4143,8 @@ def _build_tools_list() -> list[Tool]:
                 "directory doesn't match their logical module). Detects nexus plates (god-module risk: "
                 "coupled to ≥4 other plates). No k parameter — plate count emerges from the topology. "
                 "Use to find hidden module boundaries, misplaced files, and architectural drift."
+            
+                " The temporal signal needs local git history; without it plates are built from structure and behaviour only."
             ),
             inputSchema={
                 "type": "object",
@@ -4039,6 +4180,8 @@ def _build_tools_list() -> list[Tool]:
                 "CLI commands (@click, @app.command), task queues (@celery, @dramatiq), event handlers, "
                 "and standard entry points (main.py, __main__.py). "
                 "Use before refactoring to understand which user-facing behaviors depend on a symbol."
+            
+                " Traces at most max_depth hops (default 5) and recognises only the listed gateway patterns, so a custom framework's entry points are missed."
             ),
             inputSchema={
                 "type": "object",
@@ -4141,6 +4284,8 @@ def _build_tools_list() -> list[Tool]:
                 "grouping by file/plate/depth, risk heat coloring. Themes: 'flow' (blue/purple "
                 "depth gradient), 'risk' (red/yellow/green heat), 'minimal' (monochrome). "
                 "Smart pruning keeps output under max_nodes."
+            
+                " Prunes to max_nodes (default 80), so a large graph renders partially. It reads the dict you pass and never queries the index."
             ),
             inputSchema={
                 "type": "object",
@@ -4218,6 +4363,8 @@ def _build_tools_list() -> list[Tool]:
                 "`path` values as the `scope_path` argument on get_project_intel "
                 "to retrieve per-package intel (Dockerfile / CI / deps) instead of "
                 "the repo-wide aggregate."
+            
+                " Detects only the listed layouts; any other workspace arrangement returns is_monorepo=false."
             ),
             inputSchema={
                 "type": "object",
@@ -4988,7 +5135,7 @@ def _delivery_entries(name: str, result):
                 yield got
 
 
-async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent]:
+async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
     """Dispatch the Counter front door (order / menu / route)."""
     if name == "order":
         return await _handle_order(arguments)
@@ -4996,7 +5143,7 @@ async def _handle_counter_tool(name: str, arguments: dict) -> list[TextContent]:
         return _handle_menu(arguments)
     if name == "route":
         return await _handle_route(arguments)
-    return [TextContent(type="text", text=json.dumps({"error": f"Unknown front-door tool '{name}'"}))]
+    return _error_call_result(json.dumps({"error": f"Unknown front-door tool '{name}'"}))
 
 
 # Common arg-name aliases agents reach for when ordering an action without the
@@ -5102,11 +5249,11 @@ async def _handle_order(arguments: dict) -> list[TextContent] | CallToolResult:
     action = arguments.get("action")
     args = arguments.get("args") or {}
     if not isinstance(args, dict):
-        return [TextContent(type="text", text=json.dumps({"error": "order 'args' must be an object."}, indent=2))]
+        return _error_call_result(json.dumps({"error": "order 'args' must be an object."}, indent=2))
     allow = bool(arguments.get("allow_state_change", False))
     err = _counter.order_gate(action, _catalog_names(), allow)
     if err is not None:
-        return [TextContent(type="text", text=json.dumps({"error": err, "tool": "order"}, indent=2))]
+        return _error_call_result(json.dumps({"error": err, "tool": "order"}, indent=2))
     return await call_tool(action, _normalize_order_args(action, dict(args)))
 
 
@@ -5136,7 +5283,7 @@ async def _handle_route(arguments: dict) -> list[TextContent] | CallToolResult:
     optionally dispatching the top one in the same call."""
     task = arguments.get("task")
     if not task or not isinstance(task, str):
-        return [TextContent(type="text", text=json.dumps({"error": "route requires a 'task' string."}, indent=2))]
+        return _error_call_result(json.dumps({"error": "route requires a 'task' string."}, indent=2))
     repo = arguments.get("repo")
     execute = bool(arguments.get("execute", False))
     names = _catalog_names()
@@ -5283,7 +5430,58 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent] | CallToolR
     Kept as the registered entry point (and the name the front door re-dispatches
     through) so every route into the dispatcher passes the cap.
     """
-    return _enforce_response_cap(name, await _call_tool_impl(name, arguments))
+    from .storage.token_tracker import begin_call_context, end_call_context
+
+    # **The dispatcher is re-entrant.** `order` and executable `route` both re-enter the
+    # registered `call_tool`, so one client request can produce two `tool_calls` rows. Giving
+    # each entry its own `call_uid` keeps a ranking event joined to exactly one latency row,
+    # which is why token-based reset matters: setting `None` in the `finally` would clear the
+    # outer entry's value and silently write `NULL` for it. The consequence to expect is that
+    # `COUNT(DISTINCT call_uid)` counts dispatcher entries rather than client requests, and
+    # the front-door row has no matching ranking event.
+    call_token = begin_call_context()
+    # ⚠⚠ **The outcome is DERIVED from the result the client receives, never
+    # asserted by the frame that produced it** (#551, @rknighton). It used to be
+    # a local flag in `_call_tool_impl` initialised to True, and three of its
+    # four error exits never cleared it -- so schema-validation rejections,
+    # the `search_text` argument guard and a front-door relay of a child's
+    # refusal all returned `isError=True` to the client and wrote `ok=1` to
+    # `tool_calls`, i.e. a 0% error rate over calls the client watched fail.
+    #
+    # Every layer was truthful about ITSELF; `_call_ok` meant "did this frame
+    # hit trouble", which is a different question from "did the request
+    # succeed", and nothing in the name marked the difference. Patching the
+    # three exits would leave the mechanism: a fifth exit (project-level tool
+    # disabling) has the identical shape, and `_enforce_response_cap` refuses
+    # AFTER the frame's `finally` has already written its row, so it could not
+    # be reached from inside `_call_tool_impl` at all.
+    #
+    # `isError` on the returned value is the one fact that answers the question
+    # the column is read for. It is set in exactly one place
+    # (`_error_call_result`), it covers the cap and every future exit, and it
+    # cannot drift from what the client saw because it IS what the client saw.
+    _t0_dispatch = time.perf_counter()
+    _dispatch_ok = False
+    try:
+        result = _enforce_response_cap(name, await _call_tool_impl(name, arguments))
+        _dispatch_ok = not bool(getattr(result, "isError", False))
+        return result
+    finally:
+        try:
+            from .storage.token_tracker import record_tool_latency
+            _duration_ms = (time.perf_counter() - _t0_dispatch) * 1000.0
+            _repo_arg = arguments.get("repo") if isinstance(arguments, dict) else None
+            # v1.108.188: persist against the store the CALL named. analyze_perf
+            # reads tool_calls and ranking_events through one base path, so a row
+            # written to the default while the reader looks in a named store is
+            # invisible to the only thing that consumes it.
+            _store_arg = arguments.get("storage_path") if isinstance(arguments, dict) else None
+            record_tool_latency(
+                name, _duration_ms, ok=_dispatch_ok, repo=_repo_arg, base_path=_store_arg,
+            )
+        except Exception:
+            logger.debug("Latency recording failed for %s", name, exc_info=True)
+        end_call_context(call_token)
 
 
 async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | CallToolResult:
@@ -5292,8 +5490,22 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
     storage_path = os.environ.get("CODE_INDEX_PATH")
     logger.info("tool_call: %s args=%s", name, {k: v for k, v in arguments.items() if k != "content"})
 
-    _t0_call = time.perf_counter()
-    _call_ok = True
+    _call_ok = True  # heartbeat label ONLY; the telemetry row is derived in call_tool
+
+    def _fail(text: str) -> CallToolResult:
+        """Every error exit in THIS frame, so the heartbeat cannot report
+        "ok" for a call the client was told failed (#551).
+
+        ⚠ `tests/test_call_outcome_contract.py` walks this function's AST and
+        fails on a bare `return _error_call_result(...)` left behind here. The
+        reported defect was three exits; the guard is over the PROPERTY,
+        because a fourth was added between the flag and its reader before
+        anyone noticed the first three.
+        """
+        nonlocal _call_ok
+        _call_ok = False
+        return _error_call_result(text)
+
     _reporter_ref = None  # progress reporter; drained in finally (#359)
     _deferred_watch = None  # folder to start watching AFTER dispatch (#384)
     try:   # main handler try starts here, before coerce
@@ -5301,6 +5513,20 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
         # `format` controls compact-output encoding (see .encoding package).
         _requested_format = None
         if isinstance(arguments, dict) and "format" in arguments:
+            # ⚠⚠ COPY BEFORE POPPING. `pop` on the caller's own dict strips
+            # `format` from it, so a caller that reuses one args object gets
+            # JSON on the first call and whatever `server_output` resolves to
+            # on every call after — silently, because the first call proves the
+            # argument works. Over the wire each call arrives as a fresh dict
+            # and nothing shows; the exposed callers are in-process ones, which
+            # includes the Counter front door re-dispatching through here.
+            #
+            # Found via #482: two tests reusing one `args` dict got a MUNCH
+            # payload on their second call and failed in `json.loads` at char 0.
+            # ⚠ It only surfaced on 3 of 8 CI legs, because the second call
+            # lands on `auto` and the 15% encoding gate then decides per
+            # response — so the same defect reads as an environment quirk.
+            arguments = dict(arguments)
             _requested_format = arguments.pop("format")
         # Coerce stringified booleans/integers/numbers before routing
         schema = (await _ensure_tool_schemas()).get(name)
@@ -5309,7 +5535,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
             try:
                 jsonschema.validate(instance=arguments, schema=schema)
             except jsonschema.ValidationError as e:
-                return _error_call_result(json.dumps(
+                return _fail(json.dumps(
                     {"error": f"Input validation error: {e.message}"}, indent=2
                 ))
 
@@ -5317,7 +5543,12 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
         # strict-freshness/auto-watch (the front door isn't repo-scoped; order
         # re-enters call_tool for the real action, which then runs those hooks).
         if name in _COUNTER_FRONT_DOOR:
-            return await _handle_counter_tool(name, arguments)
+            _front = await _handle_counter_tool(name, arguments)
+            if getattr(_front, "isError", False):
+                # A relayed child refusal IS this call's outcome. The relay
+                # itself succeeded, which is exactly why this was missed.
+                _call_ok = False
+            return _front
 
         # Session yield tracking (v1.108.146): repeated identical calls +
         # follow-through/edit-through signals for get_session_stats' `yield`
@@ -5355,7 +5586,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
                 arguments.get("query", ""), bool(arguments.get("is_regex", False))
             )
             if _arg_err is not None:
-                return _error_call_result(json.dumps(_arg_err, indent=2))
+                return _fail(json.dumps(_arg_err, indent=2))
 
         # Strict freshness mode: wait for any in-progress reindex to complete
         # before serving query results (except for write/index tools).
@@ -5373,7 +5604,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
         allow_disable_tier = config_module.get("allow_disabling_tier_controls", False, repo=repo_arg)
         protected_at_call = frozenset() if allow_disable_tier else _UNDISABLEABLE_TOOLS
         if name not in protected_at_call and config_module.is_tool_disabled(name, repo=repo_arg):
-            return _error_call_result(json.dumps({
+            return _fail(json.dumps({
                 "error": (
                     f"Tool '{name}' is disabled in this project's configuration. "
                     f"Project-level tool disabling is set via the 'disabled_tools' key "
@@ -6953,8 +7184,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
             # In-band tool error (e.g. ambiguous/not-found repo, Unknown tool).
             # Carry the same JSON body but flag isError for clients that branch
             # on it (F-P01); the v1.108.30 passthrough already kept errors JSON.
-            _call_ok = False
-            return _error_call_result(_text)
+            return _fail(_text)
         _record_response_tokens(_text)
         return [TextContent(type="text", text=_text)]
 
@@ -6974,13 +7204,13 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
                 "error": f"Internal error processing {name}",
                 "summary": f"KeyError: {e}",
             }
-            return _error_call_result(json.dumps(payload, separators=(',', ':')))
+            return _fail(json.dumps(payload, separators=(',', ':')))
         _missing_msg = f"Missing required argument: {e}. Check the tool schema for correct parameter names."
         if str(e).strip("'\"") == "repo" and _steer_state["repos"]:
             # Informed retry (v1.108.158): agents ordering without resident
             # schemas omit repo — name what this session has already resolved.
             _missing_msg += " This session has resolved: " + ", ".join(_steer_state["repos"]) + ". Pass repo=<one of these>."
-        return _error_call_result(json.dumps({"error": _missing_msg}, separators=(',', ':')))
+        return _fail(json.dumps({"error": _missing_msg}, separators=(',', ':')))
     except Exception as exc:
         _call_ok = False
         logger.error("call_tool %s failed", name, exc_info=True)
@@ -6992,7 +7222,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
             "error": f"Internal error processing {name}",
             "summary": summary,
         }
-        return _error_call_result(json.dumps(payload, separators=(',', ':')))
+        return _fail(json.dumps(payload, separators=(',', ':')))
     finally:
         # Flush in-flight progress notifications BEFORE the response is
         # written (the SDK writes only after call_tool returns, and finally
@@ -7021,20 +7251,6 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent] | Cal
                 await _auto_watch_after_tool(_deferred_watch)
             except Exception:
                 logger.debug("Deferred auto-watch failed", exc_info=True)
-        try:
-            from .storage.token_tracker import record_tool_latency
-            duration_ms = (time.perf_counter() - _t0_call) * 1000.0
-            _repo_arg = arguments.get("repo") if isinstance(arguments, dict) else None
-            # v1.108.188: persist against the store the CALL named. analyze_perf
-            # reads tool_calls and ranking_events through one base path, so a row
-            # written to the default while the reader looks in a named store is
-            # invisible to the only thing that consumes it.
-            _store_arg = arguments.get("storage_path") if isinstance(arguments, dict) else None
-            record_tool_latency(
-                name, duration_ms, ok=_call_ok, repo=_repo_arg, base_path=_store_arg,
-            )
-        except Exception:
-            logger.debug("Latency recording failed for %s", name, exc_info=True)
 
 
 async def _run_server_with_watcher(
@@ -7091,6 +7307,7 @@ async def _run_server_with_watcher(
         storage_path=watcher_kwargs.get("storage_path"),
         extra_ignore_patterns=watcher_kwargs.get("extra_ignore_patterns"),
         follow_symlinks=watcher_kwargs.get("follow_symlinks", False),
+        context_providers=watcher_kwargs.get("context_providers", True),
         quiet=True,
         log_file_handle=_log_file_handle,
     )
@@ -7237,7 +7454,7 @@ async def run_stdio_server():
             await server.run(
                 read_stream,
                 write_stream,
-                server.create_initialization_options(),
+                _initialization_options(),
             )
     finally:
         if not _watchdog_task.done():
@@ -7356,7 +7573,7 @@ async def run_sse_server(host: str, port: int):
             await server.run(
                 read_stream,
                 write_stream,
-                server.create_initialization_options(),
+                _initialization_options(),
             )
 
     middleware = []
@@ -7534,7 +7751,7 @@ async def run_streamable_http_server(host: str, port: int):
                     await server.run(
                         read_stream,
                         write_stream,
-                        server.create_initialization_options(),
+                        _initialization_options(),
                     )
             except asyncio.CancelledError:
                 pass
@@ -7715,6 +7932,64 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# Quick-start steps as DATA, not literal lines (#506).
+#
+# ⚠⚠ #495 filtered `### All tools` and left this section as six fixed strings
+# that no filter reached, so the guide could still instruct a caller to run a
+# tool `call_tool` rejects. **Fixing the reported section and leaving an
+# adjacent one with the identical defect is the failure mode this project keeps
+# hitting** — the same shape as #495's own "the filtering existed and a second
+# generator walked around it".
+#
+# Each entry is (tools named, text, alternatives). A step whose tool will not
+# dispatch is dropped whole and the remainder RENUMBERED, so the list never
+# shows a gap or an orphaned continuation line.
+_QUICK_START_STEPS: tuple[tuple[tuple[str, ...], str, tuple[tuple[str, str], ...]], ...] = (
+    (
+        ("list_repos",),
+        "`list_repos` — check if the project is indexed.",
+        (("index_folder", "local"), ("index_repo", "GitHub URL")),
+    ),
+    (
+        ("search_symbols",),
+        "`search_symbols` — find functions/classes by name or description.",
+        (),
+    ),
+    (
+        ("get_context_bundle",),
+        "`get_context_bundle` — symbol source + imports in one call.",
+        (),
+    ),
+    (
+        ("search_text",),
+        "`search_text` — full-text/regex search for literals and comments.",
+        (),
+    ),
+)
+
+
+def _quick_start_lines(active: Optional[set]) -> list[str]:
+    """Numbered quick-start steps, restricted to tools that will dispatch.
+
+    ``active`` of ``None`` means no filtering is needed and the output is
+    byte-identical to the pre-#506 literal.
+    """
+    def _ok(name: str) -> bool:
+        return active is None or name in active
+
+    out: list[str] = []
+    step = 0
+    for tools, text, alternatives in _QUICK_START_STEPS:
+        if not all(_ok(t) for t in tools):
+            continue
+        step += 1
+        out.append(f"{step}. {text}")
+        available = [f"`{t}` ({label})" for t, label in alternatives if _ok(t)]
+        if available:
+            out.append("   If not: " + " or ".join(available) + ".")
+    return out
+
+
 def _generate_claude_md_snippet(missing_only: bool = False) -> str:
     """Return the recommended CLAUDE.md prompt-policy snippet.
 
@@ -7752,6 +8027,41 @@ def _generate_claude_md_snippet(missing_only: bool = False) -> str:
             logger.debug("front-door snippet unavailable; using the full one", exc_info=True)
 
     categories = _SNIPPET_TOOL_CATEGORIES
+
+    # #495: filter to what this process will actually dispatch.
+    #
+    # ⚠⚠ `disabled_tools` ships as `["test_summarizer"]`, so at SHIPPED DEFAULTS
+    # this guide advertised a tool `call_tool` then refuses — an agent reads the
+    # name here, calls it, and gets an error before the handler runs. Nothing
+    # about that is configuration-dependent; it was the out-of-the-box state.
+    #
+    # ⚠⚠ The filtering already existed and a SECOND generator walked around it.
+    # Commit e086e9a ("claude-md respects tool_profile and disabled_tools", #242)
+    # added exactly this to `cli/init.py`, which is why the CLI policy path
+    # filters correctly today. This function is the other generator and never
+    # received it. **Reuse `_get_active_tools` rather than writing a third
+    # filter** — a copy is how these two drifted apart in the first place.
+    #
+    # ⚠ Profile is honoured too, not just `disabled_tools`. The registered
+    # description promises the guide "Matches the active tool surface, tier and
+    # disabled_tools", and `tier` is the profile. A profile-hidden tool stays
+    # dispatchable by name, so naming it costs context rather than erroring
+    # (#397) — a weaker harm than the reported one, and the same promise.
+    try:
+        from .cli.init import _get_active_tools
+        _active = _get_active_tools()
+    except Exception:
+        logger.debug("active-tool filter unavailable; listing all", exc_info=True)
+        _active = None
+    if _active is not None:
+        categories = [
+            (cat, [t for t in tools if t in _active])
+            for cat, tools in categories
+        ]
+        # A category emptied by filtering is dropped whole; a bare "**Search:**"
+        # with nothing after it reads as a surface with no tools in it.
+        categories = [(cat, tools) for cat, tools in categories if tools]
+
     from . import __version__ as _ver
     lines = [
         f"## jcodemunch-mcp (v{_ver})",
@@ -7759,11 +8069,7 @@ def _generate_claude_md_snippet(missing_only: bool = False) -> str:
         "Use jcodemunch-mcp tools instead of Grep/Read/Glob for any indexed repository.",
         "",
         "### Quick start",
-        "1. `list_repos` — check if the project is indexed.",
-        "   If not: `index_folder` (local) or `index_repo` (GitHub URL).",
-        "2. `search_symbols` — find functions/classes by name or description.",
-        "3. `get_context_bundle` — symbol source + imports in one call.",
-        "4. `search_text` — full-text/regex search for literals and comments.",
+        *_quick_start_lines(_active),
         "",
         "### All tools",
     ]
@@ -8390,14 +8696,26 @@ def _run_config(check: bool = False, init: bool = False, upgrade: bool = False) 
                 # `C:/.../jcodemunch-mcp.EXE hook-pretooluse` install and the
                 # check reported every hook missing on a correctly-installed box.
                 _present = False
+                _installed_matcher = ""
                 for _rule in _installed_hooks.get(_event, []):
                     for _h in _rule.get("hooks", []):
                         if _extract_jcm_subcommand(_h.get("command", "")) == _hook_cmd:
                             _present = True
+                            # Report the matcher actually INSTALLED, not the
+                            # shipped one — a pre-upgrade settings.json can
+                            # carry a stale matcher, and printing the expected
+                            # value here masked exactly that defect.
+                            _installed_matcher = _rule.get("matcher", "")
                             break
                 if _present:
-                    _label = f"{_event}({_matcher})" if _matcher else _event
+                    _label = f"{_event}({_installed_matcher})" if _installed_matcher else _event
                     print(f"  {green(CHECK)} {_hook_cmd} installed [{_label}]")
+                    if _installed_matcher != _matcher:
+                        print(
+                            f"  {yellow(WARN)} {_hook_cmd} matcher is stale: "
+                            f"installed '{_installed_matcher}', current is "
+                            f"'{_matcher}'. Re-run: jcodemunch-mcp init --hooks"
+                        )
                     _found_any = True
                 else:
                     print(f"  {dim(f'  {_hook_cmd} not installed')}")
@@ -8705,6 +9023,11 @@ def main(argv: Optional[list[str]] = None):
         "--no-ai-summaries",
         action="store_true",
         help="Disable AI-generated summaries during re-indexing",
+    )
+    watch_parser.add_argument(
+        "--no-context-providers",
+        action="store_true",
+        help="Skip framework context providers (Django/Express/Next.js/Rails/dbt/...). They are discovered once per watched folder and cached, so this trades route and template edges for a lower first-event cost (#558)",
     )
     watch_parser.add_argument(
         "--follow-symlinks",
@@ -9461,7 +9784,7 @@ def main(argv: Optional[list[str]] = None):
     # --- hook-precompact ---
     subparsers.add_parser(
         "hook-precompact",
-        help="PreCompact hook: generate session snapshot before context compaction (reads stdin)",
+        help="PreCompact hook: register the transcript root before compaction (reads stdin; the snapshot is delivered by hook-sessionstart)",
     )
 
     # --- hook-taskcomplete ---
@@ -9512,6 +9835,11 @@ def main(argv: Optional[list[str]] = None):
         help="Disable AI-generated summaries during re-indexing",
     )
     wc_parser.add_argument(
+        "--no-context-providers",
+        action="store_true",
+        help="Skip framework context providers (Django/Express/Next.js/Rails/dbt/...). They are discovered once per watched folder and cached, so this trades route and template edges for a lower first-event cost (#558)",
+    )
+    wc_parser.add_argument(
         "--follow-symlinks",
         action="store_true",
         help="Include symlinked files in indexing",
@@ -9538,6 +9866,8 @@ def main(argv: Optional[list[str]] = None):
     )
     wa_parser.add_argument("--no-ai-summaries", action="store_true",
         help="Disable AI-generated summaries during re-indexing")
+    wa_parser.add_argument("--no-context-providers", action="store_true",
+        help="Skip framework context providers (Django/Express/Next.js/Rails/dbt/...). They are discovered once per watched folder and cached, so this trades route and template edges for a lower first-event cost (#558)")
     wa_parser.add_argument("--follow-symlinks", action="store_true",
         help="Include symlinked files in indexing")
     wa_parser.add_argument("--extra-ignore", nargs="*",
@@ -10278,6 +10608,7 @@ def main(argv: Optional[list[str]] = None):
                     storage_path=os.environ.get("CODE_INDEX_PATH"),
                     extra_ignore_patterns=args.extra_ignore,
                     follow_symlinks=args.follow_symlinks,
+                    context_providers=not args.no_context_providers,
                     idle_timeout_minutes=args.idle_timeout,
                 )
             )
@@ -10295,6 +10626,7 @@ def main(argv: Optional[list[str]] = None):
                 storage_path=os.environ.get("CODE_INDEX_PATH"),
                 extra_ignore_patterns=args.extra_ignore,
                 follow_symlinks=args.follow_symlinks,
+                context_providers=not args.no_context_providers,
                 rediscover_interval_s=args.rediscover_interval or DEFAULT_REDISCOVER_INTERVAL_S,
             )
         )
@@ -10331,6 +10663,7 @@ def main(argv: Optional[list[str]] = None):
                 storage_path=os.environ.get("CODE_INDEX_PATH"),
                 extra_ignore_patterns=args.extra_ignore,
                 follow_symlinks=args.follow_symlinks,
+                context_providers=not args.no_context_providers,
             )
         )
     elif args.command == "index":

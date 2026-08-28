@@ -4,7 +4,6 @@ import heapq
 import json
 import logging
 import math
-import re
 import time
 from fnmatch import fnmatch
 from typing import Optional
@@ -13,6 +12,26 @@ logger = logging.getLogger(__name__)
 
 from ..storage import IndexStore, record_savings, estimate_savings, cost_avoided
 from ..parser.imports import resolve_specifier
+
+# ⚠ Re-exported, not redefined -- these moved to `retrieval/scoring.py` to
+# break the search_symbols <-> signal_fusion cycle. Patch THERE, not here:
+# a monkeypatch on this alias is silently ineffective.
+from ..retrieval.scoring import (  # noqa: F401,E402
+    _ABBREV_MAP,
+    _BM25_B,
+    _BM25_K1,
+    _CAMEL_RE,
+    _CJK_RE,
+    _FIELD_REPS,
+    _STEM_RULES,
+    _TOKEN_RE,
+    _cjk_bigrams,
+    _cosine_similarity,
+    _identity_score,
+    _stem,
+    _sym_tokens,
+    _tokenize,
+)
 from ._utils import (
     resolve_repo,
     resolve_fqn,
@@ -29,11 +48,8 @@ _FUZZY_NEAR_MISS_THRESHOLD = 0.1
 _NEGATIVE_EVIDENCE_THRESHOLD = 0.5
 
 # BM25 hyperparameters (standard Robertson et al. values)
-_BM25_K1 = 1.5
-_BM25_B = 0.75
 
 # Per-field repetition weights: name appears 3× in the virtual doc, etc.
-_FIELD_REPS = {"name": 3, "keywords": 2, "signature": 2, "summary": 1, "docstring": 1}
 
 # Centrality: log-scaled bonus for symbols in frequently-imported files (tiebreaker only)
 _CENTRALITY_WEIGHT = 0.3
@@ -42,30 +58,13 @@ _CENTRALITY_WEIGHT = 0.3
 _PR_COMBINED_WEIGHT = 100.0
 
 # Pre-compiled regexes for _tokenize (called ~9000× on cold BM25 build)
-_CAMEL_RE = re.compile(r"([a-z])([A-Z])")
 # Unicode word runs (was [a-zA-Z0-9]{2,}, which silently dropped ALL
 # non-ASCII — CJK names/docstrings produced zero BM25 tokens; jdoc #91 class).
-_TOKEN_RE = re.compile(r"[^\W_]+")
 # CJK scripts carry no whitespace word boundaries; runs in these ranges are
 # expanded to overlapping character bigrams (same expansion at index and
 # query time, so bigram overlap is the match signal).
-_CJK_RE = re.compile(
-    "[ᄀ-ᇿ"  # Hangul Jamo
-    "぀-ヿ"  # Hiragana + Katakana
-    "㄰-㆏"  # Hangul Compatibility Jamo
-    "ㇰ-ㇿ"  # Katakana Phonetic Extensions
-    "㐀-䶿"  # CJK Unified Ideographs Extension A
-    "一-鿿"  # CJK Unified Ideographs
-    "가-힯"  # Hangul Syllables
-    "豈-﫿]+"  # CJK Compatibility Ideographs
-)
 
 
-def _cjk_bigrams(run: str) -> list[str]:
-    """Overlapping character bigrams for a CJK run; a lone char passes through."""
-    if len(run) == 1:
-        return [run]
-    return [run[i : i + 2] for i in range(len(run) - 1)]
 
 # Search result cache (Feature 5 — session-aware routing)
 import threading
@@ -184,138 +183,15 @@ def result_cache_invalidate_repo(repo_key: str) -> int:
 # Abbreviation map: bidirectional code abbreviation <-> full form.
 # Built once at import time.
 # ---------------------------------------------------------------------------
-_ABBREV_MAP: dict[str, list[str]] = {
-    "db": ["database"], "auth": ["authentication", "authorization"],
-    "config": ["configuration"], "ctx": ["context"], "env": ["environment"],
-    "err": ["error"], "exec": ["execute", "execution"],
-    "fn": ["function"], "func": ["function"],
-    "impl": ["implementation", "implement"], "init": ["initialize", "initialization"],
-    "iter": ["iterator", "iterate"], "len": ["length"], "lib": ["library"],
-    "max": ["maximum"], "mem": ["memory"], "min": ["minimum"],
-    "msg": ["message"], "num": ["number"], "obj": ["object"],
-    "param": ["parameter"], "params": ["parameters"], "pkg": ["package"],
-    "prev": ["previous"], "proc": ["process", "procedure"],
-    "prop": ["property"], "props": ["properties"],
-    "ref": ["reference"], "refs": ["references"], "repo": ["repository"],
-    "req": ["request"], "res": ["response", "result"], "ret": ["return"],
-    "src": ["source"], "str": ["string"],
-    "sync": ["synchronize", "synchronous"], "sys": ["system"],
-    "temp": ["temporary"], "tmp": ["temporary"],
-    "val": ["value"], "var": ["variable"], "vars": ["variables"],
-    # Reverse mappings
-    "database": ["db"], "authentication": ["auth"], "authorization": ["auth"],
-    "configuration": ["config"], "context": ["ctx"], "environment": ["env"],
-    "error": ["err"], "execute": ["exec"], "function": ["func", "fn"],
-    "initialize": ["init"], "initialization": ["init"],
-    "iterator": ["iter"], "message": ["msg"],
-    "parameter": ["param"], "parameters": ["params"],
-    "repository": ["repo"], "request": ["req"], "response": ["res"],
-    "temporary": ["temp", "tmp"], "variable": ["var"], "variables": ["vars"],
-}
 
 # Stemming rules: (suffix, replacement, min_base_length)
 # Ordered longest-first; doubled-consonant rules before single.
-_STEM_RULES: list[tuple[str, str, int]] = [
-    ("ation", "", 3), ("izing", "ize", 3), ("ating", "ate", 3),
-    ("nning", "n", 2), ("tting", "t", 2), ("pping", "p", 2),
-    ("gging", "g", 2), ("bbing", "b", 2), ("dding", "d", 2),
-    ("mming", "m", 2), ("lling", "l", 2),
-    ("sses", "ss", 2), ("ness", "", 3), ("ment", "", 3), ("tion", "", 3),
-    ("ized", "ize", 3), ("ling", "le", 3), ("ring", "r", 3),
-    ("ning", "n", 3), ("ting", "t", 3), ("ping", "p", 3),
-    ("bing", "b", 2), ("ding", "d", 3), ("ging", "g", 3),
-    ("king", "k", 3), ("ming", "m", 3),
-    ("lled", "ll", 3), ("nned", "n", 3), ("tted", "t", 3),
-    ("pped", "p", 3), ("gged", "g", 3), ("bbed", "b", 3), ("dded", "d", 3),
-    ("ing", "", 3), ("ies", "y", 3),
-    ("ed", "", 3), ("er", "", 3), ("ly", "", 3), ("es", "", 4),
-]
 
 
-def _stem(word: str) -> str:
-    """Lightweight Porter-style suffix stripping for code identifiers."""
-    w = word.lower()
-    if len(w) < 5:
-        return w
-    for suffix, replacement, min_base in _STEM_RULES:
-        if w.endswith(suffix):
-            base = w[:-len(suffix)]
-            if len(base) >= min_base:
-                return base + replacement
-    # Strip trailing 's' if result is 4+ chars and doesn't end in 's'
-    if w.endswith("s") and len(w) >= 5 and w[-2] != "s":
-        return w[:-1]
-    return w
 
 
-def _tokenize(text: str) -> list[str]:
-    """Split camelCase / snake_case text into tokens with stemming and
-    abbreviation expansion for richer BM25 matching."""
-    if not text:
-        return []
-    text = _CAMEL_RE.sub(r"\1_\2", text)
-    # Pad CJK runs with spaces so mixed-script tokens split cleanly.
-    text = _CJK_RE.sub(lambda m: " " + m.group(0) + " ", text)
-    raw_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
-
-    result = []
-    seen: set[str] = set()
-    for tok in raw_tokens:
-        if _CJK_RE.fullmatch(tok):
-            # Bigram expansion; stemming/abbreviations are English-only.
-            for bg in _cjk_bigrams(tok):
-                result.append(bg)
-                seen.add(bg)
-            continue
-        if len(tok) < 2:
-            continue
-        result.append(tok)
-        seen.add(tok)
-        # Stemmed form
-        stemmed = _stem(tok)
-        if stemmed != tok and stemmed not in seen:
-            result.append(stemmed)
-            seen.add(stemmed)
-        # Abbreviation expansion (canonical forms, not stemmed)
-        for key in (tok, stemmed) if stemmed != tok else (tok,):
-            for exp in _ABBREV_MAP.get(key, ()):
-                if exp not in seen:
-                    result.append(exp)
-                    seen.add(exp)
-    return result
 
 
-def _sym_tokens(sym: dict) -> list[str]:
-    """Weighted token bag for a symbol (repetition = field weight).
-    Cached on the symbol dict to avoid re-tokenizing across calls.
-    Also caches _tf (term frequency dict) and _dl (document length)."""
-    cached = sym.get("_tokens")
-    # Fast path: tokens AND tf/dl all present — nothing to do
-    if cached is not None and "_tf" in sym:
-        return cached
-    # Build tokens if not yet cached (or reuse if carried forward without _tf/_dl)
-    if cached is not None:
-        tokens = cached
-    else:
-        tokens = []
-        tokens += _tokenize(sym.get("name", "")) * _FIELD_REPS["name"]
-        tokens += [kw.lower() for kw in sym.get("keywords", [])] * _FIELD_REPS["keywords"]
-        tokens += _tokenize(sym.get("signature", "")) * _FIELD_REPS["signature"]
-        tokens += _tokenize(sym.get("summary", "")) * _FIELD_REPS["summary"]
-        tokens += _tokenize(sym.get("docstring", "")) * _FIELD_REPS["docstring"]
-        sym["_tokens"] = tokens
-    # Always (re)compute tf/dl — cheap dict ops, ensures consistency
-    # NB: _tokens/_tf/_dl are internal; all API-facing code must use explicit
-    # key picks, not raw dict passthrough
-    tf: dict[str, int] = {}
-    for t in tokens:
-        tf[t] = tf.get(t, 0) + 1
-    sym["_tf"] = tf
-    # T10: use unique token count for _dl so it matches df (document-frequency)
-    # which also counts unique tokens per symbol. Using len(tokens) inflates
-    # avgdl by the field-repetition weights, distorting BM25 normalisation.
-    sym["_dl"] = len(set(tokens))
-    return tokens
 
 
 def _compute_bm25(symbols: list[dict]) -> tuple[dict[str, float], float, dict[str, list[int]]]:
@@ -364,67 +240,59 @@ def _compute_centrality(
     return {f: math.log(1 + c) * _CENTRALITY_WEIGHT for f, c in counts.items()}
 
 
-def _identity_score(sym: dict, query_joined: str, raw_query: str = "") -> float:
-    """Identity channel: exact, normalised, or prefix match on symbol name/ID.
+# The four keys the lexical corpus cache publishes together. ``idf`` is the
+# readiness sentinel every historical call site checked, so it stays the last
+# one written; the fast path below checks all four anyway, so a future edit that
+# reorders the writes degrades to an extra lock acquisition instead of a
+# KeyError (#490).
+_BM25_CORPUS_KEYS = ("avgdl", "inverted", "centrality", "idf")
 
-    Returns a high score for exact matches and a decreasing score for weaker
-    identity matches by specificity.  Replaces the old ``50.0`` exact-name hack.
+# Used only if an index arrives without its own lock. A process-wide lock is
+# slower than a per-index one and correct; the `threading.Lock()` this replaces
+# was a NEW lock per caller, i.e. no mutual exclusion at all, which is the
+# failure this whole helper exists to remove.
+_BM25_FALLBACK_LOCK = threading.Lock()
 
-    Scoring:
-      - Exact name match          → 50.0
-      - Exact ID match            → 50.0
-      - Normalised name/ID match  → 40.0
-      - Name starts with query    → 30.0
-      - ID contains query segment → 20.0
-      - No match                  →  0.0
 
-    ⚠ **The 40.0 tier is the whole point of #458 and it is easy to delete by
-    "simplification".** ``_tokenize`` folds case *and* strips leading
-    underscores and punctuation, so a pytest fixture named ``state`` and the
-    class literally named ``_State`` both reach the tokenized comparison for
-    the query ``_State``. Grading them alike put them at 50.0 apiece, and the
-    tie fell through to BM25, where the shorter name with a docstring won —
-    a test fixture outranking the source symbol it tests, by 0.355 points out
-    of ~58. A literal match must outrank a normalised one, and ``identity_type``
-    must not report ``exact`` for a grade it did not measure (#440's shape).
+def ensure_bm25_cache(index) -> dict:
+    """Populate and return ``index._bm25_cache``'s lexical corpus stats.
 
-    ⚠ **Case folding alone still counts as exact, deliberately.** ``raw_lower``
-    is already case-folded and has graded exact since the channel arrived, so
-    making case load-bearing would change the answer for every caller who types
-    ``getuser`` for ``getUser`` — a behaviour change with no defect behind it.
-    What drops to 40.0 is a match that needed *more* than case: an underscore,
-    a separator, anything ``_tokenize`` removed.
+    Builds ``idf`` / ``avgdl`` / ``inverted`` / ``centrality`` exactly once per
+    loaded index, under the index's own lock, and returns the cache dict.
+
+    LIMITATION: this covers only the lexical corpus keys. ``pagerank`` and
+    ``name_map`` are built by their own single-key blocks elsewhere; each writes
+    the one key it also checks, so those are atomic by construction and are not
+    routed through here.
+
+    ⚠⚠ The build must never publish a key a reader treats as "cache ready"
+    before the keys that reader will go on to read. Three call sites wrote
+    ``cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(...)`` and
+    then ``cache["centrality"] = ...`` as a separate statement -- four
+    ``__setitem__`` calls behind a check-then-build guarded on ``idf`` alone. A
+    second caller arriving in that window passed the readiness check and raised
+    ``KeyError: 'centrality'`` (#490). The window is not narrow: it is the whole
+    runtime of ``_compute_centrality`` over the corpus.
     """
-    raw_lower = raw_query.lower() if raw_query else ""
-    if not raw_lower and not query_joined:
-        return 0.0
-    name_lower = sym.get("name", "").lower()
-    sym_id_lower = sym.get("id", "").lower()
+    cache = index._bm25_cache
+    if all(k in cache for k in _BM25_CORPUS_KEYS):
+        return cache
+    with getattr(index, "_bm25_lock", None) or _BM25_FALLBACK_LOCK:
+        if all(k in cache for k in _BM25_CORPUS_KEYS):
+            return cache
+        idf, avgdl, inverted = _compute_bm25(index.symbols)
+        centrality = _compute_centrality(
+            index.symbols, index.imports, index.alias_map,
+            getattr(index, "psr4_map", None),
+        )
+        cache["avgdl"] = avgdl
+        cache["inverted"] = inverted
+        cache["centrality"] = centrality
+        # Sentinel last: see the module note above.
+        cache["idf"] = idf
+    return cache
 
-    # Raw query preserves snake_case/camelCase for exact matches.
-    if raw_lower and (raw_lower == name_lower or raw_lower == sym_id_lower):
-        return 50.0
 
-    # Tokenized fallback preserves previous semantics for callers that only have terms.
-    if query_joined == name_lower or query_joined == sym_id_lower:
-        # With no raw spelling there is nothing to be literal about, so the
-        # tokenized match is the best evidence available and stays exact.
-        return 50.0 if not raw_lower else 40.0
-
-    # Prefix match on name (e.g. query "get_sym" matches "get_symbol_source")
-    if query_joined and name_lower.startswith(query_joined):
-        return 30.0
-    if raw_lower and name_lower.startswith(raw_lower):
-        return 30.0
-
-    # Qualified ID segment match (e.g. query "storage.indexstore" matches
-    # "src/storage/index_store.py::IndexStore")
-    if query_joined and query_joined in sym_id_lower:
-        return 20.0
-    if raw_lower and raw_lower in sym_id_lower:
-        return 20.0
-
-    return 0.0
 
 
 def _ledger_identity_rows(
@@ -567,20 +435,6 @@ def _edit_distance(a: str, b: str) -> int:
     return row[la]
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity in pure Python (no numpy).
-
-    Returns 0.0 if either vector is zero-length or the lists differ in size.
-    Uses ``math.sqrt`` and ``sum()`` — no external deps.
-    """
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
 
 
 def _materialize_full_entry(entry: dict, index, store, owner: str, name: str) -> None:
@@ -690,8 +544,9 @@ def search_symbols(
             "centrality" = filter by query match, rank by PageRank score.
             "combined" = BM25 + PageRank weighted combination.
         semantic: Enable semantic (embedding-based) search. Requires an embedding
-            provider to be configured (JCODEMUNCH_EMBED_MODEL, GOOGLE_API_KEY +
-            GOOGLE_EMBED_MODEL, or OPENAI_API_KEY + OPENAI_EMBED_MODEL).
+            provider; ``embeddings.advice.PROVIDER_HINT`` is the single source for
+            which ones and which wins (#489 — this docstring used to enumerate
+            them and had gone stale).
             When False (default) there is zero performance impact and no new imports.
         semantic_weight: Weight for semantic score in hybrid ranking (0.0–1.0).
             BM25 receives ``1 - semantic_weight``. Default 0.5.
@@ -793,6 +648,15 @@ def search_symbols(
                 _is_negative = isinstance(_cv, dict) and _cv.get("state") == "absent"
                 _now_state = _subject.capture(index, include_tree=_is_negative)
                 _why = _subject.changed(_cached_state, _now_state)
+                # This branch is the only place in the tree that learns whether
+                # a SERVED hit still describes the index, so it is the only
+                # place that can keep `hit_rate` honest. Reporting is
+                # best-effort: a telemetry failure must never affect the answer.
+                try:
+                    from ..storage import result_cache_hit_validated
+                    result_cache_hit_validated("search_symbols", stale=bool(_why))
+                except Exception:
+                    logger.debug("cache-hit validation telemetry failed", exc_info=True)
                 if _why:
                     _subject.revalidate_verdict(_cv, _why)
                     # The verdict now discloses that the subject moved — but the
@@ -861,28 +725,21 @@ def search_symbols(
         from .embed_repo import _detect_provider
         _semantic_provider = _detect_provider()
         if _semantic_provider is None:
+            from ..embeddings.advice import (  # noqa: PLC0415
+                NO_PROVIDER_MESSAGE as _NO_PROVIDER_MESSAGE,
+            )
             return {
                 "error": "no_embedding_provider",
-                "message": (
-                    "No embedding provider is configured. Set one of: "
-                    "JCODEMUNCH_EMBED_MODEL (sentence-transformers, free/local), "
-                    "GOOGLE_API_KEY + GOOGLE_EMBED_MODEL (Gemini), or "
-                    "OPENAI_API_KEY + OPENAI_EMBED_MODEL (OpenAI)."
-                ),
+                "message": _NO_PROVIDER_MESSAGE,
             }
 
     # BM25 corpus stats — cached on CodeIndex, computed once per index load
     query_terms = _tokenize(query) or [query.lower()]
     # Guard: empty string in query_terms causes "" to match every filename
     query_terms = [t for t in query_terms if t]
-    cache = index._bm25_cache
-    if "idf" not in cache:
-        # Single-flight: concurrent cold searches must not each build the
-        # full-corpus BM25 state (#370)
-        with getattr(index, "_bm25_lock", None) or threading.Lock():
-            if "idf" not in cache:
-                cache["idf"], cache["avgdl"], cache["inverted"] = _compute_bm25(index.symbols)
-                cache["centrality"] = _compute_centrality(index.symbols, index.imports, index.alias_map, getattr(index, "psr4_map", None))
+    # Single-flight: concurrent cold searches must not each build the
+    # full-corpus BM25 state (#370), nor observe a half-published one (#490).
+    cache = ensure_bm25_cache(index)
     idf = cache["idf"]
     avgdl = cache["avgdl"]
     centrality = cache["centrality"]
@@ -1747,6 +1604,19 @@ def _search_symbols_semantic(
     # The semantic channel really ran, and the verdict should say so rather than
     # inherit the `off` default from `semantic_requested=False` above.
     meta["verdict"]["channels"]["semantic"] = "ok"
+    # #500: a store written across a model change holds two vector widths, and
+    # the matrix silently excludes whichever width is not the first row's. The
+    # producer is fixed, but stores already in that state stay that way until
+    # the next model change or a forced re-embed — so say so, or a partial
+    # corpus reads as a complete one and short results read as a finding.
+    _skipped_dim = getattr(matrix, "skipped_dim_mismatch", 0) if matrix else 0
+    if _skipped_dim:
+        meta["semantic_partial"] = {
+            "symbols_excluded": _skipped_dim,
+            "reason": "embedding_dimension_mismatch",
+            "remedy": "embed_repo(force=True) rebuilds the store at one width",
+        }
+        meta["verdict"]["channels"]["semantic"] = "partial"
     negative_evidence = _vres["negative_evidence"]
     if negative_evidence is not None:
         result["negative_evidence"] = negative_evidence

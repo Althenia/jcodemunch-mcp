@@ -353,6 +353,24 @@ DEFAULTS = {
     "exclude_secret_patterns": [],
     "exclude_skip_directories": [],
     "extra_extensions": {},
+    # Racket only, and deliberately NOT a generic `definition_forms` map. A
+    # Racket project routinely defines its own defining forms via
+    # `define-syntax` -- congame binds ~448 symbols through `defstep`,
+    # `defstudy` and `defvar` -- and no static parser can know what those bind.
+    # Declaring them here is the user ASSERTING it, which is the only safe
+    # source for that claim. Clojure, Elixir and Common Lisp have the same
+    # blindness, but none of them has been measured, so a shared key would be a
+    # general promise backed by one data point. If a second language earns one,
+    # `<lang>_definition_forms` appears beside this and unification becomes a
+    # decision with evidence behind it.
+    "racket_definition_forms": {},
+    # Racket only. `#lang` names a READER, and tree-sitter-racket reads
+    # S-expressions, so a `.rkt` whose reader is Markdown (`punct`) or at-exp
+    # text (`conscript`) must be told apart before the grammar runs. Built-in
+    # lists cover the distribution's langs; a project's own lang is unknown to
+    # them and is treated as a document (no symbols) until promoted here:
+    # {"conscript": "at-exp"}. Values: "sexp", "at-exp", "text".
+    "racket_langs": {},
     "context_providers": True,
     "meta_fields": [],  # [] = no _meta (token-efficient; set null in config for all fields)
     "languages": None,  # None = all languages
@@ -512,6 +530,8 @@ CONFIG_TYPES = {
     "exclude_secret_patterns": list,
     "exclude_skip_directories": list,
     "extra_extensions": dict,
+    "racket_definition_forms": dict,
+    "racket_langs": dict,
     "context_providers": bool,
     "meta_fields": (list, type(None)),
     "languages": (list, type(None)),
@@ -986,6 +1006,33 @@ def _ensure_loaded() -> None:
         load_config(create_missing=False)
     except Exception:
         logger.debug("Lazy config load failed; answering from defaults", exc_info=True)
+
+
+def racket_config_digest(repo: str | None) -> str:
+    """Fingerprint of the config that changes what the Racket parser EMITS.
+
+    `racket_definition_forms` and `racket_langs` alter extraction for
+    unchanged file content, and the incremental indexer skips unchanged
+    content by design. So a declaration added after an index exists applied
+    to nothing until each file was edited -- measured: `check-admin ABSENT`
+    across an incremental reindex, present only after a full one -- which is
+    the "parameter present and doing nothing" defect (#508). The digest is
+    stamped on the index at save; a mismatch at the next index forces one
+    full re-parse, the way `PARSER_GENERATION` does for a code change.
+    Empty when neither key is set, so an unconfigured project never differs.
+    """
+    forms = get("racket_definition_forms", {}, repo=repo) or {}
+    langs = get("racket_langs", {}, repo=repo) or {}
+    if not isinstance(forms, dict):
+        forms = {}
+    if not isinstance(langs, dict):
+        langs = {}
+    if not forms and not langs:
+        return ""
+    import hashlib
+    import json as _json
+    payload = _json.dumps({"forms": forms, "langs": langs}, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def get(key: str, default: Any = None, repo: str | None = None) -> Any:
@@ -2117,6 +2164,24 @@ def generate_template() -> str:
   //   Map additional file extensions to languages.
   //   Example: {{".mpl": "cpp"}} to parse .mpl files as C++.
 
+  // "racket_definition_forms": {{}},
+  //   Racket only. Declare a project's own defining macros so what they bind
+  //   becomes searchable. Each value is what the form binds: function,
+  //   constant, class or type. Where the name sits is read from the source.
+  //   Example: {{"defstep": "function", "defstudy": "constant"}}
+  //   This is an assertion jCodeMunch cannot verify; a wrong entry indexes a
+  //   name Racket does not bind. Built-in forms always win over declarations.
+
+  // "racket_langs": {{}},
+  //   Racket only. A `#lang` line names a reader, and the parser reads
+  //   S-expressions, so a `.rkt` in a project's own lang is treated as a
+  //   document (no symbols) until you say what its syntax is:
+  //   "sexp" (plain S-expressions), "at-exp" (at-exp text bodies over
+  //   Racket, e.g. conscript) or "text" (Markdown, Scribble -- never walked).
+  //   Example: {{"conscript": "at-exp", "punct": "text"}}
+  //   A key also matches its sub-langs (`conscript` covers
+  //   `conscript/with-require`). Distribution langs are built in.
+
   // "context_providers": true,
   //   Enable context providers for enhanced AI summarization.
   //   Set false to disable (faster indexing, less context).
@@ -2573,8 +2638,14 @@ def generate_template() -> str:
   // "summarizer_model": "",
   // "embed_model": "",
   //   Sentence-transformers model name for local (free) semantic embeddings.
-  //   Example: "all-MiniLM-L6-v2". Requires sentence-transformers package.
-  //   When set, takes priority over GOOGLE_API_KEY and OPENAI_API_KEY embeddings.
+  //   Example: "all-MiniLM-L6-v2". Requires the sentence-transformers package
+  //   (pip install 'jcodemunch-mcp[semantic]').
+  //   When set, takes priority over GOOGLE_API_KEY and OPENAI_API_KEY
+  //   embeddings AND over the bundled zero-config ONNX encoder. Setting it is
+  //   an explicit choice, so it outranks the default (v1.108.286, #488).
+  //   Leave it empty to use the bundled encoder.
+  //   If the package is not installed the setting is SKIPPED rather than
+  //   honoured into an error, and embed_repo reports it in provider_skipped.
   // "allow_remote_summarizer": false,
   //   Allow remote LLM endpoints for summarization (security risk).
   //   Default false blocks non-local summarization.

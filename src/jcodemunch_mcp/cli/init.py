@@ -15,87 +15,27 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# ⚠ Re-exported, not redefined. These moved to `policy.py` to break the
+# init <-> skills import cycle; 31 call sites across src/ and tests/ still
+# import them from here, and a move that renames the import path is a
+# different change from a move that breaks a cycle.
+from .policy import (  # noqa: F401,E402
+    _CLAUDE_MD_POLICY,
+    _CLAUDE_MD_POLICY_COUNTER,
+    _TOOL_REF_RE,
+    _effective_tool_surface,
+    _filter_policy_for_tools,
+    _front_door_tool_names,
+    _get_active_tools,
+    active_policy,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _CLAUDE_MD_MARKER = "## Code Exploration Policy"
 
-_CLAUDE_MD_POLICY = """\
-## Code Exploration Policy
-
-Always use jCodemunch-MCP tools for code navigation. Never fall back to Read, Grep, Glob, or Bash for code exploration.
-**Exception:** Use `Read` when you need to edit a file — the agent harness requires a `Read` before `Edit`/`Write` will succeed. Use jCodemunch tools to *find and understand* code, then `Read` only the specific file you're about to modify.
-
-**Start any session:**
-1. `resolve_repo { "path": "." }` — confirm the project is indexed. If not: `index_folder { "path": "." }`
-2. `suggest_queries` — when the repo is unfamiliar
-
-**Finding code:**
-- symbol by name → `search_symbols` (add `kind=`, `language=`, `file_pattern=`, `decorator=` to narrow)
-- decorator-aware queries → `search_symbols(decorator="X")` to find symbols with a specific decorator (e.g. `@property`, `@route`); combine with set-difference to find symbols *lacking* a decorator (e.g. "which endpoints lack CSRF protection?")
-- string, comment, config value → `search_text` (supports regex, `context_lines`)
-- database columns (dbt/SQLMesh) → `search_columns`
-
-**Reading code:**
-- before opening any file → `get_file_outline` first
-- one or more symbols → `get_symbol_source` (single ID → flat object; array → batch)
-- symbol + its imports → `get_context_bundle`
-- specific line range only → `get_file_content` (last resort)
-
-**Repo structure:**
-- `get_repo_outline` → dirs, languages, symbol counts
-- `get_file_tree` → file layout, filter with `path_prefix`
-
-**Relationships & impact:**
-- what imports this file → `find_importers`
-- where is this name used → `find_references`
-- is this identifier used anywhere → `check_references`
-- file dependency graph → `get_dependency_graph`
-- what breaks if I change X → `get_blast_radius`
-- what symbols actually changed since last commit → `get_changed_symbols`
-- find unreachable/dead code → `find_dead_code`
-- class hierarchy → `get_class_hierarchy`
-
-## Session-Aware Routing
-
-**Opening move for any task:**
-1. `plan_turn { "repo": "...", "query": "your task description", "model": "<your-model-id>" }` — get confidence + recommended files; the `model` parameter narrows the exposed tool list to match your capabilities at zero extra requests.
-2. Obey the confidence level:
-   - `high` → go directly to recommended symbols, max 2 supplementary reads
-   - `medium` → explore recommended files, max 5 supplementary reads
-   - `low` → the feature likely doesn't exist. Report the gap to the user. Do NOT search further hoping to find it.
-3. **One-call shortcut for a concrete task** — `assemble_task_context { "repo": "...", "task": "..." }` returns a single token-budgeted, source-attributed context capsule. It auto-classifies the task (explore / debug / refactor / extend / audit / review), auto-extracts anchor symbols, and runs the intent-appropriate sequence of the tools below end-to-end — so you get the whole context in one request instead of chaining the primitives by hand. Prefer it over a manual chain when the task is well-defined; fall back to step 1's routing when you need to decide *whether* the feature exists first.
-
-**Interpreting search results:**
-- If `search_symbols` returns `negative_evidence` with `verdict: "no_implementation_found"`:
-  - Do NOT re-search with different terms hoping to find it
-  - Do NOT assume a related file (e.g. auth middleware) implements the missing feature (e.g. CSRF)
-  - DO report: "No existing implementation found for X. This would need to be created."
-  - DO check `related_existing` files — they show what's nearby, not what exists
-- If `verdict: "low_confidence_matches"`: examine the matches critically before assuming they implement the feature
-
-**After editing files:**
-- If PostToolUse hooks are installed (Claude Code only), edited files are auto-reindexed
-- Otherwise, call `register_edit` with edited file paths to invalidate caches and keep the index fresh
-- For bulk edits (5+ files), always use `register_edit` with all paths to batch-invalidate
-
-**Token efficiency:**
-- If `_meta` contains `budget_warning`: stop exploring and work with what you have. Results are never silently shortened — the warning is advisory, and what you got is complete
-- Use `get_session_context` to check what you've already read — avoid re-reading the same files
-
-## Model-Driven Tool Tiering
-
-Your jcodemunch-mcp server narrows the exposed tool list based on the model you are running as. To avoid wasting requests on primitives when a composite would do, always include `model="<your-model-id>"` in your opening `plan_turn` call.
-
-Replace `<your-model-id>` with your active model:
-- Claude Opus variants → `claude-opus-4-7` (or any `claude-opus-*`)
-- Claude Sonnet variants → `claude-sonnet-4-6`
-- Claude Haiku variants → `claude-haiku-4-5`
-- GPT-4o / GPT-5 / o1 / Llama → use the model id as printed by your runner
-
-The `model=` parameter rides on the existing `plan_turn` call — it does **not** add a separate tool invocation. If `plan_turn` is not appropriate for a non-code task, call `announce_model(model="...")` once instead.
-"""
 
 # Policy for `tool_surface="counter"`, the default on a genuinely first-ever
 # install. The full policy above names ~25 tools directly; under the front door
@@ -106,36 +46,6 @@ The `model=` parameter rides on the existing `plan_turn` call — it does **not*
 # Deliberately short: the point of the front door is that the agent discovers
 # capabilities at need instead of carrying 91 schemas plus a long policy in every
 # turn. Naming the workflow, not the catalogue, is what keeps that promise.
-_CLAUDE_MD_POLICY_COUNTER = """\
-## Code Exploration Policy
-
-Always use jCodeMunch-MCP for code navigation. Never fall back to Read, Grep, Glob, or Bash for code exploration.
-**Exception:** use `Read` when you are about to edit a file — the harness requires a `Read` before `Edit`/`Write`. Use jCodeMunch to *find and understand* code, then `Read` only the file you are changing.
-
-This server runs the **front door** surface: three tools reach every jCodeMunch capability, so the tool list stays small and the catalogue is fetched only when you need it.
-
-**Start any session:**
-1. `order { "action": "resolve_repo", "args": { "path": "." } }` — confirm the project is indexed. If it is not: `order { "action": "index_folder", "args": { "path": "." } }`
-
-**Then, for any task:**
-- Know what you want → `order { "action": "<name>", "args": { ... } }`
-- Know the goal, not the tool → `route { "query": "your task in a sentence" }` picks the action and shapes the arguments
-- Want to see what exists → `menu { "query": "what you are trying to do" }` returns matching actions with example arguments
-- Want the whole catalogue and the usage rules → `jcodemunch_guide`
-
-`menu` and `jcodemunch_guide` list every action this server can run, including ones absent from your tool list. That is expected: the front door is the way to call them.
-
-**Interpreting results:**
-- A `verdict` of `no_implementation_found` is evidence of absence. Report the gap; do not re-search with different wording.
-- A `verdict` of `degraded` means a channel was unavailable, so absence is NOT proven. Read the note before relying on the result.
-- `source: ""` alongside `source_status` means the body could not be read, not that the symbol is empty.
-
-**After editing files:**
-- With PostToolUse hooks installed (Claude Code), edited files are reindexed automatically.
-- Otherwise `order { "action": "register_edit", "args": { "paths": [...] } }` after an edit, batched for bulk changes.
-
-**Announce your model once per session** so the server can size its answers: `announce_model { "model": "<your-model-id>" }`.
-"""
 
 _MCP_ENTRY = {
     "command": "uvx",
@@ -189,8 +99,11 @@ def _worktree_hooks() -> dict[str, Any]:
 def _enforcement_hooks() -> dict[str, Any]:
     exe = _hook_invocation()
     return {
+        # Bash and Glob are in the matcher because they are the dominant
+        # unhooked routes for local search (Bash grep/rg/find); the handler
+        # itself decides which Bash commands are search-shaped.
         "PreToolUse": [{
-            "matcher": "Read|Grep",
+            "matcher": "Read|Grep|Glob|Bash",
             "hooks": [{"type": "command", "command": f"{exe} hook-pretooluse"}],
         }],
         "PostToolUse": [{
@@ -235,13 +148,24 @@ _WINDSURF_RULES_CONTENT = _CLAUDE_MD_POLICY
 # Client detection
 # ---------------------------------------------------------------------------
 
+# Every configuration method `configure_client` knows how to dispatch.
+# ⚠ This is the ONE list. It used to be a comment on MCPClient.method plus a
+# hardcoded tuple inside a test, and adding a method meant remembering both --
+# `test_detect_clients_returns_list` caught `toml_codex` precisely because it
+# had its own copy. A declared method with no dispatch branch would otherwise
+# return "unknown method for X" at runtime, which reads as a client we support.
+CONFIGURE_METHODS = frozenset(
+    {"cli", "json_patch", "toml_codex", "json_opencode", "json_vscode"}
+)
+
+
 class MCPClient:
     """Represents a detected MCP client and how to configure it."""
 
     def __init__(self, name: str, config_path: Optional[Path], method: str):
         self.name = name
         self.config_path = config_path
-        self.method = method  # "cli" | "json_patch"
+        self.method = method  # one of CONFIGURE_METHODS
 
     def __repr__(self) -> str:
         if self.config_path:
@@ -296,6 +220,41 @@ def _detect_clients() -> list[MCPClient]:
     if continue_dir.exists():
         clients.append(MCPClient("Continue", continue_dir / "config.json", "json_patch"))
 
+    # Codex CLI. Detected by its config directory OR the executable: `codex`
+    # can be on PATH before ~/.codex exists on a fresh install, and the
+    # directory can exist without the binary on a machine it was removed from.
+    if (Path.home() / ".codex").exists() or _find_executable("codex"):
+        clients.append(MCPClient("Codex", _codex_config_path(), "toml_codex"))
+
+    # opencode
+    if (Path.home() / ".config" / "opencode").exists() or _find_executable("opencode"):
+        clients.append(MCPClient("opencode", _opencode_config_path(), "json_opencode"))
+
+    # Gemini CLI. ⚠ Keyed on settings.json / the executable, NOT on ~/.gemini
+    # existing: Antigravity shares that directory but reads a DIFFERENT file
+    # (~/.gemini/config/mcp_config.json), so a directory check would offer to
+    # configure Gemini CLI on a machine that only has Antigravity and write a
+    # settings.json nothing reads.
+    gemini_settings = Path.home() / ".gemini" / "settings.json"
+    if gemini_settings.exists() or _find_executable("gemini"):
+        clients.append(MCPClient("Gemini CLI", gemini_settings, "json_patch"))
+
+    # Cline. ⚠ The documented path is the CLI's ~/.cline/mcp.json. The VS Code
+    # extension keeps its own settings under an editor globalStorage directory
+    # that Cline does not document per-platform, so it is deliberately NOT
+    # guessed at here -- CLIENTS.md points extension users at the marketplace UI.
+    cline_config = Path.home() / ".cline" / "mcp.json"
+    if cline_config.exists() or _find_executable("cline"):
+        clients.append(MCPClient("Cline", cline_config, "json_patch"))
+
+    # VS Code / GitHub Copilot. Workspace-scoped, so this requires an existing
+    # .vscode/ directory rather than merely finding `code` on PATH: the latter
+    # is true on most developer machines and would CREATE .vscode/mcp.json in
+    # whatever directory init happened to run in.
+    vscode_dir = Path.cwd() / ".vscode"
+    if vscode_dir.exists():
+        clients.append(MCPClient("VS Code (Copilot)", vscode_dir / "mcp.json", "json_vscode"))
+
     return clients
 
 
@@ -347,6 +306,185 @@ def _patch_mcp_config(path: Path, *, backup: bool = True, dry_run: bool = False)
     return f"  added jcodemunch to {path}"
 
 
+# ---------------------------------------------------------------------------
+# Codex CLI (~/.codex/config.toml)
+# ---------------------------------------------------------------------------
+
+def _codex_config_path() -> Path:
+    """Return the Codex CLI MCP config path."""
+    return Path.home() / ".codex" / "config.toml"
+
+
+def _toml_string(value: str) -> str:
+    """Render a path as a TOML string.
+
+    Prefers a LITERAL string (single quotes), which performs no escape
+    processing at all — the point being Windows paths, where a basic string
+    would turn ``C:\\Users\\j`` into an invalid escape sequence and a parser
+    would either reject the file or silently mangle the path. Falls back to a
+    basic string only when the value contains a single quote, which a literal
+    string cannot represent.
+    """
+    if "'" not in value:
+        return f"'{value}'"
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _codex_command() -> Optional[str]:
+    """Resolve the jcodemunch-mcp binary for a Codex server entry.
+
+    ⚠⚠ Returns None rather than falling back to ``uvx``, and that refusal is
+    the whole point of this function. Codex's rmcp transport is strict about
+    the first JSON-RPC frame on stdout, and uvx's install chatter on a cold
+    run poisons the handshake — the documented symptom is a SILENT multi-hour
+    hang, not an error (see CLIENTS.md). Every other client in this module
+    gets ``_MCP_ENTRY``'s ``uvx`` form; Codex must not, so a caller that
+    cannot resolve a real binary has to say so instead of writing a config
+    that appears to work.
+    """
+    return shutil.which("jcodemunch-mcp")
+
+
+def _has_codex_entry(text: str) -> bool:
+    """True when config.toml already declares the jcodemunch server."""
+    return re.search(r"^\s*\[mcp_servers\.jcodemunch\]", text, re.MULTILINE) is not None
+
+
+def _patch_codex_config(
+    path: Path, *, backup: bool = True, dry_run: bool = False
+) -> str:
+    """Append an ``[mcp_servers.jcodemunch]`` block to Codex's config.toml.
+
+    APPENDS rather than parse-and-rewrite. config.toml is a user-owned file
+    holding unrelated Codex settings; round-tripping it through a serialiser
+    would drop their comments and reorder their keys, and Python has no TOML
+    *writer* in the stdlib at any version this package supports.
+    """
+    existing = ""
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"  could not read {path}: {exc}"
+
+    if _has_codex_entry(existing):
+        return f"  already configured in {path}"
+
+    exe = _codex_command()
+    if not exe:
+        return (
+            "  skipped — Codex needs a resolved binary, not uvx "
+            "(uvx's first-run output breaks its handshake). "
+            "Run `uv tool install jcodemunch-mcp`, then re-run init."
+        )
+
+    if dry_run:
+        return f"  would add [mcp_servers.jcodemunch] to {path} (command = {exe})"
+
+    if backup and path.exists():
+        shutil.copy2(path, path.with_suffix(".toml.bak"))
+
+    block = (
+        "\n[mcp_servers.jcodemunch]\n"
+        f"command = {_toml_string(exe)}\n"
+    )
+    # Keep exactly one blank line between our block and whatever precedes it.
+    prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(existing + prefix + block, encoding="utf-8")
+    return f"  added [mcp_servers.jcodemunch] to {path}"
+
+
+# ---------------------------------------------------------------------------
+# VS Code / GitHub Copilot (.vscode/mcp.json)
+# ---------------------------------------------------------------------------
+
+def _vscode_mcp_config_path() -> Path:
+    """Return the workspace MCP config VS Code reads for Copilot.
+
+    Workspace-scoped on purpose. VS Code's USER-level MCP file is reached
+    through an editor command ("MCP: Open User Configuration") rather than a
+    documented path, and it moves with the active profile, so an installer
+    that guessed at it would write somewhere the editor may never read.
+    `.vscode/mcp.json` is the documented, stable target.
+    """
+    return Path.cwd() / ".vscode" / "mcp.json"
+
+
+def _patch_vscode_mcp_config(
+    path: Path, *, backup: bool = True, dry_run: bool = False
+) -> str:
+    """Add jcodemunch to VS Code's MCP config for Copilot.
+
+    ⚠ The top-level key is `servers`, NOT `mcpServers`. That is the third
+    distinct schema in this module (generic `mcpServers`, opencode's `mcp`,
+    and this), and like opencode's it fails silently: VS Code reads a file
+    whose servers live under the wrong key, finds none, and reports nothing.
+    Per-server fields are `command`/`args` as usual -- `type` defaults to
+    "stdio" for a local server, so it is left off rather than asserted.
+    """
+    data = _read_json(path)
+    servers = data.get("servers")
+    if isinstance(servers, dict) and "jcodemunch" in servers:
+        return f"  already configured in {path}"
+
+    if dry_run:
+        return f"  would add jcodemunch to {path}"
+
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["jcodemunch"] = dict(_MCP_ENTRY)
+    data["servers"] = servers
+    _write_json(path, data, backup=backup)
+    return f"  added jcodemunch to {path}"
+
+
+# ---------------------------------------------------------------------------
+# opencode (~/.config/opencode/opencode.json)
+# ---------------------------------------------------------------------------
+
+def _opencode_config_path() -> Path:
+    """Return the opencode global config path.
+
+    opencode documents a hardcoded ``~/.config/opencode/`` for the global
+    config on every platform and does not document XDG_CONFIG_HOME support,
+    so this deliberately does NOT consult that variable — following a spec the
+    tool does not implement would write a file it never reads.
+    """
+    return Path.home() / ".config" / "opencode" / "opencode.json"
+
+
+def _patch_opencode_config(
+    path: Path, *, backup: bool = True, dry_run: bool = False
+) -> str:
+    """Add jcodemunch to opencode's config.
+
+    ⚠ opencode's schema is NOT the `mcpServers` shape every other JSON client
+    in this module uses. The top-level key is `mcp`, each server needs an
+    explicit `"type": "local"`, and `command` is a single ARRAY carrying the
+    executable and its arguments rather than separate `command`/`args` keys.
+    Writing `_MCP_ENTRY` here produces a file opencode parses and ignores.
+    """
+    data = _read_json(path)
+    servers = data.get("mcp")
+    if isinstance(servers, dict) and "jcodemunch" in servers:
+        return f"  already configured in {path}"
+
+    if dry_run:
+        return f"  would add jcodemunch to {path}"
+
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["jcodemunch"] = {
+        "type": "local",
+        "command": ["uvx", "jcodemunch-mcp"],
+        "enabled": True,
+    }
+    data["mcp"] = servers
+    _write_json(path, data, backup=backup)
+    return f"  added jcodemunch to {path}"
+
+
 def _claude_cli_exe() -> Optional[str]:
     """Resolve the `claude` executable, or None if unavailable.
 
@@ -390,6 +528,12 @@ def configure_client(client: MCPClient, *, backup: bool = True, dry_run: bool = 
         return _configure_claude_code(dry_run=dry_run)
     elif client.method == "json_patch" and client.config_path:
         return _patch_mcp_config(client.config_path, backup=backup, dry_run=dry_run)
+    elif client.method == "toml_codex" and client.config_path:
+        return _patch_codex_config(client.config_path, backup=backup, dry_run=dry_run)
+    elif client.method == "json_opencode" and client.config_path:
+        return _patch_opencode_config(client.config_path, backup=backup, dry_run=dry_run)
+    elif client.method == "json_vscode" and client.config_path:
+        return _patch_vscode_mcp_config(client.config_path, backup=backup, dry_run=dry_run)
     return f"  unknown method for {client.name}"
 
 
@@ -477,157 +621,19 @@ def ensure_config_loaded() -> None:
         logger.debug("could not load config before generating policy", exc_info=True)
 
 
-def _effective_tool_surface() -> str:
-    """The tool surface this install will actually serve ("full" or "counter")."""
-    try:
-        from ..config import get as cfg_get
-        env = os.environ.get("JCODEMUNCH_TOOL_SURFACE")
-        return (env or cfg_get("tool_surface", "full") or "full").strip().lower()
-    except Exception:
-        return "full"
 
 
-def _get_active_tools() -> set[str] | None:
-    """Return the set of tool names active under current config.
-
-    Applies tool_surface, tool_profile and disabled_tools filtering.
-    Returns ``None`` when the profile is "full" and nothing is disabled
-    (i.e. no filtering needed).
-
-    ⚠ Surface is checked FIRST and is not a filter over the tier: under
-    ``counter`` the server advertises only the front door, whatever the profile
-    says, so a policy naming direct tools describes calls the client cannot
-    offer the model. The tools remain callable by name, which is exactly why
-    this went unnoticed -- nothing errors, the guidance is simply unreachable
-    through the tool list.
-    """
-    try:
-        from ..config import get as cfg_get
-        from ..server import _PROFILE_TIERS, _CANONICAL_TOOL_NAMES
-    except Exception:
-        return None
-
-    if _effective_tool_surface() == "counter":
-        return set(_front_door_tool_names())
-
-    profile = cfg_get("tool_profile", "full")
-    tier = _PROFILE_TIERS.get(profile)
-    disabled = set(cfg_get("disabled_tools", []))
-
-    if tier is None and not disabled:
-        return None  # full profile, nothing disabled
-
-    active = set(_CANONICAL_TOOL_NAMES) if tier is None else set(tier)
-    active -= disabled
-    return active
 
 
-def _front_door_tool_names() -> set[str]:
-    """Tool names the server advertises under ``tool_surface="counter"``.
-
-    The front door itself is only three tools, but the surface it produces is
-    six: ``_ALWAYS_PRESENT_TOOLS`` survives every filter, and the policy
-    legitimately uses two of them (``announce_model`` to size answers,
-    ``jcodemunch_guide`` to discover the catalogue). Reading both from the
-    server keeps this from drifting the moment either list changes.
-    """
-    names: set[str] = set()
-    try:
-        from ..server import _ALWAYS_PRESENT_TOOLS, _counter_front_door_tools
-        names = {t.name for t in _counter_front_door_tools()}
-        names |= set(_ALWAYS_PRESENT_TOOLS)
-    except Exception:
-        logger.debug("could not read the front-door tool list", exc_info=True)
-    return names or {"order", "menu", "route", "jcodemunch_guide",
-                     "announce_model", "set_tool_tier"}
 
 
 # Regex matching tool names in backtick contexts:
 #  - `tool_name` (exact)
 #  - `tool_name { ... }` (tool with inline args)
 #  - `tool_name(...)` (tool with call syntax)
-_TOOL_REF_RE = re.compile(r"`([a-z][a-z0-9_]*)[`(\s{]")
 
 
-def active_policy() -> str:
-    """The agent policy matching the surface this install actually serves.
 
-    Every writer goes through here so the choice cannot be made two ways. Under
-    the front door the direct-tool policy is not merely over-long, it names
-    calls the client will not offer the model, so the counter policy replaces it
-    outright rather than being filtered down to the three surviving names --
-    filtering a workflow away leaves an agent with no workflow at all.
-    """
-    if _effective_tool_surface() == "counter":
-        return _CLAUDE_MD_POLICY_COUNTER
-    return _filter_policy_for_tools(_CLAUDE_MD_POLICY, _get_active_tools())
-
-
-def _filter_policy_for_tools(policy: str, active_tools: set[str] | None) -> str:
-    """Filter the CLAUDE.md policy to only reference available tools.
-
-    Lines containing backtick-quoted tool names that are NOT in
-    *active_tools* are removed.  Sections left empty after filtering
-    are also removed.  Returns the policy unchanged when *active_tools*
-    is ``None`` (full profile, nothing disabled).
-    """
-    if active_tools is None:
-        return policy
-
-    # Build the set of all known tool names for reference-detection.
-    try:
-        from ..server import _CANONICAL_TOOL_NAMES
-        all_tools = set(_CANONICAL_TOOL_NAMES)
-    except Exception:
-        return policy
-
-    lines = policy.splitlines(keepends=True)
-    kept: list[str] = []
-
-    for line in lines:
-        refs = _TOOL_REF_RE.findall(line)
-        # Only consider refs that are actual tool names
-        tool_refs = [r for r in refs if r in all_tools]
-        if tool_refs and any(t not in active_tools for t in tool_refs):
-            continue  # drop line — references unavailable tool(s)
-        kept.append(line)
-
-    # Remove bold-label headers (e.g. "**Finding code:**") that lost all
-    # their child bullets.  A bold-label is "empty" if the next non-blank
-    # line is another bold-label, a ## heading, or EOF.
-    # We do NOT prune ## headings here — they may legitimately sit above
-    # bold-label sub-sections that survived filtering.
-    result: list[str] = []
-    i = 0
-    while i < len(kept):
-        line = kept[i]
-        stripped = line.strip()
-
-        is_bold_label = (
-            stripped.startswith("**")
-            and stripped.endswith(":**")
-            and not stripped.startswith("## ")
-        )
-
-        if is_bold_label:
-            j = i + 1
-            while j < len(kept) and not kept[j].strip():
-                j += 1
-            if j >= len(kept):
-                break  # trailing empty label — drop
-            next_s = kept[j].strip()
-            next_is_boundary = (
-                (next_s.startswith("**") and next_s.endswith(":**"))
-                or next_s.startswith("## ")
-            )
-            if next_is_boundary:
-                i = j  # skip empty bold-label section
-                continue
-
-        result.append(line)
-        i += 1
-
-    return "".join(result)
 
 
 def install_claude_md(scope: str = "global", *, dry_run: bool = False, backup: bool = True) -> str:
@@ -795,12 +801,65 @@ def _extract_jcm_subcommand(cmd: str) -> Optional[str]:
     return m.group(1).strip().strip('"').strip("'") if m else None
 
 
+def _rule_subs(rule: dict) -> "set[str]":
+    """jcm subcommands invoked by one settings hook rule."""
+    return {
+        s for s in (
+            _extract_jcm_subcommand(h.get("command", "") or "")
+            for h in rule.get("hooks", [])
+        ) if s
+    }
+
+
+def _converge_rule(existing_rules: list, shipped_rule: dict) -> bool:
+    """Converge jcm-owned fields (matcher AND command) of any existing rule
+    that invokes one of ``shipped_rule``'s subcommands. Returns True when
+    anything changed.
+
+    Without the matcher half, a pre-1.108.47 install keeps matcher "Read"
+    forever; without the command half, a bare-name command from a
+    pre-absolute-path install keeps dying under the hook shell's minimal
+    PATH — and re-running init reports success either way.
+    """
+    shipped_cmds = {
+        sub: h.get("command", "")
+        for h in shipped_rule.get("hooks", [])
+        if (sub := _extract_jcm_subcommand(h.get("command", "") or ""))
+    }
+    changed = False
+    for old_rule in existing_rules:
+        if not (_rule_subs(old_rule) & shipped_cmds.keys()):
+            continue
+        # The matcher is a RULE-level field: converge it only when every hook
+        # in the rule is ours. A user who hand-merged their own hook into our
+        # rule must not have THEIR trigger silently widened.
+        all_ours = all(
+            _extract_jcm_subcommand(h.get("command", "") or "")
+            for h in old_rule.get("hooks", [])
+        )
+        if all_ours and old_rule.get("matcher", "") != shipped_rule.get("matcher", ""):
+            old_rule["matcher"] = shipped_rule.get("matcher", "")
+            changed = True
+        for h in old_rule.get("hooks", []):
+            sub = _extract_jcm_subcommand(h.get("command", "") or "")
+            shipped = shipped_cmds.get(sub)
+            if shipped and h.get("command") != shipped:
+                h["command"] = shipped
+                changed = True
+    return changed
+
+
 def _merge_hooks(
     data: dict[str, Any],
     hook_defs: dict[str, list],
     marker: str,
-) -> list[str]:
-    """Merge hook definitions into settings data, returning names of added events.
+) -> "tuple[list[str], list[str]]":
+    """Merge hook definitions into settings data.
+
+    Returns ``(added, updated)``: event names whose rules were added, and
+    event names whose existing rule had a stale matcher or command converged
+    to the shipped definition. Callers pick their own verbs — encoding status
+    into the event-name string forced "added X (updated)" phrasing on them.
 
     Duplicate detection is path-shape-agnostic: two commands that invoke
     the same jcm subcommand (e.g. ``hook-pretooluse``) are considered the
@@ -814,27 +873,28 @@ def _merge_hooks(
     """
     hooks = data.setdefault("hooks", {})
     added: list[str] = []
+    updated: list[str] = []
 
     for event_name, event_hooks in hook_defs.items():
         existing_cmds: list[str] = []
         existing_subcommands: set[str] = set()
         if event_name in hooks:
             for rule in hooks[event_name]:
-                for h in rule.get("hooks", []):
-                    cmd = h.get("command", "") or ""
-                    existing_cmds.append(cmd)
-                    sub = _extract_jcm_subcommand(cmd)
-                    if sub:
-                        existing_subcommands.add(sub)
+                existing_cmds.extend(
+                    h.get("command", "") or "" for h in rule.get("hooks", [])
+                )
+                existing_subcommands |= _rule_subs(rule)
 
         new_rules = []
+        rule_updated = False
         for rule in event_hooks:
             rule_cmds = [h.get("command", "") for h in rule.get("hooks", [])]
-            rule_subcommands = {
-                s for s in (_extract_jcm_subcommand(c) for c in rule_cmds) if s
-            }
+            rule_subcommands = _rule_subs(rule)
             # Primary check: any jcm subcommand already installed for this event?
             if rule_subcommands and rule_subcommands & existing_subcommands:
+                # Already installed — converge its jcm-owned fields instead.
+                # (The event key exists: existing_subcommands came from it.)
+                rule_updated |= _converge_rule(hooks[event_name], rule)
                 continue
             # Exact-match check (covers non-jcm hooks like sync_memory.py).
             if any(cmd in existing_cmds for cmd in rule_cmds if cmd):
@@ -851,8 +911,10 @@ def _merge_hooks(
             else:
                 hooks[event_name] = new_rules
             added.append(event_name)
+        elif rule_updated:
+            updated.append(event_name)
 
-    return added
+    return added, updated
 
 
 def install_hooks(*, dry_run: bool = False, backup: bool = True) -> str:
@@ -862,15 +924,22 @@ def install_hooks(*, dry_run: bool = False, backup: bool = True) -> str:
     """
     path = _settings_json_path()
     data = _read_json(path)
-    added = _merge_hooks(data, _worktree_hooks(), "jcodemunch-mcp hook-event")
+    added, updated = _merge_hooks(data, _worktree_hooks(), "jcodemunch-mcp hook-event")
 
-    if not added:
+    if not added and not updated:
         return f"  hooks already present in {path}"
+    would, done = [], []
+    if added:
+        would.append(f"add {', '.join(added)}")
+        done.append(f"added {', '.join(added)}")
+    if updated:
+        would.append(f"update {', '.join(updated)}")
+        done.append(f"updated {', '.join(updated)}")
     if dry_run:
-        return f"  would add {', '.join(added)} hooks to {path}"
+        return f"  would {', '.join(would)} hooks in {path}"
 
     _write_json(path, data, backup=backup)
-    return f"  added {', '.join(added)} hooks to {path}"
+    return f"  {', '.join(done)} hooks in {path}"
 
 
 def _install_version_path() -> Path:
@@ -901,6 +970,19 @@ def read_install_version() -> Optional[str]:
         return None
 
 
+def _is_copilot_rule(rule: dict) -> bool:
+    """Whether a Copilot hooks.json rule is OUR postToolUse rule.
+
+    Matched by SUBCOMMAND, never by a bare-name prefix — install writes an
+    absolute-path command, which a prefix check can never match (the exact
+    "check can never match" defect the subcommand form replaced, #447-shaped:
+    one definition, every site delegates).
+    """
+    return _extract_jcm_subcommand(
+        rule.get("bash", "") or ""
+    ) == "hook-copilot-posttooluse"
+
+
 def install_copilot_hooks(*, dry_run: bool = False, backup: bool = True) -> str:
     """Write a ``.github/hooks/hooks.json`` for GitHub Copilot CLI / cloud agent.
 
@@ -917,34 +999,48 @@ def install_copilot_hooks(*, dry_run: bool = False, backup: bool = True) -> str:
     hooks_dir = cwd / ".github" / "hooks"
     hooks_path = hooks_dir / "hooks.json"
 
+    # Absolute path for the same reason _hook_invocation resolves one for
+    # Claude Code hooks: the agent's hook shell PATH cannot be trusted to
+    # include pipx/user-install script dirs, and a bare name dies silently.
+    exe = _hook_invocation()
     rule = {
         "type": "command",
-        "bash": "jcodemunch-mcp hook-copilot-posttooluse",
-        "powershell": "jcodemunch-mcp hook-copilot-posttooluse",
+        "bash": f"{exe} hook-copilot-posttooluse",
+        "powershell": f"{exe} hook-copilot-posttooluse",
         "timeoutSec": 30,
         "comment": "jcodemunch-mcp: auto-reindex edited files",
     }
 
     if hooks_path.exists():
         try:
-            data = json.loads(hooks_path.read_text(encoding="utf-8"))
+            raw = hooks_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
         except (json.JSONDecodeError, ValueError, OSError):
             return f"  failed to parse existing {hooks_path}; skipping"
         hooks = data.setdefault("hooks", {})
         existing = hooks.setdefault("postToolUse", [])
-        for r in existing:
-            if r.get("bash", "").startswith("jcodemunch-mcp hook-copilot"):
+        ours = next((r for r in existing if _is_copilot_rule(r)), None)
+        if ours is not None:
+            # Upgrade a stale command in place (pre-fix installs wrote the
+            # bare name, which dies under the agent hook shell's minimal
+            # PATH) — same reasoning as the Claude-hook matcher upgrade.
+            if ours.get("bash") == rule["bash"] and ours.get("powershell") == rule["powershell"]:
                 return f"  Copilot hooks already present in {hooks_path}"
-        if dry_run:
-            return f"  would append jcodemunch postToolUse hook to {hooks_path}"
-        existing.append(rule)
-        data.setdefault("version", 1)
+            if dry_run:
+                return f"  would update Copilot hook command in {hooks_path}"
+            ours["bash"] = rule["bash"]
+            ours["powershell"] = rule["powershell"]
+            msg = f"  updated Copilot hook command in {hooks_path}"
+        else:
+            if dry_run:
+                return f"  would append jcodemunch postToolUse hook to {hooks_path}"
+            existing.append(rule)
+            data.setdefault("version", 1)
+            msg = f"  appended Copilot postToolUse hook to {hooks_path}"
         if backup:
-            hooks_path.with_suffix(".json.bak").write_text(
-                hooks_path.read_text(encoding="utf-8"), encoding="utf-8"
-            )
+            hooks_path.with_suffix(".json.bak").write_text(raw, encoding="utf-8")
         hooks_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        return f"  appended Copilot postToolUse hook to {hooks_path}"
+        return msg
 
     if dry_run:
         return f"  would create {hooks_path} with jcodemunch postToolUse hook"
@@ -959,8 +1055,9 @@ def install_enforcement_hooks(
 ) -> str:
     """Merge PreToolUse/PostToolUse enforcement hooks into ~/.claude/settings.json.
 
-    PreToolUse (Read|Grep) — steer Claude toward jCodemunch for code files and
-        searches inside an indexed repo.
+    PreToolUse (Read|Grep|Glob|Bash) — steer Claude toward jCodemunch for code
+        files and searches inside an indexed repo (Bash only when the command
+        line opens with a search command like grep/rg/find).
     PostToolUse (Edit|Write) — auto-reindex modified files.
 
     When ``strict`` is True, also persist ``env.JCODEMUNCH_ENFORCE = "strict"``
@@ -977,7 +1074,7 @@ def install_enforcement_hooks(
     # per-subcommand via _extract_jcm_subcommand, so hooks outside the "hook-p"
     # prefix (hook-sessionstart, hook-taskcomplete, hook-subagent-start) merge
     # correctly and are added to an existing install on re-run.
-    added = _merge_hooks(data, _enforcement_hooks(), "jcodemunch-mcp hook-p")  # matches hook-pretooluse & hook-posttooluse & hook-precompact
+    added, updated = _merge_hooks(data, _enforcement_hooks(), "jcodemunch-mcp hook-p")  # matches hook-pretooluse & hook-posttooluse & hook-precompact
 
     # Persist (or revert) the strict-enforce env flag the hook reads at runtime.
     env_changed = False
@@ -993,13 +1090,15 @@ def install_enforcement_hooks(
             env["JCODEMUNCH_ENFORCE"] = "advisory"  # revert a prior --strict
             env_changed, desired = True, "advisory"
 
-    if not added and not env_changed:
+    if not added and not updated and not env_changed:
         return f"  enforcement hooks already present in {path}"
 
     def _bits(verb_add: str, verb_env: str) -> str:
         parts = []
         if added:
             parts.append(f"{verb_add} {', '.join(added)} enforcement hooks")
+        if updated:
+            parts.append(f"converged {', '.join(updated)} to the shipped rule")
         if env_changed:
             tier = "strict deny" if desired == "strict" else "advisory warn"
             parts.append(f"{verb_env} JCODEMUNCH_ENFORCE={desired} ({tier})")
@@ -1721,7 +1820,7 @@ def uninstall_copilot_hooks(*, dry_run: bool = False, backup: bool = True) -> st
     pt = hooks.get("postToolUse", [])
     if not isinstance(pt, list):
         return f"  unexpected shape in {hooks_path}; skipped"
-    kept = [r for r in pt if not r.get("bash", "").startswith("jcodemunch-mcp hook-copilot")]
+    kept = [r for r in pt if not _is_copilot_rule(r)]
     if len(kept) == len(pt):
         return f"  no jcodemunch Copilot hook in {hooks_path}"
     if dry_run:
@@ -1944,7 +2043,7 @@ def install_status() -> dict[str, Any]:
         try:
             cdata = json.loads(copilot_path.read_text(encoding="utf-8"))
             for r in (cdata.get("hooks") or {}).get("postToolUse", []) or []:
-                if isinstance(r, dict) and r.get("bash", "").startswith("jcodemunch-mcp hook-copilot"):
+                if isinstance(r, dict) and _is_copilot_rule(r):
                     copilot_present = True
                     break
         except (json.JSONDecodeError, ValueError, OSError):

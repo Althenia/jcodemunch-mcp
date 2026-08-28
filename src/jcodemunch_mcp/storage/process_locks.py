@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from .sqlite_store import _default_base_path
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,13 @@ try:
     import fcntl
 except ImportError:
     fcntl = None
+
+#: A wait past this many seconds is a user-visible stall, not a debug detail,
+#: so it is logged at WARNING with the holder NAMED. Chosen because a
+#: single-file reindex should never queue: #557 measured `save=9.906s` on a
+#: one-file change, where a contended lock and a slow write are
+#: indistinguishable from the caller's side.
+_SLOW_WAIT_SECONDS = 1.0
 
 # Module-level registry of open file descriptors held for Unix flock. Keyed by
 # (scope, target) so the same process can hold an index_write lock on a repo
@@ -96,7 +104,7 @@ def _path_hash(target: str) -> str:
 
 def _lock_dir(storage_path: Optional[str]) -> Path:
     """Return the directory for lock files, creating it if needed."""
-    base = Path(storage_path) if storage_path else Path.home() / ".code-index"
+    base = Path(storage_path) if storage_path else _default_base_path()
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -510,12 +518,44 @@ class held:  # noqa: N801 — context-manager helper, lowercase reads natural at
         self.wait_seconds = max(0.0, wait_seconds)
         self.poll_seconds = max(0.05, poll_seconds)
         self._acquired = False
+        #: Wall-clock spent waiting. 0.0 when the lock was free on the
+        #: first attempt, which is the ordinary case.
+        self.waited_seconds = 0.0
 
     def __enter__(self) -> bool:
-        deadline = time.monotonic() + self.wait_seconds
+        """Acquire, polling until ``wait_seconds`` elapses.
+
+        ⚠⚠ **A CONTENDED LOCK AND SLOW WORK ARE INDISTINGUISHABLE FROM THE
+        OUTSIDE, and that is the whole reason `waited_seconds` exists** (#557).
+        The caller measures `save=9.906s` either way: waiting for another
+        process to finish writing looks exactly like writing slowly. Only the
+        wait itself can tell them apart, and only this function can see it.
+
+        ⚠ Logged at WARNING past `_SLOW_WAIT_SECONDS` because a multi-second
+        stall on a single-file reindex is a user-visible problem, not a debug
+        detail -- and the holder is NAMED, since "something else has the lock"
+        without saying what sends the reader looking in the wrong process.
+        """
+        started = time.monotonic()
+        deadline = started + self.wait_seconds
         while True:
             self._acquired = acquire(self.scope, self.target, self.storage_path)
             if self._acquired or time.monotonic() >= deadline:
+                self.waited_seconds = time.monotonic() - started
+                if self.waited_seconds >= _SLOW_WAIT_SECONDS:
+                    logger.warning(
+                        "waited %.3fs for the %s lock on %s%s%s",
+                        self.waited_seconds, self.scope, self.target,
+                        current_holder_diagnostic(
+                            self.scope, self.target, self.storage_path
+                        ),
+                        "" if self._acquired else " -- GAVE UP",
+                    )
+                elif self.waited_seconds > 0.0:
+                    logger.debug(
+                        "waited %.3fs for the %s lock on %s",
+                        self.waited_seconds, self.scope, self.target,
+                    )
                 return self._acquired
             time.sleep(self.poll_seconds)
 

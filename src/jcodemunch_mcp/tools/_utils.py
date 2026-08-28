@@ -336,6 +336,45 @@ def needs_parser_upgrade(index) -> bool:
     return getattr(index, "parser_generation", 0) < PARSER_GENERATION
 
 
+def racket_reparse_reason(index) -> Optional[str]:
+    """Why a local index holding Racket files must be re-parsed in full, or None.
+
+    Two reasons, told apart because a caller reads `rebuild_reason`:
+
+    - ``racket_index_predates_gate``: the index carries NO
+      `racket_config_digest` stamp, so it was built before the Racket
+      extraction changes of 2026-08-27 (the `#lang` gate above all, which
+      REMOVES fabricated symbols a 1.108.297-.301 index still holds). This is
+      the narrow substitute for a `PARSER_GENERATION` bump: it reaches exactly
+      the indexes that hold Racket files instead of every language for
+      everybody, and an absent key stays detectable at any later date.
+    - ``racket_config_changed``: `racket_definition_forms` / `racket_langs`
+      differ from the stamp. They change what the parser emits for UNCHANGED
+      content, which the incremental path never re-reads, so a declaration
+      added after the index was built applied to nothing (measured:
+      `check-admin ABSENT` across an incremental reindex, present only after a
+      full one).
+
+    Same shape as `needs_parser_upgrade`, scoped to one project. A remote
+    index has no source root and never qualifies.
+    """
+    if index is None:
+        return None
+    if "racket" not in (getattr(index, "languages", None) or {}):
+        return None
+    source_root = getattr(index, "source_root", "") or ""
+    if not source_root:
+        return None
+    stamp = getattr(index, "racket_config_digest", None)
+    if stamp is None:
+        return "racket_index_predates_gate"
+    from .. import config as _config
+
+    if _config.racket_config_digest(source_root) != stamp:
+        return "racket_config_changed"
+    return None
+
+
 def stamp_incremental_outcome(
     result: dict,
     requested: bool,
@@ -392,3 +431,92 @@ def resolve_fqn(
     if not resolved:
         return None, f"FQN '{fqn}' could not be resolved. File not in index or namespace mismatch."
     return resolved, None
+
+
+def file_byte_mass(symbols) -> tuple[dict[str, int], list[str]]:
+    """Per-file source bytes the symbol table actually spans, counting overlap once.
+
+    Summing ``byte_length`` over every symbol in a file DOUBLE-COUNTS nesting: a
+    class's span already covers its methods, and each method is a symbol of its
+    own. The inflation is not uniform — it tracks how class-heavy a file is — so
+    any cross-file comparison built on the naive sum (a Gini coefficient, a
+    concentration ranking, a corpus-wide savings baseline) is biased, not merely
+    scaled. Measured on this repo at 33.4% overall and up to 2.28x on a single
+    file. Merging the spans is the fix: a byte covered by both a class and its
+    method is one byte of source.
+
+    Returns ``(mass_by_file, unmeasurable_files)``. A file lands in the second
+    list when its spans cannot be trusted — more than one symbol carrying real
+    length at ``byte_offset == 0``, which is the signature of a parser that never
+    set offsets (the field defaults to 0, so "unset" and "starts at byte 0" are
+    indistinguishable for a single symbol but not for two). Those files are
+    UNKNOWN, never 0: a caller that folds them in as zero mass reports a
+    confident wrong answer, and one that folds in their naive sum reports the
+    defect this exists to remove. They are absent from ``mass_by_file``.
+    """
+    spans: dict[str, list[tuple[int, int]]] = {}
+    zero_offset: dict[str, int] = {}
+    for sym in symbols:
+        f = (sym.get("file", "") or "").replace("\\", "/")
+        if not f:
+            continue
+        length = int(sym.get("byte_length", 0) or 0)
+        offset = int(sym.get("byte_offset", 0) or 0)
+        spans.setdefault(f, [])
+        if length <= 0 or offset < 0:
+            continue
+        if offset == 0:
+            zero_offset[f] = zero_offset.get(f, 0) + 1
+        spans[f].append((offset, offset + length))
+
+    mass: dict[str, int] = {}
+    unmeasurable: list[str] = []
+    for f, intervals in spans.items():
+        if zero_offset.get(f, 0) > 1:
+            unmeasurable.append(f)
+            continue
+        total = 0
+        start = end = None
+        for lo, hi in sorted(intervals):
+            if start is None:
+                start, end = lo, hi
+            elif lo <= end:
+                end = max(end, hi)
+            else:
+                total += end - start
+                start, end = lo, hi
+        if start is not None:
+            total += end - start
+        mass[f] = total
+    return mass, sorted(unmeasurable)
+
+
+def symbol_span_bytes(symbols) -> int:
+    """Bytes of distinct source a symbol collection covers — the savings baseline.
+
+    ``sum(byte_length)`` over a symbol collection is NOT this number. A class's
+    span already covers its methods, so the naive sum counts those bytes once per
+    level of nesting and lands at 2.85x the real size of the files it describes
+    on this repo. A savings baseline is a claim about what someone would
+    otherwise have READ, and nobody reads a method twice for being inside a
+    class.
+
+    Deliberately CONSERVATIVE in two ways, both understating rather than
+    overstating a number we publish about ourselves: bytes outside every symbol
+    span (imports, comments, module docstrings, data literals) are not counted,
+    and a file whose spans cannot be trusted contributes 0 instead of a guess.
+    """
+    mass, _ = file_byte_mass(symbols)
+    return sum(mass.values())
+
+
+def distinct_file_bytes(file_sizes: dict, symbols) -> int:
+    """Bytes of the distinct FILES a symbol collection touches.
+
+    Looking `file_sizes` up per symbol charges a file once per symbol selected
+    from it — 84.89x over this repo's symbol table. Reading a file once yields
+    all of its symbols, so the file is the unit.
+    """
+    files = {(s.get("file", "") or "").replace("\\", "/") for s in symbols}
+    normalised = {k.replace("\\", "/"): v for k, v in (file_sizes or {}).items()}
+    return sum(int(normalised.get(f, 0) or 0) for f in files if f)

@@ -212,9 +212,13 @@ def _record_coverage(
         )
 
 
-def _build_skip_dirs_regex() -> re.Pattern:
-    """Build regex from config-filtered skip directories (called per-index)."""
-    dirs = get_skip_directories()
+def _build_skip_dirs_regex(repo: Optional[str] = None) -> re.Pattern:
+    """Build regex from config-filtered skip directories (called per-index).
+
+    ``repo`` is the walk root, threaded so a project's
+    ``exclude_skip_directories`` applies (#491).
+    """
+    dirs = get_skip_directories(repo=repo)
     return re.compile("^(" + "|".join(dirs) + ")$")
 
 
@@ -234,7 +238,7 @@ def _maybe_apply_adaptive(folder_path: str, result: dict) -> None:
 
 def get_filtered_files(path: str) -> Generator[str, None, None]:
     """Generator function to filter directories and files"""
-    skip_dirs_regex = _build_skip_dirs_regex()
+    skip_dirs_regex = _build_skip_dirs_regex(repo=path)
     # Use os.walk with followlinks=False to avoid infinite loops caused by
     # NTFS junctions or symlinks pointing back to ancestor directories.
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
@@ -576,7 +580,7 @@ def _should_index_file(
         return False, "extra_ignore", rel_path, None
 
     # 10. Secret-file detection
-    if is_secret_file(rel_path):
+    if is_secret_file(rel_path, repo=str(cfg.root)):
         return False, "secret", rel_path, f"Skipped secret file: {rel_path}"
 
     # 11. Extension filter
@@ -764,6 +768,7 @@ from ._utils import (
     PARSER_UPGRADE_WARNING,
     describe_unloadable_index,
     needs_parser_upgrade as _needs_parser_upgrade,
+    racket_reparse_reason as _racket_reparse_reason,
     size_cap_warning as _size_cap_warning,
     stamp_incremental_outcome as _stamp_incremental_outcome,
 )
@@ -839,6 +844,55 @@ def _fast_path_providers(folder_path: Path, context_providers: bool) -> list:
     providers = _resolve_active_providers(folder_path, context_providers)
     _cache_active_providers(folder_path, providers)
     return providers
+
+
+def _attach_hash_delta(
+    result: dict,
+    changed_paths: Optional[list],
+    subset_hashes: dict,
+    deleted_files,
+) -> None:
+    """Publish the hashes this run actually STORED, for a watcher-driven call.
+
+    ⚠⚠ The watcher used to answer "what is the new hash?" by loading the WHOLE
+    index after every single-file edit, hydrating every symbol to read a dict
+    of strings. **In the steady state that is nearly free and the first version
+    of this docstring was WRONG to claim otherwise**: `incremental_save` keeps
+    the LRU entry coherent, so the reload measures 0.001 s, not the 0.36 s a
+    cold load costs. Measured, after asserting the opposite (#557).
+
+    ⚠⚠ What it removes is a CLIFF, not a per-event cost, and the cliff is
+    reachable by a setting we ship. `JCODEMUNCH_INDEX_CACHE_TTL` evicts an
+    index that has sat unused -- and a watcher is idle between edits BY
+    DEFINITION, so with the TTL set every edit pays a cold hydration. Measured
+    at TTL=1 with a 1.5 s gap between edits: **0.001 s -> 0.19 s per event on
+    15,075 symbols**, and #370 measured cold hydration of a 665k-symbol index
+    at 7.5-11.4 MINUTES. The same happens whenever anything else moves the .db
+    mtime between the save and the read (a second server instance, the
+    embedding store, `refresh`). Reading what we already computed depends on
+    none of that.
+
+    ⚠ It cannot be answered by re-reading the file either, and that is why the
+    full reload was there: between our read and the watcher's the file can
+    change again, so the cache records a hash for content nobody indexed and
+    the NEXT edit is skipped as unchanged (T6). Returning what we stored has
+    neither problem -- there is no second read to race with.
+
+    ⚠⚠ Emitted ONLY when `changed_paths` was supplied. `index_folder` is an MCP
+    tool and this dict is unbounded in the size of the change set; a full walk
+    would put every hash in the repository on the wire, against a response cap
+    that refuses rather than truncates (JCODEMUNCH_RESPONSE_MAX_BYTES). The
+    watcher is the only caller that passes `changed_paths`, so the tool's
+    response is unchanged byte for byte.
+
+    ⚠ ABSENT and EMPTY mean different things and the consumer must keep them
+    apart: absent is "this run cannot tell you" (fall back to a full reload),
+    empty is "nothing moved". Same UNKNOWN-is-not-False rule as `has_any()`.
+    """
+    if changed_paths is None:
+        return
+    result["file_hashes_delta"] = dict(subset_hashes)
+    result["file_hashes_removed"] = sorted(deleted_files or [])
 
 
 def _rel_to_root(abs_path: Path, root: Path) -> Optional[str]:
@@ -938,7 +992,8 @@ def _scan_package_json_forced_paths(folder_path: Path) -> set[str]:
                 if target.is_file():
                     forced.add(os.path.normcase(str(target)))
                     continue
-                for ext in (".js", ".ts", ".mjs", ".cjs", ".jsx", ".tsx"):
+                for ext in (".js", ".ts", ".mjs", ".cjs", ".mts", ".cts",
+                            ".jsx", ".tsx"):
                     trial = pkg_dir / f"{cand}{ext}"
                     if trial.is_file():
                         forced.add(os.path.normcase(str(trial.resolve())))
@@ -1102,7 +1157,7 @@ def resolve_explicit_paths(
         # The explicit-paths branch must apply the same secret filter the walk
         # does; it intentionally still opts past gitignore/skip-dir so callers
         # can name generated/ignored source files on purpose.
-        if is_secret_file(_rel):
+        if is_secret_file(_rel, repo=str(walk_root)):
             warnings.append(f"Skipped secret file: {_rel}")
             skip_counts["secret"] = skip_counts.get("secret", 0) + 1
             continue
@@ -1241,7 +1296,7 @@ def discover_local_files(
         respect_cachedir_tag=respect_cachedir_tag,
     )
 
-    skip_dirs_regex = _build_skip_dirs_regex()
+    skip_dirs_regex = _build_skip_dirs_regex(repo=str(root))
     for dirpath, dirnames, filenames in os.walk(str(root), followlinks=False):
         dpath = Path(dirpath)
         # Prune directories that should always be skipped before descending.
@@ -1653,6 +1708,25 @@ def index_folder(
         # When the watcher provides the exact change set, skip full directory
         # discovery (~3s on Windows) and only process the affected files.
         if changed_paths and incremental:
+            # ── Per-phase timings (#557) ──
+            # `duration_seconds` alone cannot say WHERE a slow event went, and
+            # a maintainer who cannot reproduce it has nothing to work from but
+            # the reporter's patience. These are wall-clock deltas between
+            # fixed points on this path, reported on the result and logged at
+            # DEBUG. Cost is one `monotonic()` per phase.
+            #
+            # ⚠ They describe the fast path only. The full walk below does not
+            # emit them, so their ABSENCE on a result says the fast path was
+            # not taken -- which is itself the first thing worth knowing.
+            _fast_phase_times: dict[str, float] = {}
+            _fast_phase_last = time.monotonic()
+
+            def _fast_phase(name: str) -> None:
+                nonlocal _fast_phase_last
+                _now = time.monotonic()
+                _fast_phase_times[name] = round(_now - _fast_phase_last, 3)
+                _fast_phase_last = _now
+
             # Build the same filter bundle the full walk uses (#306). The
             # fast path previously applied only the extension check (and as
             # of v1.108.19 extra_ignore_patterns) but skipped every other
@@ -1740,7 +1814,9 @@ def index_folder(
                 max_size=_fast_max_size,
                 extra_spec=_fast_extra_spec,
                 forced_paths=_fast_forced_paths(),
-                skip_dirs_regex=_build_skip_dirs_regex(),
+                skip_dirs_regex=_build_skip_dirs_regex(
+                    repo=str(Path(walk_root).resolve())
+                ),
                 check_binary=False,
                 check_filename=True,
                 respect_cachedir_tag=get_respect_cachedir_tag(
@@ -1751,7 +1827,29 @@ def index_folder(
             # Branch detection for watcher fast-path
             _fast_branch = _get_git_branch(folder_path)
             _fast_is_branch_delta = False
-            _fast_base_index = store.load_index(owner, repo_name)  # always load base for branch check
+            # Base index for the branch check and the two re-parse predicates.
+            #
+            # ⚠⚠ This used to be `store.load_index(...)` unconditionally, on
+            # EVERY watcher event, inside the path whose entire purpose is to
+            # avoid loading the index (#557, @Ticki84). Three lines below,
+            # `use_memory_hash_cache` exists so the watcher's own hashes stand
+            # in for the store's -- and this load ran first regardless, so the
+            # saving was never realised on a cold read.
+            #
+            # ⚠ Everything the fast path asks of it is METADATA: `branch`,
+            # `git_head`, `file_hashes`, `has_source_file`, and the two
+            # re-parse stamps. A selective view answers all of them exactly and
+            # reads ZERO symbol rows; `open_selective` returns the cached full
+            # index untouched when one is already warm, so the warm case is
+            # byte-for-byte what it was.
+            #
+            # ⚠ `open_selective` returning None means "take the ordinary path",
+            # never "no such repo" -- a JSON-only legacy index has no rows to
+            # select from and must migrate through `load_index`.
+            _fast_base_index = store.open_selective(owner, repo_name)
+            if _fast_base_index is None:
+                _fast_base_index = store.load_index(owner, repo_name)
+            _fast_phase("base_index")
             if _fast_base_index is not None and _fast_branch:
                 _fast_base_branch = getattr(_fast_base_index, "branch", "") or ""
                 if not _fast_base_branch:
@@ -1794,7 +1892,7 @@ def index_folder(
             # are UNCHANGED, so a change-set-driven pass never re-parses them
             # (#414). Disarm the fast path and let the full walk below take the
             # upgrade branch, which is the only thing that rewrites every row.
-            if _needs_parser_upgrade(_fast_base_index):
+            if _needs_parser_upgrade(_fast_base_index) or _racket_reparse_reason(_fast_base_index):
                 existing_index = None
                 use_memory_hash_cache = False
 
@@ -1903,6 +2001,7 @@ def index_folder(
                 fast_warnings: list[str] = []
                 mtime_only_updates: dict[str, int] = {}
 
+                _fast_phase("classify")
                 for rel_path in set(changed_files) | set(new_files):
                     abs_path = rel_path_map_fast[rel_path]
                     try:
@@ -1961,11 +2060,15 @@ def index_folder(
                         "changed": 0, "new": 0, "deleted": 0,
                         "duration_seconds": round(time.monotonic() - t0, 2),
                     }
+                    # Nothing was re-parsed, so no stored hash moved. An EMPTY
+                    # delta is the authoritative answer here, not a missing one.
+                    _attach_hash_delta(_fast_mtime_only, changed_paths, {}, [])
                     _stamp_incremental_outcome(
                         _fast_mtime_only, _requested_incremental, True
                     )
                     return _fast_mtime_only
 
+                _fast_phase("read_hash")
                 files_to_parse = set(changed_files) | set(new_files)
                 # Split pipeline: parse immediately (no AI), fire summarization thread.
                 new_symbols, incr_file_summaries, incr_file_languages, incr_file_imports, incremental_no_symbols = (
@@ -1978,8 +2081,10 @@ def index_folder(
                     )
                 )
 
+                _fast_phase("parse")
                 git_head = _get_git_head(folder_path) or ""
                 incr_context_metadata = collect_metadata(active_providers) if active_providers else None
+                _fast_phase("git_head")
 
                 # Merge mtime-only updates so they're persisted alongside real changes
                 all_mtimes = {**mtime_only_updates, **fast_mtimes}
@@ -2056,6 +2161,15 @@ def index_folder(
                     "indexed_at": updated.indexed_at if updated else "",
                     "duration_seconds": round(time.monotonic() - t0, 2),
                 }
+                _fast_phase("save")
+                result["phase_seconds"] = dict(_fast_phase_times)
+                logger.debug(
+                    "index_folder fast path %s/%s: %s (total %.3fs)",
+                    owner, repo_name,
+                    " ".join(f"{k}={v}s" for k, v in _fast_phase_times.items()),
+                    time.monotonic() - t0,
+                )
+                _attach_hash_delta(result, changed_paths, subset_hashes, deleted_files)
                 if _fast_is_branch_delta:
                     result["branch"] = _fast_branch
                     result["branch_delta"] = True
@@ -2215,8 +2329,44 @@ def index_folder(
                 }
             # Same git_root.  Decide between merge (v1.96 format) and
             # rebuild (v1.95 legacy format).
-            if _existing_source_root == _git_root:
+            #
+            # ⚠⚠ The merge is for a SUBDIR walk only (#504). It exists to carry
+            # over files outside `walk_prefix`, and a full-root walk has nothing
+            # outside it — every indexed file is in this walk. Assigning
+            # `_merge_with_existing` there is not merely redundant: the
+            # incremental branch below is gated on `_merge_with_existing is
+            # None`, so a full-root RE-walk could never reach it and every
+            # repeat index rebuilt the whole corpus. That is invisible from the
+            # outside because the rebuild is correct — just unboundedly more
+            # expensive than the no-change return it replaced, on exactly the
+            # path a scheduled freshness check takes.
+            if _existing_source_root == _git_root and walk_prefix:
                 _merge_with_existing = _existing_for_collision
+            elif _existing_source_root == _git_root and set(
+                getattr(_existing_for_collision, "source_roots", []) or []
+            ) != {""}:
+                # A full-root walk over an index whose `source_roots` is still a
+                # PARTIAL subdir marker cannot use the full-corpus incremental
+                # diff: that diff is computed against the entire stored file
+                # set, and layering it onto a partial marker would leave the
+                # marker claiming less coverage than the index now has. Rebuild
+                # once to establish `source_roots == [""]`; every later root
+                # walk then takes the no-change path.
+                #
+                # ⚠ DISCLOSED MIGRATION: the first full-root index after
+                # upgrading is a rebuild for anyone whose index was last written
+                # by a subdir walk. It happens once per index, not per run.
+                incremental = False
+                logger.info(
+                    "index_folder: full-root walk supersedes partial source_roots "
+                    "for %s/%s; rebuilding once to establish the full-root marker",
+                    owner,
+                    repo_name,
+                )
+            elif _existing_source_root == _git_root:
+                # Full-root re-walk of an index already marked full-root: leave
+                # `_merge_with_existing` unset so the incremental diff runs.
+                pass
             elif _existing_source_root:
                 _v195_legacy_rebuild = True
                 # Drop the legacy index so the full-save path below
@@ -2303,6 +2453,39 @@ def index_folder(
                 getattr(existing_index, "parser_generation", 0), PARSER_GENERATION,
             )
             warnings.append(PARSER_UPGRADE_WARNING)
+        elif (_racket_reason := _racket_reparse_reason(existing_index)) and not (force_reparse and paths is not None):
+            # Two Racket-only escalations, same shape as the generation bump
+            # above and the same exemption for a bounded slice campaign, each
+            # with its own reason so a caller can tell them apart:
+            # `racket_index_predates_gate` -- the index carries no config
+            # stamp, so it was built before the Racket extraction changes of
+            # 2026-08-27 and may hold symbols the `#lang` gate now refuses;
+            # `racket_config_changed` -- `racket_definition_forms` /
+            # `racket_langs` differ from the stamp, and they change what the
+            # parser emits for UNCHANGED content, which the incremental path
+            # never re-reads.
+            incremental = False
+            rebuild_reason = _racket_reason
+            if _racket_reason == "racket_index_predates_gate":
+                logger.warning(
+                    "index_folder racket_index_predates_gate — %s/%s: this index holds "
+                    "Racket files and predates the Racket #lang gate; re-parsing every file once",
+                    owner, repo_name,
+                )
+                warnings.append(
+                    "This index holds Racket files and was built before the Racket #lang gate; "
+                    "every file was re-parsed once so its Racket symbols match the current parser."
+                )
+            else:
+                logger.warning(
+                    "index_folder racket_config_changed — %s/%s: racket_definition_forms "
+                    "or racket_langs differ from the index's stamp; re-parsing every file once",
+                    owner, repo_name,
+                )
+                warnings.append(
+                    "Racket config (racket_definition_forms / racket_langs) changed since this "
+                    "index was built; every file was re-parsed once so the declarations apply."
+                )
 
         # Discovery pass — resolve rel_paths and collect mtimes without
         # reading file contents (P2-5: avoids 200MB-1GB allocation

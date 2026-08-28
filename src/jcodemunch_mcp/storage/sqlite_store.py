@@ -275,6 +275,23 @@ _META_KEYS = [
 # fires raises TypeError("'>' not supported between 'NoneType' and 'int'").
 _INDEX_VERSION: Optional[int] = None
 _PARSER_GENERATION: Optional[int] = None
+
+
+def _racket_config_digest_for(source_root: str, languages: Optional[dict]) -> Optional[str]:
+    """The Racket config fingerprint to stamp on a freshly built index.
+
+    Every LOCAL index is stamped -- `""` for an unconfigured project -- so
+    that an absent key means exactly one thing: the index predates the stamp.
+    A remote index has no source root, no project config, and no stamp.
+    """
+    if not source_root:
+        return None
+    try:
+        from .. import config as _config
+        return _config.racket_config_digest(source_root)
+    except Exception:
+        logger.debug("racket config digest unavailable", exc_info=True)
+        return ""
 _file_hash: Callable[[str], str] = lambda x: ""
 
 
@@ -767,6 +784,31 @@ def _unlink_retry(path: Path, retries: int = 3, delay: float = 0.1) -> bool:
     return False  # unreachable, but satisfies type checkers
 
 
+
+def _default_base_path() -> Path:
+    """Storage root when a caller names none: `CODE_INDEX_PATH`, else `~/.code-index`.
+
+    ⚠⚠ This env var was DOCUMENTED and only half implemented. `config.py`,
+    `process_registry.py`, `install_pack.py`, `receipt.py` and two `server.py`
+    sites honoured `CODE_INDEX_PATH`; the two storage classes hardcoded
+    `Path.home() / ".code-index"` and ignored it. A user who set it therefore got
+    their CONFIG from one directory and their INDEXES in another -- split state
+    produced by a knob the env table calls "Index storage location".
+
+    ⚠ That is the #428 shape: a declared capability with nothing behind it,
+    which errors nowhere and so reads as working. The two `server.py` sites that
+    pass `os.environ.get("CODE_INDEX_PATH")` by hand are the fingerprint --
+    someone hit this and patched their own call site instead of the default.
+
+    ⚠ Resolved exactly as an explicit `base_path` is, so the two entry points
+    cannot disagree about what one spelling of a directory means (v1.108.280).
+    """
+    env = os.environ.get("CODE_INDEX_PATH")
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / ".code-index"
+
+
 class SQLiteIndexStore:
     """Storage backend using SQLite WAL for code indexes.
 
@@ -785,9 +827,9 @@ class SQLiteIndexStore:
             base_path: Base directory for storage. Defaults to ~/.code-index/
         """
         if base_path:
-            self.base_path = Path(base_path)
+            self.base_path = Path(base_path).expanduser().resolve()
         else:
-            self.base_path = Path.home() / ".code-index"
+            self.base_path = _default_base_path()
         _key = str(self.base_path)
         if _key not in _VERIFIED_PATHS:
             self.base_path.mkdir(parents=True, exist_ok=True)
@@ -1265,6 +1307,7 @@ class SQLiteIndexStore:
             symbols=composed_symbols,
             index_version=base_index.index_version,
             parser_generation=getattr(base_index, "parser_generation", 0),
+            racket_config_digest=getattr(base_index, "racket_config_digest", None),
             file_hashes=composed_hashes,
             git_head=delta.get("git_head", base_index.git_head),
             file_summaries=composed_summaries,
@@ -1380,6 +1423,7 @@ class SQLiteIndexStore:
             symbols=serialized_symbols,
             index_version=cast(int, _INDEX_VERSION),
             parser_generation=cast(int, _PARSER_GENERATION),
+            racket_config_digest=_racket_config_digest_for(source_root, languages),
             file_hashes=file_hashes,
             git_head=git_head,
             file_summaries=file_summaries or {},
@@ -2434,6 +2478,33 @@ class SQLiteIndexStore:
         repos.sort(key=lambda repo: repo["repo"])
         return repos
 
+    def list_source_roots(self) -> list[str]:
+        """Source roots of every indexed repo — one meta read per .db.
+
+        For callers that need ONLY the roots (the hook steering gate, per
+        tool call): `list_repos()` pays `SELECT COUNT(*)` over symbols and
+        files per repo, a full b-tree scan the roots never needed.
+        """
+        from .generation import connect_readonly
+        _pairs = parse_path_map()
+        roots: list[str] = []
+        for db_file in self.base_path.glob("*.db"):
+            if db_file.name in _NON_REPO_DB_FILES:
+                continue
+            try:
+                conn = connect_readonly(db_file)
+                conn.row_factory = sqlite3.Row  # _read_meta indexes by name
+                try:
+                    meta = self._read_meta(conn)
+                finally:
+                    conn.close()
+                sr = remap(meta.get("source_root", "") or "", _pairs)
+                if sr:
+                    roots.append(sr)
+            except Exception:
+                logger.debug("skipping %s for source roots", db_file, exc_info=True)
+        return roots
+
     def _list_repo_from_db(self, db_path: Path, _pairs: Optional[list] = None) -> Optional[dict]:
         """Read repo metadata from a .db file for list_repos."""
         if _pairs is None:
@@ -2688,18 +2759,17 @@ class SQLiteIndexStore:
 
     def _safe_content_path(self, content_dir: Path, relative_path: str) -> Optional[Path]:
         """Resolve a content path and ensure it stays within content_dir."""
-        try:
-            dir_key = str(content_dir)
-            base_str = self._resolved_content_dirs.get(dir_key)
-            if base_str is None:
+        from ..security import resolve_within
+
+        dir_key = str(content_dir)
+        base_str = self._resolved_content_dirs.get(dir_key)
+        if base_str is None:
+            try:
                 base_str = str(content_dir.resolve())
-                self._resolved_content_dirs[dir_key] = base_str
-            candidate = (content_dir / relative_path).resolve()
-            if os.path.commonpath([base_str, str(candidate)]) != base_str:
+            except (OSError, ValueError):
                 return None
-            return candidate
-        except (OSError, ValueError):
-            return None
+            self._resolved_content_dirs[dir_key] = base_str
+        return resolve_within(content_dir, relative_path, base_resolved=base_str)
 
     def _write_cached_text(self, path: Path, content: str) -> None:
         """Write cached text atomically, without newline translation.
@@ -3003,6 +3073,7 @@ class SQLiteIndexStore:
             symbols=patched_symbols,
             index_version=old.index_version,
             parser_generation=getattr(old, "parser_generation", 0),
+            racket_config_digest=getattr(old, "racket_config_digest", None),
             file_hashes=new_file_hashes,
             git_head=meta.get("git_head", old.git_head),
             file_summaries=new_file_summaries,
@@ -3102,6 +3173,7 @@ class SQLiteIndexStore:
             symbols=symbols,
             index_version=int(meta.get("index_version", "0")),
             parser_generation=int(meta.get("parser_generation", "0") or 0),
+            racket_config_digest=meta.get("racket_config_digest"),  # None = never stamped
             file_hashes=file_hashes,
             git_head=meta.get("git_head", ""),
             file_summaries=file_summaries,
@@ -3130,6 +3202,11 @@ class SQLiteIndexStore:
             "indexed_at": index.indexed_at,
             "index_version": str(index.index_version),
             "parser_generation": str(getattr(index, "parser_generation", 0)),
+            # Written ONLY when stamped: an absent key is what marks an index
+            # that predates the stamp, and writing "" for it would certify a
+            # re-parse that never happened.
+            **({"racket_config_digest": index.racket_config_digest}
+               if getattr(index, "racket_config_digest", None) is not None else {}),
             "git_head": index.git_head,
             "source_root": index.source_root,
             "git_root": getattr(index, "git_root", "") or "",
@@ -3175,6 +3252,7 @@ class SQLiteIndexStore:
             ext_map = {
                 ".py": "python", ".js": "javascript", ".ts": "typescript",
                 ".mjs": "javascript", ".cjs": "javascript",
+                ".mts": "typescript", ".cts": "typescript",
                 ".jsx": "javascript", ".tsx": "typescript", ".go": "go",
                 ".rs": "rust", ".java": "java", ".c": "c", ".cpp": "cpp",
                 ".h": "cpp", ".ino": "arduino", ".pde": "arduino",

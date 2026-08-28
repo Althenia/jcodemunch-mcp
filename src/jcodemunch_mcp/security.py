@@ -9,6 +9,25 @@ from . import config as _config
 
 # --- Package Integrity Check ---
 
+# Directories a real installation lands in. Running from anywhere else means no
+# distribution describes this code, so there is nothing to compare it against.
+_INSTALL_DIRS = {"site-packages", "dist-packages"}
+
+
+def _official_dist_owns_running_code(dist) -> bool:
+    """True when *dist* is the distribution the running package came from.
+
+    Installed-and-correctly-named is not sufficient on its own: the official
+    distribution can be present while the imported code came from somewhere
+    else, which is the case the warning exists for.
+    """
+    try:
+        claimed = Path(str(dist.locate_file("jcodemunch_mcp"))).resolve()
+    except Exception:
+        return False
+    return claimed == Path(__file__).resolve().parent
+
+
 def verify_package_integrity() -> None:
     """Warn at startup if this code is running from an unofficial distribution.
 
@@ -16,6 +35,23 @@ def verify_package_integrity() -> None:
     different name (e.g. jcodemunch-mcp-fork instead of jcodemunch-mcp).
     Uses packages_distributions() to find which distribution actually owns
     the running code — catches renamed forks that install under a different name.
+
+    ⚠⚠ **The checks are ordered cheapest-first and the ORDER is the fix.**
+    ``packages_distributions()`` builds a top-level-name -> distribution map for
+    EVERY distribution on ``sys.path`` in order to answer a question about ONE
+    of them. Measured on a Windows dev box carrying 894 top-level names:
+    **3.35 s, uncached, on every CLI invocation** — and on that box it then
+    returned nothing, because the code was running from source. The targeted
+    lookup that settles the common case is 5 ms.
+
+    ⚠ It was invisible while the CLI was something a human typed once. It stops
+    being invisible the moment hooks spawn it per tool call, where it is
+    essentially the whole cost of the hook.
+
+    ⚠⚠ **The expensive map is still reached and must stay reachable** — it is
+    the only thing that can NAME the other distribution, which is the entire
+    content of the warning. It now runs only after the cheap checks have found
+    something genuinely unusual, which is when that answer is worth 3 s.
     """
     import sys
 
@@ -23,11 +59,34 @@ def verify_package_integrity() -> None:
     canonical_url = "https://github.com/jgravelle/jcodemunch-mcp"
 
     try:
+        # 1. Source checkout, editable tree, zipapp: no installed distribution
+        #    provides this code. The old path reached the same verdict, having
+        #    first enumerated every distribution on the box to be told the
+        #    package it was asking about was not among them.
+        if Path(__file__).resolve().parent.parent.name not in _INSTALL_DIRS:
+            return
+
+        from importlib.metadata import distribution
+
+        try:
+            official = distribution(expected_dist)
+        except Exception:
+            # PackageNotFoundError is the expected miss; anything else here is
+            # a metadata problem, and both mean "cannot settle it cheaply".
+            official = None
+
+        # 2. The official distribution is installed AND owns the code actually
+        #    running. Nothing to warn about, and no map needed to say so.
+        if official is not None and _official_dist_owns_running_code(official):
+            return
+
+        # 3. Unusual: the official distribution is absent, or present and did
+        #    not provide the running code. Only now is the full map worth it.
         from importlib.metadata import packages_distributions
 
         distributions = packages_distributions().get("jcodemunch_mcp", [])
         if not distributions:
-            # Running from source / editable install without dist metadata — skip.
+            # Installed layout carrying no dist metadata — nothing to compare.
             return
 
         actual_dist = distributions[0]
@@ -67,6 +126,47 @@ def validate_path(root: Path, target: Path) -> bool:
         return os.path.commonpath([resolved_root, resolved]) == str(resolved_root)
     except (OSError, ValueError):
         return False
+
+
+def resolve_within(
+    base: Path,
+    relative: str,
+    *,
+    base_resolved: Optional[str] = None,
+) -> Optional[Path]:
+    """Join ``relative`` onto ``base`` and return it only if it stays inside.
+
+    The rule is CONFINEMENT BY RESOLUTION, deliberately not a string test on the
+    member name. A pre-scan for a leading separator and ``..`` is necessary and
+    not sufficient: ``C:/Windows/Temp/evil.txt`` contains neither, and
+    ``base / relative`` with an absolute ``relative`` DISCARDS ``base``. No
+    enumeration of separator and drive spellings ever finishes; resolving and
+    comparing does not have to.
+
+    ⚠ Whether a given name escapes is PLATFORM-DEPENDENT and that is correct
+    rather than a gap. ``C:/Windows/...`` is absolute on Windows and an ordinary
+    relative name on Linux and macOS, where resolving it under the base is the
+    right answer. Assert confinement, never that a particular string is refused.
+
+    Args:
+        base: The directory the result must stay inside.
+        relative: An untrusted path fragment (archive member, stored file path).
+        base_resolved: ``str(base.resolve())`` when the caller already has it.
+            Callers on a hot path pass their cached value; the rule is unchanged.
+
+    Returns:
+        The resolved destination, or None if it escapes or cannot be resolved.
+    """
+    try:
+        base_str = base_resolved if base_resolved is not None else str(base.resolve())
+        candidate = (base / relative).resolve()
+        if os.path.commonpath([base_str, str(candidate)]) != base_str:
+            return None
+        return candidate
+    except (OSError, ValueError):
+        # ValueError also covers Windows' different-drive commonpath, which is
+        # an escape by definition.
+        return None
 
 
 def is_symlink_escape(root: Path, path: Path) -> bool:
@@ -131,7 +231,7 @@ def _resolve_secret_overrides(excluded: list[str]) -> tuple[set[str], list[str]]
     return disabled, allow
 
 
-def is_secret_file(file_path: str) -> bool:
+def is_secret_file(file_path: str, repo: Optional[str] = None) -> bool:
     """Return True if a path is judged to be a secret/credential file.
 
     Thin boolean wrapper over :func:`secret_classifier.classify_secret_file`,
@@ -145,7 +245,11 @@ def is_secret_file(file_path: str) -> bool:
     flagged; an actual credential file (``.env``, ``*.pem``, ``secrets/db.yaml``,
     ``.aws/credentials``) is.
     """
-    excluded = list(_config.get("exclude_secret_patterns", []) or [])
+    # ⚠ `repo=` is what makes the docstring above true. Without it this reads
+    # global config only, and the project's documented opt-out never applies
+    # (#491). Its sibling `get_respect_cachedir_tag` has threaded it since
+    # v1.108.270; these two were left behind by the #301 audit.
+    excluded = list(_config.get("exclude_secret_patterns", [], repo=repo) or [])
     disabled, allow = _resolve_secret_overrides(excluded)
     return classify_secret_file(
         file_path,
@@ -179,6 +283,54 @@ _SKIP_DIRECTORY_NAMES: list[str] = [
     # counted in `discovery_skip_counts`, so a surprised user can see which
     # rule dropped what rather than guessing.
     "backup", "old", "archive",
+    # v1.108.295: the UNDERSCORE spelling of a build tree. `build` and
+    # `.build` were both listed and `_build` was not, which is the spelling
+    # Elixir/Mix, Sphinx and Dune all use — and we index Elixir.
+    #
+    # ⚠⚠ This is the SAME defect as the three entries above, not a new one.
+    # `mix` copies dependency SOURCES into `_build`, so an Elixir project
+    # indexed here got every dependency symbol twice, with the copies
+    # competing against the originals in ranking. A build tree is derived
+    # data by definition; the only reason it survived is that nobody wrote
+    # down the third spelling.
+    #
+    # ⚠ Bounded, and listed anyway: `_build/` is in the standard Elixir
+    # .gitignore and gitignore is honoured, so this bites a project without
+    # one or indexed outside git. `build/` is in that same .gitignore and has
+    # been listed since the beginning — the argument for one is the argument
+    # for the other.
+    #
+    # ⚠ Found by reading Graft's fix titles against our tree
+    # (`fix(ingest): skip _build, the underscore spelling of a build tree`),
+    # which is the third time that probe has paid.
+    "_build",
+    # v1.108.303: the JS/TS build trees, which are the same defect a FOURTH
+    # time -- `build`, `.build` and `_build` were all listed and the framework
+    # spellings were not. `.next/server/**` holds a TRANSPILED copy of the
+    # pages the user wrote, so a Next.js project indexed here got its own
+    # source twice, with the machine-generated copy competing against the
+    # original in ranking.
+    #
+    # ⚠ DOTTED spellings only, deliberately. `out`, `bin`, `obj` and `coverage`
+    # name real source directories in real projects; the entries above already
+    # carry that risk for `backup`/`old`/`archive` and it needs no fourth
+    # instance. Nobody ships a package directory called `.next`.
+    #
+    # ⚠ Each of these is in its framework's standard .gitignore and gitignore
+    # is honoured, so this bites a project without one or indexed outside git
+    # -- the identical bound `_build` carries, and the argument for one is the
+    # argument for the others.
+    #
+    # ⚠ Found by reading GitNexus's fix titles against our tree
+    # (`fix(ingestion): ignore emitted Next.js build output`).
+    ".next",         # Next.js
+    ".nuxt",         # Nuxt 2
+    ".output",       # Nuxt 3 / Nitro
+    ".svelte-kit",   # SvelteKit
+    ".angular",      # Angular CLI cache
+    ".turbo",        # Turborepo
+    ".parcel-cache", # Parcel
+    ".dart_tool",    # Dart / Flutter
 ]
 
 # Glob-style patterns — matched by regex in index_folder, by suffix in index_repo.
@@ -255,23 +407,40 @@ def get_respect_cachedir_tag(repo: Optional[str] = None) -> bool:
     return False if value is False else True
 
 
-def _excluded_skip_directories() -> set[str]:
-    """Return the set of directory names the user wants to un-skip."""
-    raw = _config.get("exclude_skip_directories", [])
+def _excluded_skip_directories(repo: Optional[str] = None) -> set[str]:
+    """Return the set of directory names the user wants to un-skip.
+
+    ⚠ ``repo`` is not optional in practice, only in signature. The skip list
+    holds ordinary English words that CAN name a real package, which is the
+    whole reason ``exclude_skip_directories`` exists — and a project that ships
+    a ``fixtures/`` or ``archive/`` module declares that in its own
+    ``.jcodemunch.jsonc``, not in global config. Reading without ``repo`` skips
+    the project overlay entirely, so the documented per-project opt-out silently
+    did nothing (#491).
+    """
+    raw = _config.get("exclude_skip_directories", [], repo=repo)
     return set(raw) if isinstance(raw, list) else set()
 
 
-def get_skip_directories() -> list[str]:
-    """Return SKIP_DIRECTORIES with user-excluded entries removed."""
-    excluded = _excluded_skip_directories()
+def get_skip_directories(repo: Optional[str] = None) -> list[str]:
+    """Return SKIP_DIRECTORIES with user-excluded entries removed.
+
+    Pass ``repo`` (a filesystem path) to honour the project's
+    ``exclude_skip_directories``. Omitting it resolves global config only.
+    """
+    excluded = _excluded_skip_directories(repo=repo)
     if not excluded:
         return SKIP_DIRECTORIES
     return [d for d in SKIP_DIRECTORIES if d not in excluded]
 
 
-def get_skip_patterns() -> frozenset[str]:
-    """Return SKIP_PATTERNS with user-excluded directory entries removed."""
-    excluded = _excluded_skip_directories()
+def get_skip_patterns(repo: Optional[str] = None) -> frozenset[str]:
+    """Return SKIP_PATTERNS with user-excluded directory entries removed.
+
+    Pass ``repo`` (a filesystem path) to honour the project's
+    ``exclude_skip_directories``. Omitting it resolves global config only.
+    """
+    excluded = _excluded_skip_directories(repo=repo)
     if not excluded:
         return SKIP_PATTERNS
     excluded_with_slash = {d + "/" for d in excluded}
@@ -605,7 +774,7 @@ def should_exclude_file(
         return "outside_root"
 
     # Secret detection
-    if check_secrets and is_secret_file(rel_path):
+    if check_secrets and is_secret_file(rel_path, repo=str(root)):
         return "secret_file"
 
     # File size

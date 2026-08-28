@@ -1,10 +1,10 @@
 # jCodeMunch MCP
 
-**The most token-efficient MCP server for precise source code retrieval via tree-sitter AST parsing.** Cut AI token costs 86-99% on code exploration (96% average, benchmarked at 27.9x fewer tokens than a grep-and-read agent) and stop burning your context window reading entire files.
+**The most token-efficient MCP server for precise source code retrieval via tree-sitter AST parsing.** Cut AI token costs 86-99% on code exploration (96% average, benchmarked at 27.4x fewer tokens than a grep-and-read agent) and stop burning your context window reading entire files.
 
 > **Real results, live from production**
-> **645B+ tokens saved** · **95,000+ reporting installs** · **$3.2M+ in AI spend avoided** · **77,000+ kg CO₂ prevented**
-> Counter figures as of 2026-08-05, valued at the $5/MTok Claude Opus **input** rate. All four only grow, so read them as floors. Live at **[jcodemunch.com](https://jcodemunch.com/)**.
+> **838B+ tokens saved** · **136,000+ reporting installs** · **$4.2M+ in AI spend avoided** · **100,000+ kg CO₂ prevented**
+> Counter figures as of 2026-08-17, valued at the $5/MTok Claude Opus **input** rate. All four only grow, so read them as floors. Live at **[jcodemunch.com](https://jcodemunch.com/)**.
 
 Works with **Claude Code**, **Cursor**, **VS Code**, **Codex CLI**, **Windsurf**, **Continue**, and [any MCP-compatible client](CLIENTS.md).
 
@@ -46,19 +46,19 @@ Index once. Query cheaply. Keep moving. **Precision context beats brute-force co
 
 ### Reproducible token efficiency benchmark
 
-Measured with `tiktoken cl100k_base` across three public repos pinned to upstream commits, run 2026-08-03 on v1.108.233. Workflow: `search_symbols` (top 5) + `get_symbol_source` × 3 per query. Two baselines, same run, same corpus, same file reader:
+Measured with `tiktoken cl100k_base` across three public repos pinned to upstream commits, run 2026-08-25 on v1.108.297. Workflow: `search_symbols` (top 5) + `get_symbol_source` × 3 per query. Two baselines, same run, same corpus, same file reader:
 
 - **Grep-top-3**: `rg -l` the query terms, rank files by match count, open the top 3 whole. This is what a competent agent without the tool actually does, and it is the number to quote.
 - **Read-all**: every indexed source file concatenated. A ceiling nobody pays; retained for continuity with previously published figures.
 
 | Repository | Files | Symbols | Grep-top-3 baseline | jCodeMunch | vs grep | vs read-all |
 |------------|------:|--------:|--------------------:|-----------:|--------:|------------:|
-| expressjs/express | 182 | 200 | 15,724 avg | 1,007 avg | **15.6x** | 153.2x |
-| fastapi/fastapi | 1,182 | 6,841 | 85,296 avg | 2,209 avg | **38.6x** | 372.9x |
-| gin-gonic/gin | 98 | 1,179 | 31,975 avg | 1,545 avg | **20.7x** | 98.3x |
-| **Grand total (15 task-runs)** | | | **664,975** | **23,805** | **27.9x** | 237.3x |
+| expressjs/express | 186 | 200 | 15,724 avg | 1,002 avg | **15.7x** | 154.3x |
+| fastapi/fastapi | 1,186 | 6,841 | 85,296 avg | 2,271 avg | **37.6x** | 363.5x |
+| gin-gonic/gin | 98 | 1,260 | 31,975 avg | 1,577 avg | **20.3x** | 96.3x |
+| **Grand total (15 task-runs)** | | | **664,975** | **24,249** | **27.4x** | 233.4x |
 
-**Against a grep-and-read agent: 96.4% reduction, 27.9x fewer tokens.** Per-query results range from 7.3x to 84.3x (median 25.5x); no single multiple describes every query. Against read-all the figure is 99.6%, but nobody pays that ceiling. Compact [MUNCH](SPEC_MUNCH.md) wire encoding then trims a median 45.5% more bytes off responses.
+**Against a grep-and-read agent: 96.4% reduction, 27.4x fewer tokens.** Per-query results range from 7.3x to 79.8x (median 25.5x); no single multiple describes every query. Against read-all the figure is 99.6%, but nobody pays that ceiling. Compact [MUNCH](SPEC_MUNCH.md) wire encoding then trims a median 45.5% more bytes off responses.
 
 Full methodology, pinned commits, harness, and known caveats: [benchmarks/METHODOLOGY.md](benchmarks/METHODOLOGY.md) · [Reproduce it yourself](benchmarks/REPRODUCING.md) · [TOKEN_SAVINGS.md](TOKEN_SAVINGS.md)
 
@@ -88,13 +88,24 @@ Full methodology, pinned commits, harness, and known caveats: [benchmarks/METHOD
 #### Recommended: one command
 
 ```bash
-pip install jcodemunch-mcp
+uv tool install jcodemunch-mcp
 jcodemunch-mcp init
 ```
 
+No virtualenv to manage, nothing written into system Python, and it works as-is on PEP 668 distros (Ubuntu 24.04+, Debian 12+) where bare `pip install` is refused. [Don't have `uv` yet?](https://docs.astral.sh/uv/getting-started/installation/)
+
 `init` auto-detects your MCP clients (Claude Code, Claude Desktop, Cursor, Windsurf, Continue), writes their config entries, installs the CLAUDE.md prompt policy so your agent actually uses jCodeMunch, optionally installs enforcement hooks, optionally indexes your project, and audits your agent config files for token waste.
 
-> **Ubuntu 24.04+ / Debian 12+:** system Python is externally managed (PEP 668). Use `pipx install jcodemunch-mcp` or `uv tool install jcodemunch-mcp` instead of bare `pip install`.
+<details>
+<summary><b>Other install paths</b></summary>
+
+| Command | Use it when |
+|---|---|
+| `uvx jcodemunch-mcp` | **Zero install.** Runs from an ephemeral environment — nothing lands on disk permanently. The client entries `init` writes already invoke the server this way, so for most setups this is all that ever runs. ⚠ Enforcement hooks are the exception: they're spawned by a minimal-PATH subshell and resolve the executable by name, so they need `uv tool install` (or `pipx`/`pip`) to work. |
+| `pipx install jcodemunch-mcp` | You already standardise on pipx |
+| `pip install jcodemunch-mcp` | Inside a virtualenv you manage yourself |
+
+</details>
 
 Verify:
 
@@ -105,9 +116,10 @@ jcodemunch-mcp --version
 #### Manual Claude Code setup
 
 ```bash
-pip install jcodemunch-mcp
-claude mcp add -s user jcodemunch jcodemunch-mcp
+claude mcp add -s user jcodemunch -- uvx jcodemunch-mcp
 ```
+
+No install step — `uvx` fetches and runs the server on demand. Prefer it on your PATH (and required for enforcement hooks)? `uv tool install jcodemunch-mcp`, then `claude mcp add -s user jcodemunch jcodemunch-mcp`.
 
 Then tell the agent to prefer the tools. This matters more than people think; installation makes the tools available but does not break the agent's brute-reading habit. One line in your CLAUDE.md does it:
 
@@ -146,9 +158,9 @@ That's the highlight reel. The complete tour of 90+ tools, the MUNCH compact wir
 <!-- WHATSNEW:START -->
 #### What's new
 
-- **[v1.108.279](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.279)** (2026-08-14) — A machine's language is not English and its bytes are not UTF-8
-- **[v1.108.278](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.278)** (2026-08-14) — `exact` must mean exact, and a guardrail must not be its own baseline
-- **[v1.108.277](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.277)** (2026-08-13) — Reachability is not only the import graph, and liveness is not only the PID
+- **[v1.108.305](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.305)** (2026-08-28) — Only the reader was never fixed
+- **[v1.108.304](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.304)** (2026-08-28) — Three hypotheses, each measured, each wrong
+- **[v1.108.303](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.303)** (2026-08-27) — The measurement was the defect
 <!-- WHATSNEW:END -->
 
 ---
@@ -171,9 +183,96 @@ It helps most on targeted edits (one function, one method, one class), which is 
 
 <a id="background-behavior-fully-disclosed"></a>
 
+## Deferring the tool schemas (Anthropic tool search)
+
+If you reach jCodeMunch through the [MCP connector](https://platform.claude.com/docs/en/agents-and-tools/mcp-connector) on a model that supports [tool search](https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-search-tool), you can keep our schemas out of your context prefix entirely and let Claude load only the two or three tools a request needs. **You do not set `defer_loading` per tool** — set it once for the whole server:
+
+```json
+{
+  "mcp_servers": [
+    { "type": "url", "url": "https://your-host/mcp", "name": "jcodemunch" }
+  ],
+  "tools": [
+    { "type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25" },
+    {
+      "type": "mcp_toolset",
+      "mcp_server_name": "jcodemunch",
+      "default_config": { "defer_loading": true },
+      "configs": {
+        "resolve_repo":       { "defer_loading": false },
+        "search_symbols":     { "defer_loading": false },
+        "get_ranked_context": { "defer_loading": false }
+      }
+    }
+  ]
+}
+```
+
+Send it with the beta header `mcp-client-2025-11-20`. **Both halves are required** — `mcp_servers` alone is a validation error, and so is `mcp_toolset` without the matching `mcp_server_name`.
+
+⚠ **The MCP connector takes a URL, so this applies to jCodeMunch served over `sse` or `streamable-http`** (`jcodemunch-mcp serve --transport streamable-http`), not to the default local stdio setup. On stdio, whether schemas are deferred is up to your client, and `tool_surface: "counter"` below is the lever you control.
+
+The `configs` block above follows Anthropic's own advice — keep your 3–5 most-used tools resident so common requests skip the search round trip — and per-tool `configs` overrides `default_config`.
+
+Deferred definitions are excluded from the system-prompt prefix and appended inline as `tool_reference` blocks when Claude discovers them, **so prompt caching is preserved** — this is not the cache-invalidating kind of dynamic tool list. At least one tool in the request must stay non-deferred, or the API returns a 400.
+
+⚠ **This is a different mechanism from our own `tool_surface: "counter"`**, and you do not need both. Tool search is host-side and works across every MCP server you have connected; the Counter is server-side, works on any host including ones with no tool-search support, and is what `init` configures on a first-ever install. Pick whichever your host supports — see [CONFIGURATION.md](CONFIGURATION.md#the-counter--collapse-to-a-3-tool-front-door-tool_surface) for the Counter and `jcodemunch-mcp surface` for what your install actually advertises.
+
+---
+
 ## Security, privacy, and background behavior
 
 Local-first by design: indexes live at `~/.code-index/`, and the base package's only default network behavior is an anonymous savings counter (random ID plus aggregate token counts, no code, no paths, no PII; opt out with `share_savings: false`). Everything the server does beyond answering a tool call (file watching, the opt-in login service, license validation, model downloads, org reporting) is opt-in or opt-out, visible, and reversible, and every item is enumerated in **[SECURITY.md](SECURITY.md#background-behavior-fully-disclosed)** alongside the path-traversal, symlink, and secret-redaction controls.
+
+---
+
+## Per-project configuration
+
+Most settings live in the global `~/.code-index/config.jsonc`, but any of them can be overridden for a single repository by dropping a `.jcodemunch.jsonc` at its root. It is an **overlay**: keys it declares win, keys it omits fall through to global and then to the built-in default, so it only needs to contain what differs.
+
+```jsonc
+// <your-repo>/.jcodemunch.jsonc
+{
+  "max_file_size": 1048576,
+  "languages": ["python", "typescript", "racket"]
+}
+```
+
+### Declaring Racket defining forms
+
+Racket projects routinely define their own defining forms with `define-syntax`, and a static parser cannot know what those bind — `(defstep (check-admin) ...)` is indistinguishable from a function call. Declaring them makes their bindings searchable:
+
+```jsonc
+{
+  "racket_definition_forms": {
+    "defstep":  "function",
+    "defstudy": "constant",
+    "defvar":   "constant",
+    "define-schema": "class"
+  }
+}
+```
+
+Each entry maps a form name to what it binds: `function`, `constant`, `class` or `type`. Where the name sits is read from the source rather than declared — `(defstep (check-admin) ...)` takes the head of the parameter list, `(defstudy consent ...)` takes the bare symbol — so a form that appears in both shapes works either way.
+
+⚠ This is an assertion, not something jCodeMunch can verify. A wrong declaration puts a name in the index that Racket does not actually bind. Declarations are also matched only after every built-in form, so declaring `define` or `struct` has no effect — the built-in handling wins.
+
+### Declaring what a Racket `#lang` looks like
+
+A `#lang` line names a *reader*, and jCodeMunch's Racket parser reads S-expressions. The distribution's langs are built in (`racket/*`, `typed/racket*`, `s-exp`, `info`, `at-exp …`, and the document langs `scribble/*`, `pollen`, `punct`, `markdown` …), but a project's own lang is unknown to it and is treated as a document — no symbols, still text-searchable — until you say what its syntax is:
+
+```jsonc
+{
+  "racket_langs": {
+    "conscript": "at-exp",
+    "mylang": "sexp"
+  }
+}
+```
+
+`sexp` is plain S-expressions; `at-exp` is at-exp text bodies over Racket (the bodies are blanked before parsing, so prose containing `;` `"` `#` or `|` cannot break the grammar); `text` is a document language that is never walked. A key also covers its sub-langs (`conscript` matches `conscript/with-require`), and a project may demote a lang as well as promote one.
+
+Both keys change what the parser emits for *unchanged* files, so a change to either is stamped on the index and forces one full re-parse on the next index (`rebuild_reason: "racket_config_changed"`); you do not need to touch the files or clear the index. An index holding Racket files that was built before this stamp existed re-parses once the same way (`rebuild_reason: "racket_index_predates_gate"`).
 
 ---
 
@@ -215,7 +314,7 @@ Conditions on all uses: retain the copyright notice, clearly mark modifications 
 ## FAQ
 
 **How much can I save on Claude / Opus tokens?**
-In retrieval-heavy workflows, code-reading tokens typically drop 86-99%, benchmarked at 96.4% average (27.9x) against a grep-and-read agent across 15 tasks and 3 repositories. Per-query results span 7.3x to 84.3x. Methodology: [TOKEN_SAVINGS.md](TOKEN_SAVINGS.md) and [benchmarks/](benchmarks/).
+In retrieval-heavy workflows, code-reading tokens typically drop 86-99%, benchmarked at 96.4% average (27.4x) against a grep-and-read agent across 15 tasks and 3 repositories. Per-query results span 7.3x to 79.8x. Methodology: [TOKEN_SAVINGS.md](TOKEN_SAVINGS.md) and [benchmarks/](benchmarks/).
 
 **How is this different from RAG or grep-based tools?**
 jCodeMunch retrieves at the **symbol level** with byte-level precision (functions, classes, importers, blast radius, hierarchies) rather than fuzzy chunks (RAG) or raw line matches (grep) the agent still has to read and reason over.
