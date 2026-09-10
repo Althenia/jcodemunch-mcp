@@ -54,8 +54,15 @@ dmypy.json
 .code-index/
 .ab_bench_idx/
 
-# Claude Code local settings (may contain credentials from allowed commands)
-.claude/
+# Claude Code: the WORKFLOW files (commands, agents, hooks, skills,
+# settings.json) are tracked as of 2026-09-05 (docs/workflows/DESIGN.md D1).
+# Only the local settings (which may carry credentials from allowed commands,
+# the v0.2.6 leak) and per-session state stay out. The sdist still excludes
+# ALL of .claude/ (pyproject [tool.hatch.build.targets.sdist]), asserted by
+# tests/test_build.py and tests/test_sdist_exclusions.py.
+.claude/settings.local.json
+.claude/*.bak
+.claude/state/
 
 # Local working notes (may contain sensitive info)
 prompt.md
@@ -85,6 +92,12 @@ docs/*
 # PARSER_GENERATION comment cites it as the thing that ends the manual-bump
 # obligation), so a contributor bound by that rule has to be able to read it.
 !docs/prd-extraction-fingerprint.md
+# The engineering standard (2026-09-03): tracked, because a gitignored
+# standard is machine-local and cannot be enforced by CI.
+!docs/standard/
+!docs/harness/
+!docs/cicd/
+!docs/workflows/
 # ...except a spec CLAUDE.md binds a live rule to. `prd-extraction-fingerprint`
 # is cited by the PARSER_GENERATION comment as the thing that ends the
 # manual-bump obligation, so a contributor who is bound by that rule has to be
@@ -117,3 +130,6 @@ benchmarks/rust_fidelity/oracle/Cargo.lock
 # ⚠⚠ `suite.log` was caught SHIPPING by that guard on 2026-08-28, minutes
 # after `relnotes.md` did ship in 1.108.304. Write scratch outside the repo.
 *.log
+!docs/inbound/
+# The competitive feedback loop (2026-09-05): docs/competitive/DESIGN.md D7.
+!docs/competitive/

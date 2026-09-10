@@ -1,0 +1,35 @@
+{
+  "schema": "jcm-self-latency/v1",
+  "n": 20,
+  "date": "2026-09-07T22:37:05",
+  "commit": "392be1e1",
+  "corpus_sha256": "d0bbb1b79c97f3ca462dba2b0cfc33e57bb8459a897561736769c4f958b1020f",
+  "env": {
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "python": "3.12.14",
+    "cpus": 4
+  },
+  "index.cold_self_seconds": 3.217,
+  "index.cold_runs": [
+    3.217,
+    3.212,
+    3.236
+  ],
+  "files": 276,
+  "symbols": 4501,
+  "repo": "local/corpus-1dcfbd4e",
+  "index.one_file_reindex_ms": 71.0,
+  "index.one_file_reindex_p95_ms": 86.1,
+  "latency.search_symbols_cold_ms": 730.6,
+  "latency.search_symbols_warm_p95_ms": 8.0,
+  "latency.search_symbols_warm_median_ms": 0.2,
+  "latency.search_text_cold_ms": 28.4,
+  "latency.search_text_warm_p95_ms": 93.5,
+  "latency.search_text_warm_median_ms": 65.5,
+  "latency.get_symbol_source_cold_ms": 5.1,
+  "latency.get_symbol_source_warm_p95_ms": 1.5,
+  "latency.get_symbol_source_warm_median_ms": 1.0,
+  "latency.get_file_outline_cold_ms": 3.1,
+  "latency.get_file_outline_warm_p95_ms": 3.1,
+  "latency.get_file_outline_warm_median_ms": 2.2
+}

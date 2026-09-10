@@ -2,6 +2,1908 @@
 
 ## [Unreleased]
 
+### Fixed - a failed embedding batch names its cause in the response, at both loops that had been swallowing it (FINDINGS CF-66)
+
+A provider failure reached the caller as `symbols_skipped_error: N` and
+nothing else: the exception went to the log, so a rejected key, a network
+outage and a model the endpoint does not serve all read as the same count,
+and a run in which every batch failed came back in the success shape with
+`symbols_embedded: 0`. The response carries `error_causes` now, one row per
+distinct exception type and message with the number of batches it explains
+(the message scrubbed before it is shortened, since a provider echoes the
+request into it, and a cut list says `causes_omitted`), and
+`all_batches_failed` when nothing was embedded; a clean run carries neither
+field. The review found the same swallow one tool over: `search_symbols`'
+lazy top-up embeds the symbols a store does not hold yet, and a failed
+batch there left them scored lexically only, inside a response labelled
+`hybrid`, with nothing at all reaching the caller. Both loops share one
+ledger now (`embeddings/failures.py`), and `search_symbols` reports a body
+field `semantic_topup` (symbols unscored, batches failed, the causes),
+declared in its compact encoder so it survives compaction. In the body,
+because `meta_fields: []` is the shipped default and the dispatcher deletes
+`_meta` under it: the first draft put it there, and the review read the
+Standing lesson back to us. Found by the
+probe a competitor's fix title asked for (zvec-grep #81, `surface embedding
+failures and avoid redundant retries`, recorded in
+`docs/competitive/FINDINGS.md` CF-66): the retry half does not apply here,
+the cause half did, twice. What is not changed: each loop still tries every
+batch after a shared failure, which the `batches` count now makes visible
+instead of hiding.
+
+### Fixed - watch mode bounds native registration on symlink-heavy workspaces
+
+`watch` now registers the real, non-skipped directory tree non-recursively
+instead of asking `watchfiles` to traverse directory symlinks before filters
+run. Directory topology changes re-arm the bounded watch set. A child deleted
+or renamed during registration triggers a retry only if the root remains and
+a fresh directory census differs from the failed watch set; missing roots,
+unchanged watch sets, and other errors still propagate. Failed streams close
+before replacements open. Initial registration and each successful re-arm
+request a full incremental reconciliation to cover edits during registration;
+ordinary file edits retain the changed-path fast path. `watch_follow_symlinks`
+still applies to symlinked files -- directory symlinks are not traversed.
+### Fixed - a `<script >` closed with a space before the bracket swallowed the markup after it (Razor and Astro)
+
+The Razor and Astro extractors cut `<script>` and `<style>` blocks out of
+the template with a regex that ended at a bare `</script>`. An end tag may
+carry whitespace before its bracket, which is valid HTML and which some
+formatters emit, and a block closed that way did not end there: the match
+ran on to the NEXT close tag, so the elements between two script blocks
+were parsed as JavaScript and their ids went unreported. The end tag now
+admits whatever a browser admits between `</script` and `>`: whitespace,
+or the junk attributes CodeQL named on the PR after a first fix that
+admitted whitespace only. Found by CodeQL (`py/bad-tag-filter`) in the
+code-scanning triage recorded as `docs/cicd/FINDINGS.md` C-16, with the
+process-lock file now created readable by its owner only (it was
+world-readable; its metadata is a pid, a client id and a start time, and
+every reader is the same user's process), the munch-bench leaderboard
+escaping model and provider names it renders into HTML, and the
+speedreview action passing its inputs to the shell as environment
+variables instead of interpolating them into the script text.
+
+### Added - the ninth competitor row, a ripgrep-plus-vector CLI in its in-process mode, with the schema weight of its one-tool MCP surface captured uncharged (FINDINGS CF-66)
+
+zvec-grep entered the comparison set on 2026-09-07 (FIELD.md, set row
+9; #638) on the adoption trigger, two months after its first release,
+and it is the first member whose own benchmark has the shape of our
+Baseline B: an agent's built-in tools against the tool, run by them on
+Claude Code with Opus 5, scored by a model judge, on a remote embedding
+model. The adapter runs its CLI in the mode its docs call `direct`
+(in-process, no daemon, no port), the corpus copied to the container's
+tmpfs because the index lives inside the workspace; P1 and T go through
+its indexed hybrid route, P2 and P4 through its ripgrep route, the one
+its agent guidance names for exact identifiers, and the note says so
+where the number will be read. The model in the image is the one its
+README recommends for code, warmed at build so the run stays offline,
+and it is not the remote model its published run used; the fairness
+note records the difference before the first number. Its MCP server is
+HTTP behind a daemon, so its one-tool surface is measured uncharged by
+starting the server on the container's loopback after the last charged
+call: one tool, 1,531 tokens of schema, where the Counter's three tools
+are 939. The smoke run over the self corpus (one run, never recorded)
+found the definition as hit #1 of ten on P1 and a fixed-string grep
+matching comments on P4; both are the tool's answers, cited as returned.
+One defect was ours: the token file the server reads was passed without
+being written, and the first capture's connection was refused.
+
+A session that changed retrieval can ask how the change moved every
+competitive row before opening a PR: the tier runs on the working tree
+and in a worktree of a ref (one adapter or all, three repetitions, in the
+container, the corpus and task checks refusing before scoring), and one
+table shows each row's ref and current values, the band, and the
+movement between them, with our own rows first. Drafts go to a state
+directory the ledger never reads, nothing is recorded into the tree's
+results, and nothing here types a number.
+
+### Added - the competitive tier's scheduled jobs, switched off until a human turns them on (FINDINGS CF-57, CF-58)
+
+Three workflows in the inbound layer's shape: a monthly run of every
+adapter over the pinned set in the container, its result and drafts
+pushed to the ledger branch by the App; a weekly release feed that reads
+registries on a read-only token, drafts an idea when a release title
+names a capability (the title quoted as data under the inbound preamble,
+the body matched and discarded) and dispatches a re-run when a release
+names a measured axis; and a daily post job that turns a draft a human
+marked approved into one labelled issue and writes the number back.
+Every write follows a kill-switch read with the App token in the same
+job; the job that runs competitor code holds no App token and writes
+nothing; the only push target is the ledger branch; each job has a
+budget row (model-free, zero cost) and the policy table names them.
+The post job needs a second variable that does not exist, so nothing can
+post; the labels do not exist either. A test file holds the workflows to
+those properties, the inbound workflow tests being the template.
+
+### Added - the competitive tier drafts its findings as issues, and posts none of them (FINDINGS CF-56)
+
+`benchmarks/competitive/findings.py` reads a recorded result file and
+the history and writes one draft per finding to a scratch directory, in
+the issue-template shape with a fingerprint line, `approved: false` and
+the `needs-human` label: a gap where a competitor is meaningfully ahead
+(with our median and spread, theirs, the band, the competitor's pinned
+release and image digest, the run file, and a first hypothesis from a
+fixed list chosen by rule, never a fix); a watch where we are ahead and
+the gap narrowed on two consecutive recorded runs; a standard proposal
+where a competitor beat a STANDARD.md Target on two runs, quoting the
+Target verbatim and proposing a Target in the same units, never a Floor,
+and saying in its first line that the standard is edited only by a
+human. Duplicates are ruled out by reading the tracker's `competitive-*`
+issues for the fingerprint: an open one is updated in place, a closed one
+is named, and a tracker that cannot be read refuses the whole run rather
+than risk a second issue. The module's only tracker verb is `issue list`,
+asserted by a test. The first run over three corpora drafts more than
+eighty gaps, and the ones worth reading first are those where a null
+baseline is ahead of us (CF-56); the release-feed drafts wait for the
+scheduled job.
+
+### Added - the competitive tier's trend tracking: the summary says how every gap moved, and whose release was beside it (FINDINGS CF-54, CF-55)
+
+A recorded run used to leave one line of medians in the history file
+and nothing read it back. `benchmarks/competitive/trend.py` now writes
+the line with the band and the gap per row and renders a *Movement*
+section at the end of every summary: per row, the delta on this run,
+the previous recorded run and the first, the movement judged against
+this run's band (`unchanged` inside it, `flipped` on a sign change,
+`widened` or `narrowed` on magnitude, `no band recorded` rather than a
+band invented for an older line), and the competitor's release on each
+of the three runs beside it, stated as a fact on the same line and
+never as a cause. A row where our own value moved past the band while
+their release did not is named our regression or our improvement, by
+the axis's direction. The self corpus's history key is normalised to
+`self` because its id carries the running commit, which made every self
+row a first run forever on the first render (CF-55). The summary also
+lists the tools-not-called rows and labels a variant adapter under its
+default; the jcm `counter` variant the design asks for has no producer
+yet and is recorded as open (CF-54).
+
+### Added - the competitive tier's corpus and task fairness checks, and the corpus set it needed to pass them (FINDINGS CF-46 to CF-48)
+
+A comparison over one language, one domain and small modular repositories
+flatters symbol search, so `benchmarks/competitive/corpus_check.py` now
+judges the SET of corpora before anything is scored, criterion by
+criterion, with every threshold read from `corpus_policy.json` and the
+verdict recorded in the result header; a failing set stops the run (exit
+5) instead of producing a table. The three corpora pinned by
+`benchmarks/tasks.json` plus this tree's own `src/` fail it on two
+criteria (the language count and one language's share), not the four the
+design predicted (CF-46), so `corpora.json` pins five more by full SHA
+(a utility library, an HTTP client library, a TypeScript monorepo and two
+repositories over 10,000 files in different languages; one alone puts its
+language over the cap, which is why there are two) and `corpora.py`
+fetches them by SHA into a cache OUTSIDE the tree, because `benchmarks/`
+ships in the sdist. `task_check.py` refuses a malformed or unanswerable
+task and keeps a task only one side can answer out of every head-to-head
+table, symmetrically; after a run it names a tool that cited nothing on
+every P task of a corpus, the shape of an adapter silently not called.
+The tasks themselves: for three corpora a third party's rules
+(sverklo-bench, CC-BY-4.0, pinned by commit) reproduced by
+`tasks/from_sverklo.py`, each hand-verified definition line re-verified
+at our SHA so a moved line refuses the generator and the three tasks that
+do not exist at our SHAs are dropped with the reason (CF-48); for the
+other three, symbols chosen by one author with expected sets computed by
+the same rules, never typed. One author wrote every adapter and every
+task, which the design's independence rule forbids and one agent cannot
+meet; it is recorded, not softened (CF-47). `run.py` takes `--set`,
+`--only`, a `--tasks` directory, and `--corpus ID=PATH|DOMAIN`.
+The first run over the whole set found a harness defect: the sandbox's
+timeout killed the docker client and not the container, so a "timed
+out" container kept running beside the next one and the host's memory
+guard killed the runner, discarding everything measured (CF-49).
+Containers are named and killed on timeout now, with a test that leaks
+one against the pre-fix code, and a checkpoint of finished runs is
+written after every run.
+The recorded run of this PR covers the self corpus and the two corpora
+with third-party tasks; the whole set does not fit the design's
+four-hour budget on a workstation (one pass alone ran past two hours,
+CF-53), which sizes the scheduled job rather than trimming the set. The
+run found two things worth more than its rows: our own adapter answers
+the reference-finding category with the import-graph tool, and that
+tool's reply says which tool to use instead, so our row there is zero on
+every corpus until the adapter is corrected (CF-51, a loss recorded as
+one); and one competitor's image lacks the runtime its JavaScript
+language server needs, so its rows on that corpus are not comparable
+rather than lost (CF-52). Neither is fixed here: adapters change one per
+PR.
+
+### Added - the eighth competitor row, the embedding representative over MCP stdio with a local model (FINDINGS CF-43 to CF-45)
+
+The last adapter of the set is the one whose retrieval is a vector
+search over AST chunks with a sentence-embedding model run locally on
+the CPU (FIELD.md, set row 8; it replaces the home-made RAG baseline
+as the embedding representative). Installed with pip from a lockfile
+that pins the package with its documented local-model extra and every
+dependency by hash; the default model is downloaded once at image
+build into a cache the offline run reads. Its daemon, which its own
+client starts on first use and talks to over a Unix socket, does not
+trip the sandbox rule: it is spawned inside the container, listens on
+the container's tmpfs and dies with it, and every row pays its start
+inside the index time, which is the tool's own design.
+
+Two things shape the rows and are recorded rather than worked around:
+its search refreshes the index before every answer by default, which is
+most of each call's latency and is charged as an agent pays it; and an
+embedding model asked an identifier ranks by meaning, so the
+definition-lookup row measures a lexical question put to a semantic
+tool, which the fairness note names as the harness's choice of task,
+not the tool's failing. Its docs describe no references or dependents
+tool, so those rows are NOT COMPARABLE by scope, not zero. The probe
+ran over the pinned corpus (CF-32's rule). The rows and their caveats
+are FINDINGS CF-43 to CF-45 beside the result file.
+
+### Added - the seventh competitor row, a repo-map tool on the token axis only (FINDINGS CF-40 to CF-42)
+
+The map-shaped approach in the lane (FIELD.md, set row 6; the one a
+third-party review says beats us on cross-file awareness, and the one
+our own whitepaper calls complementary) is a measured row for the first
+time, on the only axis a map can be measured on: what the text it sends
+with every change request costs at the tool's default budget. It is not
+an answer to a question, so no F1 row exists for it and none is
+invented; the adapter answers token tasks only, passes the query
+nowhere because the tool takes none, and cites nothing. Installed with
+pip from a lockfile that pins the package and every dependency by hash,
+on the Python the package declares, with the tokenizer assets cached at
+image build so the offline run fetches nothing.
+
+Two of its behaviours shape the row and are recorded rather than worked
+around: its default budget is not the figure its docs give but a clamp
+on the model's context window, read from its own banner line; and its
+stdout carries a human-facing announce block ahead of the map, so the
+payload is the map after the tool's own preface and the block is kept
+aside. The probe ran over the pinned corpus, and its banner is what
+exposed CF-39. The rows and their caveats are FINDINGS CF-40 to CF-42
+beside the result file.
+
+### Fixed - the competitive self corpus carried this tree's bytecode, and every recorded row was measured over it (FINDINGS CF-39)
+
+The pinned self corpus is `src/` copied and git-inited, and the copy
+was a plain `copytree`: every `__pycache__` the host interpreter had
+left behind rode along and was committed, so the repository each tool
+was told to index held three compiled files for every source file. The
+shared file set the scorer uses was never touched (it is text files off
+`git ls-files`), so no F1 or token row read them; what did is every
+tool's own index step, which saw a repository three times the size it
+should have, and one tool's own banner printed the count. The copy now
+excludes bytecode by directory name and by suffix, the property is
+asserted over `git ls-files` of a built corpus, and the whole set was
+re-recorded on the corrected corpus; what moved per tool, and what did
+not, is CF-39 beside the two result files.
+
+### Added - the sixth competitor row, a pre-written-cards tool over MCP stdio on its deterministic path (FINDINGS CF-35 to CF-38)
+
+The structurally different approach in the lane (FIELD.md, set row 5) is
+a measured row, on the path its docs describe as needing no key and no
+network: the tree-sitter wiring graph and per-file cards its build writes
+to disk, served by its MCP server. Its npm package and every dependency
+are pinned by integrity hash in a lockfile the image installs with `npm
+ci`; the native grammar addons are built at image build; nothing is
+fetched at run. Its graph is written to a context directory outside the
+read-only corpus through the documented global option, with the two files
+it would otherwise write into the repo switched off by its documented
+flags. The LLM layer its headline claims are made for is not built (no
+key), and the fairness note records that as the first disadvantage.
+
+Two of its behaviours shape the rows and are recorded rather than worked
+around: its file-level import edges are unresolved on this corpus, so the
+documented file-dependents route answers with none and points, in its own
+text, at its regex search; the adapter follows that instruction only when
+the tool gives it, in a second container, and cites what the search lists.
+And every answer opens with a token-savings estimate addressed to the
+agent, which is part of what an agent receives and is charged like the
+rest; no row reads the estimate. The probe ran over the pinned corpus
+(the rule CF-32 set). The rows and their caveats are FINDINGS CF-35 to
+CF-38 beside the result file.
+
+### Added - the fifth competitor row, a knowledge-graph tool over MCP stdio with a one-tool default surface (FINDINGS CF-31 to CF-34)
+
+The lane's largest adoption (FIELD.md, set row 4) is a measured row. Its
+release bundle for linux-x64 is verified against the release's published
+checksums and installed the way its install script installs it, without
+running the script; nothing is compiled and nothing is fetched at run.
+The tool keeps its index inside the project root and the corpus mount is
+read-only, so each container indexes a copy on the sandbox's private
+tmpfs, a harness cost timed by nobody and a read path faster than the
+bind mount every other adapter reads through, which the fairness note
+records under advantages. Its documented sandboxed-environment setting
+and its documented off-switch for telemetry and the update check are set;
+its documented watcher-off flag is passed, because nothing changes under
+a measurement.
+
+Two things the probes found shape the adapter and are recorded rather
+than smoothed over: the tool's primary answer tool elides lines it sent
+earlier in a session, so a shared session would make a task's token
+count depend on the tasks before it, and every T task runs in its own
+session; and its file-dependents answer names eight files and a count,
+so its P4 recall is capped by its output shape and the citations are the
+eight it names, never the count. A probe over the full checkout rather
+than the pinned corpus produced a draft finding about the task set that
+the recorded run did not support; it is recorded as a method finding
+with the rule that closes it. The rows, their caveats and the schema
+weight of both surfaces are FINDINGS CF-31 to CF-34 beside the result
+file.
+
+### Added - the fourth competitor row, an LSP-backed tool over MCP stdio (FINDINGS CF-27 to CF-30)
+
+The alternative the field survey lists first (FIELD.md, set row 1) is
+a measured row. Its wheel, the language-server package it pins and
+every dependency are pinned by version and hash in a lockfile the image
+installs with `--require-hashes`; the language server is launched from
+the image through the tool's documented `ls_path` setting, so no `uvx`
+download happens at run time, and the Node runtime its Python wrapper fetches
+on first use is fetched once at build. The tool's global configuration is
+pinned in the tree: the template's values, with the dashboard and GUI log
+window off and per-project data pointed outside the read-only corpus
+mount.
+
+Two harness defects fell out of the first probes and both are fixed
+where the next tool inherits the fix: the wrapper's pinned Node-version
+variable makes it re-run its installer on every start (a download that
+killed the server under `--network none`), so the image unsets it for the
+run; and the MCP driver read a server's stderr only at exit, so a server
+that logs every tool result there filled the pipe mid-call and read as a
+hang. The driver drains stderr continuously now, and the two earlier MCP
+rows are re-measured with it in this PR's recorded run. The rows
+themselves and their caveats are FINDINGS CF-27 to CF-30 beside the
+result file (`results/2026-09-05-76e75398.json`): a per-call latency
+dominated by the Windows bind mount, a token row dominated by a pattern
+search that returns every match, and a second instance of a server
+reporting its framework's version rather than its own.
+
+### Added - the third competitor row, over MCP stdio (FINDINGS CF-23 to CF-26)
+
+The tool's own published token-reduction claim (FIELD.md) is now a
+measured row instead of a quoted one. The PyPI wheel
+and every one of its dependencies are pinned by version and hash in a
+lockfile the image installs with `--require-hashes`; the base install
+only, because the README makes embeddings, communities and Python
+call-resolution optional extras. The same `mcp_driver.py` that drove
+the second row drives this tool's `serve` command; the tool's default
+data dir is inside the repository, which the sandbox mounts read-only, so
+its documented `CRG_DATA_DIR` knob points it at the writable mount.
+
+The three-run rows of this configuration are FINDINGS CF-23 to CF-26
+beside the result file (`results/2026-09-05-95eb4a00.json`): an answer
+that is the tool's own at its documented default and not an adapter
+defect (CF-23), a token row that is not like-for-like (the tool returns no
+source bodies, so the agent's own reads are uncharged) and must carry
+that caveat wherever it is quoted (CF-24), a second witness for a candidate
+CF-20 already raised (CF-25), and a `serverInfo` field that reports the
+framework's version rather than the tool's, the defect our own server
+shipped until 1.108.292 (CF-26).
+
+### Added - the second competitor row, over MCP stdio (FINDINGS CF-19 to CF-22)
+
+`benchmarks/competitive/sandbox/mcp_driver.py` is a minimal MCP client
+that runs inside a competitor's container: initialize, `tools/list` (the
+schema weight every MCP server pays, counted in the shape the field's
+tool-definition benchmark uses), then each task's `tools/call`, every
+round trip timed. The tool is driven through it the way its own
+`mcpServers` entry drives it, from the release's portable archive
+verified against its published checksum (the PyPI wheel is a
+launcher that fetches the runtime on first run, a network step the sandbox
+forbids after build). The tool refuses a cache it does not own, so the
+sandbox gained one more mount, a uid-owned 0700 tmpfs, pinned in the test
+like every other flag; it refuses the corpus root as "too broad", so the
+adapter indexes each top-level directory as its message asks.
+
+The P4 ground truth is the union of textual and re-export-resolved
+importers now, computed from source by AST (FINDINGS CF-19), because a
+truth only one definition satisfies grades the tool holding the other
+definition down. The three-run rows of this configuration, and the
+`competitive-gap` candidates they raise for item 5, are FINDINGS CF-19 to
+CF-22 beside the result file (`results/2026-09-05-73fbd7cf.json`); the latency and cold-index rows of that run
+were unstable under the 10% rule and are not claimed. None is an issue
+until item 5 exists and the pinned corpora agree; none touches product
+source.
+
+### Added - the competitive tier's sandbox and its first competitor row (FINDINGS CF-12 to CF-18)
+
+Every measured tool, jCodeMunch included, now runs inside a container the
+tier builds from a pinned Dockerfile (base image by digest, the tool by
+release checksum) and runs with the network removed, a read-only root, no
+capabilities, an unprivileged user and memory and pid ceilings
+(`benchmarks/competitive/sandbox.py`; `tests/test_competitive_sandbox.py`
+pins every flag and that no host variable reaches the tool). jCodeMunch's
+own row moved into the same shape (`sandbox/jcodemunch.Dockerfile`, built
+from what a commit of the working tree would contain, with one worker file
+run identically on the host when there is no Docker), so the sandbox's
+cost is paid on every row and a result file says which sandbox, whether
+the tree was dirty and which scorer wrote it. The tool is driven per its
+README's agent policy (`investigate`, `search` then `show` on the top 3,
+`refs`, `importers`), with its default output as the payload and an
+uncharged `--json` twin for citations; its fairness note under
+`docs/competitive/fairness/` was written before its first number.
+
+The first three-run result with a competitor on the table is recorded
+in `docs/competitive/FINDINGS.md` (CF-12 to CF-18) beside the result file
+it came from. Those rows are one 277-file corpus, ten tasks and the
+loop's first week of methodology, not a product comparison, and each
+entry says what it is evidence of and what it is not. Review round 1
+corrected two places where the first draft favoured the home team (the
+shared file set, CF-5; the P4 ground truth, CF-18). A timed-out or failed competitor is a
+`not_runnable` row now, never partial means; the jcodemunch image is
+two-stage with dependencies pinned from `uv.lock`; a `show` miss is
+charged what the agent sees, like every other miss.
+
+### Added - the competitive tier: the null alternatives and jCodeMunch through one interface
+
+`benchmarks/competitive/` is the first piece of the competitive feedback
+loop (`docs/competitive/FIELD.md`, `DESIGN.md`): one adapter interface that
+jCodeMunch, read-all and grep-top-3 all implement, a runner that puts every
+row through the same corpus, the same tasks and the same tokenizer three
+times, and a result file that carries the raw triple, the median, the
+spread, the band and whether a gap is meaningful. The point of shipping the
+nulls first is that every later competitor row is measured against a
+table that already shows what "no tool" costs on the same line. No competitor is
+measured yet; nothing here reads a README, and a result file has no field
+a self-reported figure could be typed into.
+
+The first three-run result on the self corpus caught the scoring rule
+mis-stated in DESIGN s5.1: the band was built from three times the larger
+of the two spreads and THEN each row was judged stable against it, so an
+unstable competitor triple (50, 100, 300) widened its own band to 750 and
+read as stable. Stability is judged first now, against the row's own
+median, and an unstable row is never a meaningful gap in either direction.
+The reviewer then found two more places the first draft leaned our way
+without saying so: our own adapter indexed with context providers OFF
+while its header said "shipped defaults" (they ship ON; the adapter runs
+them now), and F1 matched cited lines to expected lines many-to-many, so a
+tool that cites every matching line, which grep does by construction, was
+paid once per citation for a single hit. Matching is one-to-one now and the
+read-all row scores a real precision (expected over corpus lines) instead
+of a floor typed as 0.0.
+`tests/test_competitive_tier.py` pins that pair, the F1 tolerance rule, the
+grep baseline's ranking and whole-file reads (ARCHAEOLOGY R24-R26), and the
+end-to-end result file.
+
+### Added - the inbound layer: headless triage of issues and PRs, off by default
+
+`docs/inbound/` (AUDIT, POLICY, DESIGN, FINDINGS, VERIFICATION) and the
+jobs under `.github/workflows/inbound-*.yml` let Claude Code, running from
+GitHub Actions, label and draft responses to inbound issues, evaluate
+Dependabot PRs, and attempt a fix on an issue a maintainer labels
+`agent-fix`, so the human's role narrows to reviewing PRs. One repository
+variable, `INBOUND_ENABLED`, is the switch, and only the exact string
+`true` turns anything on; every job with no model reads it before its
+first step and again before its first write, and a job that runs the
+model or PR code starts only from that read. Nothing headless merges, tags,
+publishes, closes, deletes, edits another account's text, or touches the
+standard, the thresholds, ARCHAEOLOGY, the workflows, or `.claude/`;
+`tests/test_inbound_workflows.py` asserts the structural half over every
+workflow file and the self-check enforces the never-touch list on every
+agent-authored PR. The App that writes on the jobs' behalf holds Contents,
+Issues and Pull requests, plus Variables read, and no job that runs a model
+holds any write scope. Details, per job, in `docs/inbound/DESIGN.md`.
+
+The first live run (2026-09-05) found two defects before anything ran.
+The switch was read with `GITHUB_TOKEN`, which cannot read a repository
+variable at all (`403 Resource not accessible by integration`; no
+`permissions:` scope covers variables), and the reader hid the 403 as
+"absent", so every job declined while reporting the switch off; the
+`vars` context is no substitute, measured as a queue-time snapshot (`true`
+two minutes after the flip to `false`). The switch is read with the App
+token now, the only token that can, in the jobs that hold no model; the
+reader prints its error; depeval and bench-full gained a gate job so a
+model or PR-code job is never first. And the daily budget counted the run
+that was asking, so a job allowed one run a day always declined itself.
+VERIFICATION section 7.
+
+The second live run, the same day, found the rest of that budget defect
+and one of the setup's: a run that had declined at its gate still spent
+the day's one slot, so the fixed sweep was declined for the broken one
+(the budget now reads each run's steps and counts only a run in which
+something beyond the gate ran); and the ruleset written to confine
+the App applied its update rule to `main` too, so every human merge needed
+an admin bypass and auto-merge could not fire. `main` is out of the ruleset
+and under branch protection; the App never merging is by construction.
+FINDINGS IN-17, IN-19. The third run got through every step of the sweep
+and failed on the last line, writing its summary into a directory that
+only a declined run had ever created; the directory is created first now.
+
+### Changed - the sdist no longer carries `.github/`
+
+Workflows, the Dependabot config and, from this release, the inbound
+layer's headless prompts and helper scripts under `.github/inbound/` are
+repository plumbing; nothing an installed package reads. `.github/` joins
+`.claude/` in `[tool.hatch.build.targets.sdist] exclude`, asserted by
+`tests/test_inbound_plumbing.py` (docs/inbound/FINDINGS.md IN-10). Wheels
+were never affected.
+
+### Fixed - the test suite rewrote the developer's real `~/.claude/settings.json` (workflows W-34)
+
+Five `run_init(yes=True, no_backup=True)` tests in `tests/test_init.py`
+never redirected `_settings_json_path`, so every full-tier run executed
+`install_enforcement_hooks` against the real Claude Code settings file, and
+`_converge_rule` rewrote all six jcodemunch hook commands to whatever
+`shutil.which("jcodemunch-mcp")` resolved to in that run. Inside a git
+worktree that is the worktree's own `.venv`; the workflows-layer probe
+deleted the worktree minutes later and the next session start failed with
+`No such file` on every product hook. `no_backup=True` is why the June
+`settings.json.bak` sat beside a September `settings.json`, and why the
+finding was first blamed on `uv sync`. On CI the runner has no settings
+file, so the write created one and nothing failed; on a developer box it
+silently repointed hooks. This is Practice 8 (#437) in a new costume: that
+guard is written against `load_config` by name and never saw this path.
+The fix is one layer down, not at the five call sites: an autouse fixture
+in `tests/conftest.py` redirects the four home-derived `cli.init` path
+helpers to a per-test directory, and a tripwire fails the test that changes
+the real `settings.json` or `CLAUDE.md` by any other route. The
+reproduction (`tests/test_init_home_isolation.py`) reruns the offending
+tests in a subprocess whose home it owns and asserts a sentinel settings
+file is byte-identical; against the pre-fix conftest it is rewritten.
+
+### Fixed - the index-cache TTL tests keep a real clock out of the loop (harness F-22)
+
+`tests/test_v1_108_172.py`'s four TTL tests slept wall-clock time against
+TTLs of 0.1 to 0.3 s, so `test_active_use_keeps_an_entry_alive` had a 0.2 s
+margin between "touched every 0.1 s" and "idle past 0.3 s". On the PR gate's
+`windows-latest, 3.13` job for #593, a docs-only change, one gap under xdist
+ran past it and a hot entry read as evicted: `1 failed, 9329 passed`, seven
+sibling jobs green, and the re-run green. That is the shape of every timing
+flake, and the first one the gate has produced. The cache reads
+`time.monotonic()` through its module's `time` name, so the tests now inject
+a clock they advance by hand: 54 simulated seconds against a 10 s TTL with a
+touch every 9, then 10.5 idle to prove it still evicts. No sleeps remain in
+the TTL section. The non-vacuity pass still holds: deleting the refresh-on-hit line in
+`_cache_get` turns the test red.
+
+### Added - `scripts/surface_diff.py --descriptions`: a reworded tool description is a surface change the script can now see
+
+The stage-5 surface gate compared tool NAMES between the base ref and the
+working tree and nothing else (`docs/workflows/FINDINGS.md` W-1), so the one
+class of surface change that moves a byte-pinned prefix and the
+`core_compact` ceiling -- a description edit -- passed it as `no surface
+change`. `--descriptions` diffs each tool's description from the same
+`_build_tools_list()` call that already lists the names (one subprocess per
+tree, no second worktree), prints `description changed: <name>` per tool,
+and appends a `## done: tool descriptions` block under `--summary`. It is
+LISTED, never a failure: the exit code still belongs to the name rule alone,
+so `dod_checklist.py` and `surface_guard.py`, which parse the old stdout,
+read it unchanged. `tests/test_surface_diff.py` exercises `verdict()` and
+the description diff on synthetic inputs with a red arm for each and no
+subprocess. No `src/` change.
+
+## [1.108.317] - 2026-09-04 - CI runs the harness on every change; publishing is a dispatched workflow
+
+### Changed - CI runs the harness on every change; publishing is a dispatched workflow
+
+The eight workflows are five: `pr-gate.yml` (five staged jobs, every one a
+required check on `main` by name), `main.yml` (full witness + online bench
+after a merge, a `regression` issue per failing Floor, a weekly results PR),
+`nightly.yml` (the matrix with fresh corpora, `drift` issues),
+`security.yml` (CodeQL) and `release.yml` (dispatch with a version: pre-flight,
+build once, Test PyPI, clean-venv smoke on both OSes, tag, PyPI via trusted
+publishing, post-publish smoke with the tool count recomputed, GitHub release
+from the CHANGELOG block, MCP registry; `dry_run` defaults true). `test.yml`,
+`replay.yml`, `harness.yml`, `handshake.yml` and `sign-release.yml` are
+retired into those. Two new Floors: `types.error_max` (pyright ratchet) and
+`deps.vuln_max` (pip-audit, zero; `click` bumped for PYSEC-2026-2132), plus a
+platform-scoped `suite.full_seconds_ci_windows`. `enforce_admins` and
+`strict` are on; the emergency path is `docs/cicd/RUNBOOK.md` §6.
+`SECURITY.md` gains a reporting policy. Design, audit, findings and the
+verification of every probe: `docs/cicd/`.
+
+### Fixed - tied `search_symbols` scores ranked by the order the disk was walked
+
+The bounded ranking heap broke equal scores by encounter order, which is
+`os.walk` order: directory order on NTFS, hash order on ext4. gin's "context
+bind" has five candidates at exactly 10.202, so which three a caller got
+depended on the filesystem, and the same pinned corpora gave the token
+benchmark 24,044 tokens on Windows and 23,440 on CI (harness F-13). Ties now
+rank by symbol id, byte order, on every platform; nothing else in the ranking
+moved. `tests/test_search_symbols_tie_order.py` reverses the index order and
+expects the same answer, and it is red against the old key.
+
+⚠ The investigation found two more contributors, each documented rather than
+papered over. A CRLF checkout serves `
+
+` inside every fetched symbol
+(+603 tokens on the same pins), so `benchmarks/REPRODUCING.md` now says clone
+LF. And `_meta.total_tokens_saved` is read from `~/.code-index/_savings.json`
+in HOME regardless of `CODE_INDEX_PATH`, so the published count carries the
+width of the measuring box's lifetime ledger (+1 search / +3 fetch tokens per
+query on a nine-digit ledger) and every benchmark run grows it; that one is
+open as harness F-17 because fixing it is a basis change.
+
+### Changed - the token benchmark's reference is captured on CI
+
+`benchmark.yml` dispatched with `reference=true` runs `--reference` on the
+ubuntu runner and uploads `jcm_reference.json`, `results.md` and
+`provenance/measured.json`; those are committed, so the number the weekly
+gate compares against was measured where the gate runs. Re-measured
+2026-09-03 on the same pins: **96.5% / 28.3x** against grep-top-3 (664,975
+-> 23,467), 99.6% / 241.1x against read-all, per-query 7.6x to 81.2x
+(median 26.1x). The six prose mirrors are re-synced.
+
+## [1.108.316] - 2026-09-02 - A display preference edited the data it was displaying
+
+### Fixed - the result cache handed out the object it was holding (#572, #570)
+
+Reported by @rknighton, twice: #570 for the crash and #572 for the cause, with a
+standard-library reproduction that builds its own repo and needs no fixtures.
+`cache_put` stored the caller's dict and `cache_get` returned that same dict, so
+the dispatcher's metadata step — a DISPLAY preference — reached into the session
+cache and changed what every later caller was served. `_isolate` in
+`storage/token_tracker.py` now clones every container on the way in and on the
+way out.
+
+⚠⚠ **The crash was the loud case and the quiet ones needed no unusual config.**
+`meta_fields: []` is the shipped default, so out of the box the second call to
+`find_references` or `get_blast_radius` came back `KeyError: '_meta'`. But
+`suppress_meta` is a per-CALL argument: on a machine with ordinary
+`meta_fields`, one call passing it emptied the shared entry, and the next caller
+— who had asked for metadata — was served the damage. Measured pre-fix on that
+sequence: an empty `_meta`. A partial `meta_fields` does the same by
+replacement.
+
+⚠⚠ **The window is the MISS path, which is why a two-call reproduction shows
+the crash and shows neither quiet case.** Both cached tools already rebuild
+`_meta` from `dict(cached)` on a hit, so a repeat call survives; it is the call
+that FILLS the cache that returns the stored object to a dispatcher that then
+edits it.
+
+⚠⚠ **Fixed in the cache, not at the two call sites, and that is @rknighton's
+argument rather than ours.** `search_symbols` keeps its own cache and had
+already paid for this twice — #377 item 3 for `_meta.verdict`, then #404 (also
+@rknighton) for the rows — and neither fix reached the shared cache. A third
+per-consumer patch clears both tools today and leaves the trap armed for the
+tool written next. Standing lesson: **we fix the reported call site and leave
+the mechanism.**
+
+⚠ **Containers only, and the depth is unbounded on purpose.** Leaves in a tool
+result are JSON-serialisable immutables by the time they reach the cache, so
+cloning them buys nothing: measured on an 800 KB response, **4.15 ms
+container-only vs 16.58 ms `copy.deepcopy`** (0.42 vs 1.67 at 80 KB). A rule
+shaped to the containers the two current callers happen to use would be a guard
+written against a spelling.
+
+⚠ **The price is seven assertions.** `tests/test_result_cache.py` asserted
+`cache_get(...) is cache_put(...)` in seven places; they are `==` now. Identity
+was never a contract anyone wanted — it was the defect written down — and the
+values are untouched.
+
+⚠ #570's `cached.get("_meta", {})` guard is merged and kept. It covers one tool
+and cannot see either quiet case; on the non-vacuity pass it is why the
+`get_blast_radius` arm stays green while `find_references` goes red.
+
+### Added - the receipt's dollar figure states what it prices
+
+`savings_usd_basis` / `savings_usd_note` on `receipt --export json` and on
+`--rates`, plus a line on both human surfaces. Fourth instance of a family
+already fixed three times — `hit_rate_basis`, `schema_tokens_basis`,
+`basis: excess_calls` — and the rule holds: **a figure whose basis is unstated
+gets a wrong one supplied for free.**
+
+⚠⚠ **A LABEL, NEVER A SCALED NUMBER, and the arithmetic is unchanged.**
+Prompted by a competitor (Graft) converting claimed savings to a *blended
+session rate*. **That is the right correction for tokens CONSUMED and the wrong
+one for tokens AVOIDED.** Measured here across 25 transcripts: **98.6% of input
+is cache reads**, a **0.1166x** blended multiplier — dividing by it would cut
+the figure ~8.6x and would price an avoided token as though it sat in the cache
+being re-read. It was never written, so it is never read. `dollar_savings` is
+pinned at exactly `$5.00` per avoided MTok at Opus, because a number quietly
+scaled by 0.1166 would answer neither question and nothing on the wire would
+show it happened (the `analyze_perf` raw `hit_rate` rule).
+
+⚠ **The honest direction is that the figure is a FLOOR.** An avoided token would
+have cost once at the fresh-input or cache-write rate — the latter carries a
+premium — and again at the cache-read rate on every later turn it sat in the
+prefix. In a session that is 98.6% cache reads, that sum exceeds one list-price
+charge. Same inversion `tier_switch_cost.py` documents: the intuition flips once
+the block is cached.
+
+⚠⚠ **The code already knew and the shipped field did not.** A comment above
+`_MODEL_PRICES_USD_PER_MTOK` has explained this counterfactual since the table
+was written — one field over from what v1.108.312 fixed, where the benchmark
+artifact knew the basis and the response omitted it.
+
+⚠ Both surfaces, not just the JSON: a machine-readable field the CLI does not
+print leaves a human to supply the missing basis, and a human is exactly who
+does. `--rates` carries it too, since it exists so consumers price their own
+counts off one table and would otherwise reproduce the omission downstream.
+
+### Changed - trimmed `get_ranked_context`'s description to recover schema headroom
+
+Live `core_compact` measured **3,998 of a hard 4,000**: two tokens, so the next
+core-tier description edit would have breached the ceiling and done it in CI
+rather than locally. Now **3,972** — 26 tokens back.
+
+⚠⚠ **The tool trimmed was chosen for WHICH PREFIX IT MOVES, not for its size.**
+The three fattest core descriptions — `jcodemunch_guide` (118), `announce_model`
+(92), `set_tool_tier` (78) — are all in the six byte-pinned `counter` tools, and
+`counter` is the default surface for new installs. Trimming `jcodemunch_guide`
+was written first and `tests/test_counter_surface_stability.py` caught it at
+**-203 B**, which is the pin doing its job: a description reword is a full-rate
+cache write for every user on that surface. `get_ranked_context` (103 -> 77)
+buys the headroom while leaving the counter prefix byte-identical. One prefix
+moves; two was avoidable.
+
+⚠ What went: `"Truncates at token_budget."`, which restated *"packs greedily
+until token_budget is exhausted"* in the same paragraph; the algorithm names,
+which no caller chooses on (`sort_by`'s own description carries them); and the
+casing list, which the pinning rule implies. Purpose and Length still pass the
+`benchmarks/description_smells/` rubric.
+
+⚠ **Routing recall is unchanged, and that was measured rather than assumed** —
+`route@1 71.2 / @3 86.4` on the human corpus and `65.9 / 72.7` on the holdout,
+identical on the pre-trim tree. Descriptions are the router's input, so a trim
+is exactly the change that could have moved them.
+
+### Fixed - `holdout_results.json` published a recall it no longer measured
+
+Found while re-running the gated artifact after the trim above.
+`benchmarks/route_recall/holdout_results.json` reported **route@3 75.0** where
+the harness measures **72.7**, and carried `null` for `blind_floor_kset` and
+`route_vs_floor_pts` — fields the harness had since started emitting. Stale by
+2.3 points **in our own favour**, on the corpus that is frozen before the
+routing fixes and is therefore the honest one.
+
+⚠⚠ **Pre-existing, and proven so rather than assumed**: the pre-trim tree
+measures 72.7 as well, so the trim did not cause it and could not have. Without
+that check the drift would have been attributed to the description change and
+"fixed" by reverting something that was correct.
+
+⚠⚠ **Three artifacts, two ratchets.** `test_route_recall_artifacts_are_fresh.py`
+gated `results.json` and `emitted_task_results.json`; `holdout_results.json`
+comes out of the SAME harness under `--corpus holdout.json` and was covered by
+nothing, so re-running the two with tests is precisely how the third went stale.
+That file's own docstring already argued this case for `results.json` in
+August. It now has a third test, non-vacuity checked against the stale artifact.
+
+### Fixed - `search_symbols(kind="field")` was refused by both gates (#571, @devtomnl)
+
+`field` has been emitted by the Python parser since the dataclass-fields change
+and was in neither gate — **399 of them in this repo's own index**, every one
+unreachable through the `kind` filter. The runtime check
+(`kind_filter not in VALID_KINDS`) refused it, and so did the published enum.
+
+⚠⚠ **The wire enum was a SECOND COPY and had drifted from the set it was meant
+to mirror.** Nothing compared them, and each side looked internally consistent:
+a reader of either sees seven kinds and no reason to doubt it. `KIND_ORDER` is
+now the one authority, `VALID_KINDS` derives from it, and the schema publishes
+it — with `tests/test_kind_enum_is_derived.py` reading the AST, because a
+literal that happens to equal the tuple today passes any value check and drifts
+the moment a kind is added, which is the history being fixed.
+
+⚠ **`KIND_ORDER` is an ordered tuple and that is not cosmetic.** The enum sits
+in the cached prefix, and `frozenset` iteration over strings varies with
+per-process hash randomisation — publishing the set directly would serve a
+different schema on every server start for the same build. Append, never
+reorder: each existing position is bytes a client has already cached.
+
+⚠ Practice 9: `test_search_symbols_tool_schema` asserted the literal seven-kind
+roster, so it could only pass while the defect existed. Rewritten to the
+property — what the parser can emit is what the schema offers — not fixed back.
+
+⚠⚠ **Measured while landing this: live `core_compact` is 3,998 of a hard
+4,000.** Two tokens. The next core-tier description edit breaches the ceiling,
+and the failure arrives in CI rather than locally whenever the tokenizer
+download is unavailable.
+
+Found by @devtomnl in #571, which was closed on the ecosystem boundary
+(markdown section extraction is jdocmunch's half). The finding was right and is
+independent of that call.
+
+## [1.108.315] - 2026-09-01 - A fix for a false positive can install a false negative
+
+### Fixed - `find_dead_code` published "provably unreachable" over a corpus that could not support it (#566, #569)
+
+`confidence: 1.0` is documented as **provably unreachable**. That is a claim
+about the tree, and it was computed from the index with nothing in between.
+
+**Runtime-discovered packages (#569).** `encoding/schemas/` is enumerated by
+`pkgutil.iter_modules(__path__)` at import time, an edge no static graph can
+see, so twelve live encoders were published at 1.0. ⚠⚠ **Which three of the
+fifteen escaped depended only on whether a test happened to import the module
+directly** -- `search_symbols.py` and `search_text.py` have the same role, the
+same shape and the same load path, and one was called dead. The signal was
+test-authoring habit. `_runtime_discovery.py` resolves a package that
+enumerates ITSELF and revives its modules; `walk_packages` extends that to
+subpackages and `iter_modules` deliberately does not.
+
+⚠⚠ **The near-miss is a false NEGATIVE, and only the non-vacuity test saw it.**
+The first working draft asked whether `__path__` appeared anywhere in the call.
+`tests/test_v1_108_169.py` writes `pkgutil.iter_modules(schemas_pkg.__path__)`
+-- another package's search path -- so the test directory was read as
+self-enumerating and **502 files went live**, suppressing every real finding
+under `tests/`. Only an UNQUALIFIED `__path__`/`__file__`, or a local name bound
+to one, names the loader's own package. A fix for a false positive that installs
+a false negative is the worse trade.
+
+**Corpus adequacy (#566).** `install_layout.py` was reported dead at 1.0 with
+two live importers added in v1.108.313, against an index pinned at v1.108.303;
+and a `too_large` file is *withheld*, taking every import it made with it.
+⚠⚠ **`search_text` handled the identical situation correctly on the identical
+index in the same session** -- `absence_refused: true`, `complete: false`, and
+it named `coverage.generation.git_head`. `_corpus_adequacy.py` reads those same
+disclosures and caps the confidence at **0.6**, below the 0.8 default, so the
+default call refuses rather than asserting.
+
+⚠ **UNKNOWN caps; NOT APPLICABLE does not.** An `index_repo` snapshot has no
+local tree to compare against and is complete by construction, so it reports
+`no_source_root` and keeps its proof; a revision we should have been able to
+read and could not does cap. ⚠ A capped run returns FEWER findings, which read
+alone is the `dead_code_pct: 0.0` shape of #559 seen from the other side --
+hence `signal_warning`, the spelling `get_dead_code_v2` already uses, plus
+`uncapped_confidence` and `confidence_capped_by` on every clamped row. Both
+numbers, never just the survivor.
+
+⚠ Fixed at BOTH call sites, not the reported one: `get_dead_code_v2`'s signal 1
+is `unreachable_file` off the same graph, so the runtime roots apply there too.
+That only ever ADDS roots, so its effect on a published grade is one direction.
+
+⚠⚠ **A THIRD surface, and it is the destructive one.** `check_delete_safe`
+reaches `safe_to_delete` from a "no refs at all" fallback **regardless of
+dead-code confidence**, then floors the confidence at 0.85 — so capping
+`find_dead_code` alone left a delete certified over a corpus that could not
+support it, and the twelve encoders of #569 each graded safe at 0.85. It now
+consults the same authority and answers `corpus_inadequate`: a classified,
+non-terminal verdict whose `stop_rule` names re-indexing as the gap. ⚠ Only the
+ABSENCE verdicts are replaced — a found importer is positive evidence and a thin
+corpus cannot unfind it. ⚠ `assess_corpus` is imported at MODULE level there
+deliberately; a function-local import resolves through the source module's
+globals, so patching it would silently do nothing (the `cli/policy.py`
+monkeypatch trap, found by a test that patched the name and watched the verdict
+not move).
+
+⚠ `json_passthrough.py` survives the fix as the one likely TRUE positive in the
+original thirteen. It is reported, not deleted -- the deletion has not been
+proven safe and is not part of this change.
+
+### Fixed - `get_watch_status` reported watcher bookkeeping as index freshness (#565)
+
+`index_stale` was `state.reindexing or state.stale_since is not None` over
+`_RepoState` -- an in-memory, per-process container that only the watcher ever
+writes. A process that never watched anything has no state, so the field
+answered **False for every repo, forever**, and a repo nothing had ever looked
+at was indistinguishable from one measured fresh.
+
+Found on a box whose index was pinned eleven releases back while
+`get_watch_status` reported `any_stale: false` across all 33 repos. The truth
+on that machine: **1 stale, 2 unknown, 10 not_tracked, 20 fresh.**
+
+`index_freshness` now routes through `FreshnessProbe.repo_freshness`, which is
+the authority on this question and has been tri-state since v1.108.180 -- when
+the boolean `repo_is_stale` was replaced for exactly this reason. The watcher
+flag is kept as `watcher_flagged_stale`, which is what it always meant.
+
+⚠⚠ **`list_repos` inherited the defect verbatim** -- `"stale_index" if
+index_stale else "fresh"` -- so it published `fresh` for every repo on any box
+whose watcher had never run, including the ten that are not git-backed and can
+never be compared. Its vocabulary gained `unknown` and `not_tracked`, and its
+shape test now reads the mapping instead of restating a literal that was
+complete only while the field could not say "we did not establish it".
+
+⚠ Cost: the index side of the comparison is free (`indexed_at` and `git_head`
+ride on the discovery entry, via the new `discover_local_repo_entries`
+authority), so the whole addition is one `git rev-parse` per repo. Measured
+over 33 repos as the delta against `check_freshness=False`: **1.28 s cold,
+0.12 s warm**. The spread is OS and git caches, not variance. Both sit under
+the ~2.4 s already spent on discovery and lock inspection, so the check is on
+by default; `check_freshness=False` reports `unknown` rather than inventing
+`fresh`.
+
+⚠⚠ **Two old tests were the defect's witnesses.** `test_v1_108_81` asserted
+`any_stale is True` with nothing set but the watcher flag -- the defect stated
+as a requirement -- and `test_list_repos` enumerated a three-value vocabulary
+with no way to say unknown. Rewritten per Practice 9 rather than fixed back.
+Removing `discover_local_repos` from the module namespace broke three
+monkeypatch seams loudly, which is the right way for a contract change to
+arrive.
+
+### Fixed - #550 was fixed for one spelling of the defect and left standing for the other
+
+`from ..retrieval import embed_drift` is a dependency on `embed_drift.py`, the
+same way `from . import receipts` is a dependency on `receipts.py`. #550 fixed
+the second and guarded the fix on `set(specifier) == {"."}` -- BARE dots -- so
+the first kept resolving to the package's `__init__.py` and never to the module.
+The specifier is `..retrieval`; the module actually imported is named in
+`names`, and nothing looked there.
+
+Every argument in #550's own comment applies to the named form word for word.
+Only the spelling differs, and the guard was written against the spelling.
+
+Measured on this repo's `src/`: **21 synthesised edges that resolve, from 18
+importer files, reaching 12 modules** -- `evidence/producers.py`,
+`evidence/receipts.py`, `retrieval/embed_drift.py`, `storage/embedding_matrix.py`,
+`storage/token_tracker.py` and seven more. Every one of them answered
+`importer_count: 0` from `find_importers` while its importer sat at module scope
+in an indexed, live file, and `find_dead_code` published them at **confidence
+1.0**.
+
+⚠ The per-name edge is offered ALONGSIDE the package edge, never instead of it,
+which is what keeps the 26 `resolve_specifier` call sites on their single-target
+contract. `from ..pkg import x` is `x` the submodule OR `x` an attribute of
+`__init__.py`; the importing file cannot say which, so both are offered and the
+one with no file behind it resolves to None, which every consumer already skips.
+
+⚠⚠ **An old test went red and it was the defect's witness, not its guard.**
+`test_every_other_import_form_is_untouched` asserted `_specs(source) ==
+[".receipts"]` under the docstring "a dotted relative import already names its
+module and must not gain a second edge". That states the MECHANISM, and the
+premise is false -- `from ..parser.fqn import x` names the module `fqn` only
+when `x` is an attribute of it. Rewritten to assert the module edge SURVIVES
+rather than that it is alone, per Practice 9.
+
+⚠⚠ **The first repo-level guard written for this PASSED against the
+reintroduced defect, and the first count in the code comment was wrong by 6x.**
+Both had the same cause: they identified a synthesised edge by its SPELLING
+("the last segment appears in `names`"), which also matches the hand-written
+`from .tools.index_repo import index_repo` -- the convention where a module and
+its chief export share a name. This repo has **113** of those, already
+resolving, so the guard scored 134 and could not fail. **Compare against the
+import statements actually written in the file.** Found on the non-vacuity pass,
+which is the entire reason that pass is run against the broken tree.
+
+## [1.108.314] - 2026-09-01 - A rate written for a future date is wrong for every day before it
+
+### Added - the published `counter` surface is a cached prefix, and nothing pinned it
+
+`tools` is serialised ahead of system and messages, so every byte of the
+published tool list sits in the cached prefix -- **4,184 B across six tools**,
+measured. Changing any of it invalidates that prefix and every turn behind it,
+for every session on every install. `benchmarks/tier_switch/` priced that at 174
+requests to repay a `full`->`standard` narrowing. **A one-word edit to the
+`order` description is not a docs change; it re-bills a full-rate cache write to
+everyone**, and nothing in the suite would have said so.
+
+`tests/test_counter_surface_stability.py` pins six tools by name AND ORDER, each
+tool's `{name, description, inputSchema}` by sha, the total byte count, the
+`_COUNTER_FRONT_DOOR` / `_ALWAYS_PRESENT_TOOLS` membership, and independence
+from `tool_profile`.
+
+⚠⚠ **The property it exists for is the one arXiv:2608.22708 (CacheRouter) is
+built around -- the catalog can GROW without moving the prefix.** The Counter
+already had it (the counter branch is a whitelist, so a new tool cannot reach
+the surface); it had never been stated as a guarantee and nothing failed if it
+broke. That paper's own answer routes long-tail tools to a SUB-MODEL that
+selects, executes and returns results, which is lossy where ours is not, and its
+reported gains are against a NO-CACHE baseline under DeepSeek pricing (cache hit
+~1/30 of a miss, against Anthropic's 0.1x) -- so the headline does not transfer
+to a surface already measured at 86% cached (`benchmarks/codex_surface/`).
+
+⚠ Same blind spot as the schema-budget guardrail that "only walked
+`tool_profile`, which does not apply to the front door at all". The front door
+keeps being the part with no test under it.
+
+⚠ Per-tool hashes, not one blob: a blob says "something changed", a keyed dict
+NAMES the tool. ⚠ The byte-count assertion is redundant with the hashes BY
+DESIGN -- a hash says "different", a count says "bigger by how much", and only
+the second answers whether the edit was worth a cache write. ⚠ Description
+overrides are forced empty in the fixture; ambient config would make these
+hashes a property of the developer's machine (the #437 shape).
+
+⚠ Non-vacuity: five defects reintroduced individually into `server.py` --
+whitelist replaced by pass-through, one word reworded in `order`, list
+reordered, whitelist widened, surface made to depend on `tool_profile` -- and
+**5/5 were detected**; `server.py` restored byte-for-byte, verified with
+`git diff --quiet`. Only the name/order test catches a reorder, which is why it
+carries the ordering assertion alone.
+
+### Fixed - the receipt priced Sonnet at a rate that was never charged
+
+`_MODEL_PRICES_USD_PER_MTOK["sonnet"]` was `3.0` with the comment
+"Claude Sonnet 5 / 4.6". **Sonnet 5 has never been $3.** It launched at $2
+introductory input pricing with an increase to $3 SCHEDULED for 2026-09-01, and
+Anthropic cancelled that increase the day before it would have applied. The
+entry was written 2026-06-24, so it recorded a FUTURE price as the current one
+and was wrong for every one of the 69 days it stood. Now `2.0`, verified against
+platform.claude.com/docs/en/about-claude/pricing, which states the $2/$10 rate
+is standard and the increase "will not occur".
+
+⚠⚠ **A rate written for a future date is wrong for the whole interval before it,
+and nothing distinguishes it from a stale one** -- both read as a plausible
+number beside a plausible date, and the date makes the stale one look checked.
+The value is what expires; the comment beside it cannot say so.
+
+⚠⚠ **The pin agreed with the defect.** `tests/test_receipt.py` restated `3.0` in
+`_EXPECTED_RATES` and asserted `dollar_savings(1M, "sonnet") == 3.0`, so the
+suite was green against a rate the vendor never charged for the model named
+beside it. A pin is only as good as the re-read that produced it -- **re-read the
+source page when touching the table, never the other copy.**
+
+⚠ A THIRD pin was a DERIVED figure -- `test_includes_dollar_headline` asserted
+`"$0.09"` in the rendered ledger. It is invisible to a search for the rate's
+name and only surfaced when the suite ran, which is the argument for keeping the
+arithmetic in the comment beside it (now `$0.06`).
+
+⚠⚠ **Four copies of this rate exist across the suite and this fixes ONE.** Still
+wrong: `jmunch-mcp/src/jmunch_mcp/meta.py:28`, `jdocmunch-mcp/.../
+storage/token_tracker.py:28`, `jdatamunch-mcp/.../storage/token_tracker.py:25`
+-- all keyed bare `claude_sonnet` at `3.00`, two carrying the identical
+conflating comment. jmunch's is the one stamping `_meta.cost_avoided` on live
+tool responses. ⚠ **This repo's own `storage/token_tracker.py:152` is CORRECT
+and shows why**: its key is `claude_sonnet_4_6`, which names the exact model, so
+the $3 beside it is true. **A key that names a FAMILY inherits whichever
+member's price someone last looked at.** ⚠ Renaming the sibling keys is a WIRE
+change for `_meta.cost_avoided` consumers, so it is not a free rename.
+
+### Changed - the CLI and env tables leave the always-loaded budget
+
+`CLI Subcommands` (8,367 chars) and `Env Vars` (13,097) were 16.6% of CLAUDE.md's
+140,000-char session budget, and every row of both was loaded into every session.
+They are split along the axis the Key Files split used on 2026-08-29: **what is
+DERIVABLE leaves, what is NOT stays.** `jcodemunch-mcp --help` and
+`jcodemunch-mcp config` answer "what does this subcommand do" and "what is this
+variable's default" live, and `config.py` holds every default. Nothing answers
+"this is a RESPONSE limit, deliberately NOT `max_file_size`".
+
+69 rows moved to `CLI-AND-ENV.md`, 27 stayed. The rows themselves are -8,718
+chars; documenting the split in place cost 1,160 back. **Measured on the settled
+tree: 129,052 -> 121,580, headroom 10,948 -> 18,420.**
+
+⚠ Self-referential, and the first two figures written here were already wrong
+when written: **documenting the split inside the file being split changes the
+number the entry reports.** Quote the SETTLED tree, after the last edit.
+
+⚠⚠ **The ⚠ marker is a PROXY for load-bearing and it under-selects.** It found
+8 env rows and 1 CLI row. Reading the rest by hand found 18 more that state a
+prohibition, a constraint whose violation causes a defect, or a rationale with no
+marker on it -- `JCODEMUNCH_RUNTIME_REDACT` ("never on production traces"),
+`JCODEMUNCH_PERF_TELEMETRY` ("the ring is ALWAYS tracked; the env var only
+controls durable persistence"), `uninstall` ("preserves user-authored hook rules"),
+`hook-precompact` ("snapshot delivery is `hook-sessionstart`"). They are named in
+`CLI_RATIONALE` / `ENV_RATIONALE` in `tests/test_cli_env_split.py`, and **adding a
+name there to buy budget is the thing the split exists to stop.**
+
+⚠ `tests/test_cli_env_split.py` fails if a row lands in both files or in neither,
+if a warning-free row returns to the always-loaded half, or if either pointer
+goes missing. Its two roster tests close the "in neither" direction as far as it
+goes honestly: a hard roster is NOT available, because 37 `JCODEMUNCH_*` names
+and 12 `add_parser` names are deliberately absent from both tables. What is
+assertable is the other direction -- a documented row must still name something
+`src/` has, so a rename that orphans a row fails instead of rotting in a file no
+session loads. All six defects it names were reintroduced individually and each
+was detected.
+
+⚠ `CONFIGURATION.md` documents 18 of these variables in prose. That overlap
+predates this split, is disclosed in `CLI-AND-ENV.md`, and is not resolved by it.
+
+## [1.108.313] - 2026-08-31 - An install created before a default can never learn there is a choice
+
+### Added - a priced, opt-in offer to move an existing install onto today's default surface
+
+`tool_surface` is written into a config exactly once, by `_fresh_config_content`
+on a genuinely first-ever install, and is deliberately kept out of
+`generate_template` so `upgrade_config` can never back-inject it. That freeze is
+correct: it is what stops a package update silently collapsing a user's tool
+surface.
+
+⚠⚠ **It also means every seat created before the `counter` default shipped is on
+`full` permanently, with no path off it.** The design solved the risk by making
+the change unreachable rather than by making it *offered*, and nothing in eight
+release steps ever revisits it. Measured on this box: `full` publishes 91 tools
+and 26,943 schema tokens; `counter` publishes 6 and 1,050.
+
+`surface_offer.py` prints the comparison on the two status commands that already
+answer questions about the install -- `jcodemunch-mcp surface` and
+`install-status` -- and stops there.
+
+⚠⚠ **It is a MESSAGE, never a migration.** Nothing in the module writes config,
+it does not import `config` at all, and `upgrade_config` is untouched; the only
+thing that can move the key is a command the user types. An offer that could
+apply itself would reintroduce precisely the failure the freeze exists to
+prevent. `tests/test_surface_offer.py` asserts that over the module's AST rather
+than its text -- **a substring scan fires on the docstring that explains the
+freeze**, which is a ratchet failing against something other than the defect it
+names.
+
+⚠⚠ **Both sides are priced by `_build_tools_list`, via a new `surface_override`
+parameter parallel to `profile_override`.** Pricing `counter` by hand is the more
+tempting of the two errors, because that branch deliberately BYPASSES tier
+filtering and `disabled_tools` -- a hand-rolled count would apply them and
+under-report the surface a client actually receives. Same lesson as
+`_schema_tokens_for_profile`, which was wrong by three tools in every tier.
+
+⚠ **The number is computed per install, never shipped as a literal.** A seat with
+`disabled_tools` set, or on a narrower `tool_profile`, has a different pair, and a
+baked-in figure would be wrong for most of them.
+
+⚠ **The saving carries its basis and its switching cost.** It reuses
+`SCHEMA_TOKENS_BASIS` from 1.108.312 rather than reformatting the number for
+persuasion, and discloses that the switch republishes the block -- cache-written
+once at the next session start. That is the half trace-mcp's equivalent
+migration omits: it moves existing installs silently, on the "paid on every
+turn" reasoning `benchmarks/codex_surface/` measured as wrong.
+
+⚠ **Omit-when-clean, and doing nothing is a supported permanent answer.** The
+offer does not render when the install is already on the target, when the delta
+is non-positive (reachable: `disabled_tools` can trim the visible surface below
+the front door's own weight), or when silenced. New config key
+`surface_offer_seen` (bool, default false, shipped COMMENTED) exists so "no
+thanks" does not require accepting the offer to stop being asked; it never
+affects which tools are served.
+
+⚠ Deliberately NOT wired into `digest`: that is a per-repo stand-up briefing
+about repo state, and a global install-config row does not belong in it.
+
+**A second surface, because the first one only reached people already looking.**
+The status commands are found by users who were *already* thinking about their
+tool surface. The defect is that nobody revisits this -- so a remedy that fires
+only when you revisit it has the same shape as the problem.
+
+⚠⚠ **MCP stdio has no channel for prompting a user, and the ones that look
+available are all closed by design**: `_meta` is stripped by the default
+`meta_fields: []` (the .311 lesson), the `instructions` string is a 1,000-char
+budget aimed at the MODEL and is the only prose surviving tool deferral, and an
+unrequested notification is what `progress.py` holds no notify channel BY
+CONSTRUCTION to prevent. What remains is the log.
+
+So server start emits **one WARNING line, once per install**, latched by a
+marker at `<CODE_INDEX_PATH>/surface_offer_state.json`. WARNING because that is
+the default `log_level` -- at INFO nobody sees it, the `HeartbeatReporter`
+precedent exactly. One line, not a banner: this server has a handshake watchdog
+for stderr chatter.
+
+⚠ **The latch is NOT the user's config.** A server start must not write
+`config.jsonc` (Practice 8), and `surface_offer_seen` stays the user's key to
+set, never ours. It also lives outside `surface_offer.py`, whose no-write
+property is asserted over its AST.
+
+⚠ **A run with nothing to say does not consume the announcement** -- the marker
+is written only when a line was actually emitted. And an unwritable marker still
+announces: repeating an advisory line is recoverable, suppressing it forever is
+not.
+
+⚠ Placed above both transport dispatch branches, beside the embedding warm-up
+that carries the same rationale. `serve` has two branches and six `asyncio.run`
+sites; a per-transport call is how one of six silently misses, so a test asserts
+**exactly one call site** in the AST.
+
+⚠ Disclosed in `SECURITY.md` under "Background behavior, fully disclosed" before
+shipping -- a new persistent local write is precisely what the standing rule
+covers.
+
+⚠⚠ **The latch records WHO announced -- pid and transport -- and that was added
+because the first version could not answer it.** On the dev box the one
+announcement had already been consumed by a server start nobody observed
+(`configs/jcodemunch.toml` registers jcodemunch in Claude Desktop too, so it is
+not the only spawner), and the latch held only a timestamp, a surface and a
+version. **A once-per-install notice with no attribution cannot answer "did a
+human ever see this?"** -- a background server whose stderr nobody reads
+delivers it technically and not practically. ⚠ A test asserts the single call
+site passes a real transport rather than relying on the parameter default: a
+parameter that is present and does nothing is indistinguishable from the defect
+it was added to fix (#508).
+
+⚠ **It is also evidence about the channel itself.** The log was always the
+weakest of the three surfaces, and the first thing it did on a real box was
+deliver to nobody. `surface`, `install-status` and `get_session_stats` are doing
+the actual work.
+
+### Fixed - a process registry whose `version` could not answer its own question
+
+`get_session_stats.processes` listed each live server with a `version`. On a
+source install that string is the RECORDED metadata number, identical across
+every process no matter when it started -- so the one question an operator
+brings to a process registry, *is this old server running old code?*, was
+unanswerable from the row, while a field that looked like it answered sat right
+there. Third reader of the conflation above.
+
+`code_stale` answers it from what actually decides the matter: a process holds
+what it imported at startup, so a source file newer than `started_at` means that
+process is behind. ⚠ Tri-state -- `None` for a copied install (the tree's mtimes
+say nothing about what a copy loaded), an unparseable `started_at`, or an
+unreadable tree -- and OMITTED rather than guessed, because a `code_stale: false`
+we never measured reads as a clean bill of health.
+
+⚠ `version` stays. It is what `serverInfo` hands the host, so it answers a real
+question; it just was never this one.
+
+⚠ **Caught a live instance on the dev box immediately**: the session's own
+server, `version: 1.108.309`, `code_stale: true`.
+
+⚠ Gated on having a peer to judge -- the mtime walk is ~13 ms over 274 files,
+cheap but not free, and a lone process has nothing to compare against.
+
+**`install_layout.py` is the new authority, and the extraction is the point.**
+"Is this a source install?" had grown THREE readers with three answers. Rather
+than add a fourth, the rule moved to a stdlib-only LEAF that `cli/init.py` and
+`storage/process_registry.py` both import -- `storage` importing `cli` would be
+the wrong direction, the same cycle `cli/policy.py` was extracted to break.
+⚠ A test walks the package AST and fails if any other module re-derives
+`parent.parent.name == "src"`, **and is run against the reintroduced copy**: a
+ratchet that scans only a clean tree is indistinguishable from one that matches
+nothing.
+
+⚠⚠ **Caught by step 2c, not by the local suite, and the cause is Practice 8's
+family.** `_recorded_source_dir` reads the REAL installed distribution's
+`direct_url.json`, so a test that did not pin it inherited whatever this machine
+has installed. Under `PYTHONPATH=src` there is no jcodemunch distribution and it
+returned None, so every test passed; under `uv run --python 3.13` the project IS
+installed editable, it resolved to the real tree, and a fake copied-install
+fixture suddenly had something to compare against. **Green on one interpreter,
+red on another, for a reason neither run could show on its own.** The helper now
+pins the input for every test in the file, so none can forget.
+
+### Fixed - the source-drift verdict was wrong in BOTH directions
+
+`install-status` conflated two different properties under one word. `__version__`
+comes from `importlib.metadata`, frozen in `.dist-info` at install time; it is
+never read from the tree. So the check compared a metadata number against
+`pyproject.toml` and called the result CODE freshness.
+
+⚠⚠ **On an editable install it false-alarmed forever.** The module is imported
+straight from the tree, so a new process always loads current code -- yet the
+versions differ after every bump, so it reported `drifted: True` permanently,
+under a remedy (`pip install -e .`) that does not change which code runs.
+**Proven by touching a source file and re-running: the verdict does not move,
+because nothing in the function reads a source file or a timestamp.** A warning
+that is always on is one people scroll past, and this is the check written to
+stop a fourteen-release drift going unnoticed.
+
+⚠⚠ **On a copied install it was blind -- and that was the actual incident.**
+2026-08-29 happened on a regular copied distribution, which has no
+`pyproject.toml` above site-packages, so the function returned UNKNOWN. **It
+reported `True` exactly where code cannot go stale and `None` exactly where it
+does.** `tests/test_source_drift.py` asserted that UNKNOWN and passed.
+
+Now split: `drifted` is about CODE, and the new `metadata_stale` is about the
+recorded version. ⚠ The metadata half is a real finding, not cosmetic --
+`server = Server("jcodemunch-mcp", version=__version__)`, so a stale number is
+what `serverInfo` hands the MCP host. The editable reason names that, keeps the
+RESTART advice (a long-running server holds the code it loaded, which is the one
+way editable code goes stale) and drops only the reinstall claim.
+
+⚠ A copied install's tree is now recovered from `direct_url.json` (PEP 610),
+which records the directory a `pip install .` came from -- so the incident shape
+is detectable at last. A PyPI wheel has no local tree and stays UNKNOWN, because
+"newer than the tree" is not a question that exists for it.
+
+⚠ **The `src` component is required, not decoration**: depth alone is not a
+discriminator, since `<x>/site-packages/jcodemunch_mcp/__init__.py` is also three
+levels under `<x>`. The first fix called a copied install editable on any shallow
+layout, and its own new test caught it.
+
+⚠ **Practice 9 applies and the old test was rewritten, not fixed back.**
+`test_a_stale_install_is_reported` claimed to reproduce the 2026-08-29 state
+while building a SOURCE TREE fixture -- the file's own docstring says the
+incident was a copied install. It asserted `drifted is True` for the one
+configuration where code cannot lag, so it could only pass while the conflation
+existed. **The test stated the mechanism; the property is whether a version gap
+means a code gap here.**
+
+### Fixed - the disproven per-request framing, in a third place
+
+`CONFIGURATION.md`'s Counter section still read *"Every turn the host serializes
+each resident tool's schema into context; the front door shrinks that fixed
+per-turn cost."*
+
+⚠⚠ **That is the framing `benchmarks/codex_surface/` rules out**, and it is the
+same defect 1.108.311 and .312 fixed on the config surface and on the two
+schema-token surfaces. Fixing a producer does not fix the prose that describes
+it: the docs kept asserting a per-request cost for two releases after the number
+carrying that claim learned to state its basis. The section now says payload
+size, quotes the 86%-cached measurement, and names the order-of-magnitude
+overstatement a per-request reading produces.
+
+⚠ Fourth instance of the family (`hit_rate_basis`, `basis: excess_calls`,
+`schema_tokens_basis`, and now the prose): **a figure whose period or
+denominator is unstated gets a wrong one supplied for free** -- and a document
+is as capable of supplying it as a JSON field.
+
+
+## [1.108.312] - 2026-08-30 - A count with no time basis is read as per-request
+
+### Fixed - every published schema-token figure carries its basis
+
+`schema_tokens_avoided` shipped as a bare count, in `get_session_stats`'s
+`tool_surface` block and in `jcodemunch-mcp surface`. A count with no time
+basis gets one supplied by the reader, and the one a reader supplies is PER
+REQUEST.
+
+⚠⚠ **That is the exact framing `benchmarks/codex_surface/` rules out in our own
+words**, having measured **86% of baseline input cached** (1,938,176 of
+2,247,575): the tool-schema block is stable, so it is paid at full rate roughly
+once per cache lifetime and at cache-read rates (~0.1x) thereafter. The artifact
+also records that this repository used the "N tokens in every request" framing
+BEFORE measuring. **The artifact knew and the shipped field did not**, which is
+the same gap 1.108.311 closed one field over.
+
+`schema_tokens_basis` and `schema_tokens_basis_note` now travel with the counts,
+on the JSON surface and on the CLI — a person reading `surface` is exactly who
+supplies the wrong basis, so a machine-readable field the CLI did not print
+would have left the human surface carrying the defect.
+
+⚠ **The fix is a LABEL, never a scaled number.** A count quietly multiplied by
+the cache-read rate answers neither the payload question nor the cost question,
+and nothing on the wire would show it had happened. Same rule as `analyze_perf`'s
+raw `hit_rate`, kept beside `hit_rate_basis` rather than replaced. A test asserts
+the counts still equal the summed weights.
+
+⚠ Third instance of one shape, after `hit_rate_basis` and `basis: excess_calls`:
+**a figure whose denominator or period is not stated gets a wrong one supplied
+for free.**
+
+⚠ jdocmunch (`server.py:330`) and jdatamunch (`server.py:262`) ship the identical
+field, also unbased. Briefs written for both; not fixable from this repo.
+
+3 tests in `tests/test_tier_switch_cost.py` (20 total), each red against its own
+reintroduction: basis fields removed, count silently discounted, CLI stops
+printing it.
+
+
+## [1.108.311] - 2026-08-30 - The intuition inverts once the block is cached
+
+### Fixed - a narrowing that cannot repay its own cache invalidation is refused
+
+`set_tool_tier("standard")` and the shipped `model_tier_map` both offered a
+mid-session switch that costs more than it saves, for the whole life of any
+session anyone runs.
+
+`tools` is serialised **ahead of** system and messages, so changing the
+published tool list invalidates the cached prefix -- the schema block and every
+turn accumulated behind it -- and the new block must be cache-*written* before
+it reads cheaply again. Measured on the live catalog
+(`benchmarks/tier_switch/`, regenerable, artifact committed): `full -> standard`
+drops 9 of 91 tools and 1,810 schema tokens, so it pays a full-rate write of
+25,133 tokens to save 181 per request. **174 requests to break even with an
+empty history; 864 with 100k of it.** `full -> core` breaks even in **4**.
+
+⚠⚠ **The intuition inverts on exactly the case that applies.** Uncached, the
+same switch saves 1,810 tokens on every request at no one-time cost and pays
+back immediately. It is wrong only because the block is CACHED --
+`benchmarks/codex_surface/` measured 86% of baseline input cached. "Fewer
+tokens is better" holds right up until the block is stable, which is precisely
+when it stops holding. That is why a surface built to save tokens shipped a
+control that spends them.
+
+⚠ This extends the codex_surface finding rather than restating it. That one
+says `standard` is **not a lever** (6.7% of the payload). The new half is that
+as a TRANSITION it is not a weak lever but a negative one.
+
+⚠⚠ **A widening is never refused.** Escalating to a larger surface after a
+capability-gated failure buys a capability; trading a correct answer for a
+cheap one is the worse error. Only a narrowing is judged, because only a
+narrowing claims to save. `standard` also remains a fine startup
+`tool_profile` -- there is no switch to pay for at startup, and the refusal
+names that route.
+
+Three findings fell out of writing it, each its own defect:
+
+- **The first pricing helper filtered the raw catalog by the tier bundle and
+  was wrong by three tools in every tier** -- it kept the hidden Counter front
+  door and dropped the force-included tier controls, pricing a surface no
+  client receives. `_build_tools_list` takes a `profile_override` now, so the
+  price comes from the function `list_tools` uses instead of a second copy of
+  the visibility rules.
+- **The refusal's explanation was put in `_meta`, which `meta_fields: []` --
+  the DEFAULT -- strips.** Most users would have received a bare verdict with
+  the reason removed by a display preference nobody would connect to it. It is
+  `reason`, in the body. Caught by the test, not by review.
+- **The map ships TWICE** and the first ratchet read `DEFAULTS` alone, passing
+  while the config TEMPLATE still routed `claude-sonnet` and `gpt-4o` at
+  `standard`. The guard reads every shipped copy and names which one offends.
+
+`tests/test_tier_switch_cost.py` (17 tests). Four fail against the
+reintroduced gate defect and one against each restored map copy; every refusal
+assertion has a sibling asserting the switch still happens where it pays, so a
+gate that refused everything fails the file.
+
+## [1.108.310] - 2026-08-30 - A `#lang` line selects a reader, and a grammar cannot follow it
+
+### Fixed - `#lang rosette` is S-expressions
+
+Rosette's reader is `#lang s-exp syntax/module-reader rosette` -- the default
+reader -- and the built-in list did not have it, so a Rosette file was a
+document: no symbols, and (previous entry) no `require` edges once the regex
+stopped guessing. Found by measuring what the document tier loses; one real
+file. `rosette/safe` rides on the same entry.
+
+### Changed - `require` edges come from the reader; the second mini-reader is gone
+
+`imports.py` carried its own comment-stripper and form reader and found
+`(require` by regex -- a second Racket reader beside the parser's, and the
+weaker one. ⚠⚠ **Measured over 2,489 files against the reader-based
+extraction: 131 edges the regex produced and the reader does not, and none
+the other way.** Every one of the 131 is a `(require ...)` the file does not
+make: inside `#;` datum comments, inside `#'` macro templates, inside a
+quasiquoted `eval` payload, inside a here-string that writes a `main.rkt` for
+someone else. The reader knows which lists are code; the regex knew which
+bytes spelled `(require`.
+
+`extract_imports` takes `repo` now, threaded from the four indexing call
+sites, because the `#lang` tier decides the reader mode and a project's own
+at-exp lang (`racket_langs`) is invisible without it -- the walker already
+read those files that way; the import extractor read them as text and got
+its edges by the regex's luck. ⚠ **A document-tier file contributes no edges
+now, and that is a measured loss, stated:** across the distribution and one
+developer's projects, with conscript promoted and `pollen/mode` built in, the
+regex found 60 edges in 17 of 211 document files (`2d`, `scribble/lp`,
+`beeswax/template`, `rash`, `camp/page` ...). A reader we do not have cannot
+say where the Racket in a document is, and any of those langs can be declared
+in `racket_langs` to get its edges back. Deleted: `_racket_strip_comments`,
+`_racket_read_form`, `_RACKET_REQUIRE_RE`.
+
+### Fixed - `#lang pollen/mode racket/base` is Racket code, not a Pollen document
+
+`pollen/mode` is a meta-language: `make-at-readtable #:command-char #\◊` over
+its argument, hardcoded in pollen/mode.rkt -- `at-exp` with a lozenge. The
+`#lang` gate's prefix rule filed it under `pollen`, a document lang, so every
+`.rkt` written in it yielded no symbols and (see the next entry) contributed
+its `require` edges only by the regex's accident. It is a built-in at-exp
+wrapper now, with its command character beside `at-exp`'s `@`. ⚠ Measured
+against Racket's own reader on 7 real `#lang pollen/mode racket/base` files
+(5,977 nodes, 51 at-forms): none differ. `#lang pollen` -- the document -- is
+still a document. ⚠ `test_built_in_tiers` had pinned `pollen/mode` as `text`,
+the prefix rule's answer written down as the intended one.
+
+### Added - `racket_langs` may declare a lang's at-exp command character
+
+`{"mylang": {"tier": "at-exp", "command_char": "◊"}}` beside the string form.
+Racket's `make-at-readtable` takes `#:command-char` and Pollen's reader uses
+`◊`, so an at-exp-shaped lang is not always an `@` lang; with the character
+declared, `◊` dispatches and `@` is an ordinary symbol constituent again,
+which the test checks in both directions. `#lang at-exp X` is Racket's own
+at-exp reader and stays `@` whatever the config says. ⚠ ONE non-whitespace
+character; a malformed entry costs that entry, never the file, the same rule
+`racket_definition_forms` has. It rides in the existing config digest, so a
+changed character re-parses the index once like any other `racket_langs` edit.
+
+### Changed - `.rkt` is read by the Racket reader; the brace-blanking pass is gone
+
+`_parse_racket_symbols` reads through `racket_reader.py` now, with `@` as the
+command character when the `#lang` tier says `at-exp`, and tree-sitter is not
+consulted for Racket at all (`test_racket_language.py` fails if any path back
+to the grammar returns). The walker is unchanged: the reader produces the tree
+shape it already consumed. ⚠⚠ **The expander harness is byte-for-byte the
+committed run** -- 211 files, `extra` 0, `wrong_span` 0, `missing` 362, 89.7%
+-- which is the point of a behaviour-preserving swap and the reason the reader
+was measured against `read-syntax` on its own first. **On 208 `#lang conscript`
+files, with no blanking: 0 missing, 0 wrong spans.**
+
+Deleted: `_racket_blank_atexp_bodies`, the 1.108.303 pre-pass that overwrote
+every `{...}` body with spaces so the grammar would not see the `;` `"` `#` `|`
+inside. It could not see `@(define ...)` inside a body, or a `{` inside a
+string inside a body, or a `|{ ... }|` alternate delimiter; the reader reads
+bodies as Racket does, so none of those is a case any more.
+
+⚠ **A read error now costs the broken form, not the rest of the file.** The
+reader marks the form's span ERROR and resumes at the next column-0 form; the
+walker still skips ERROR. So a stray `)` at line 40 no longer loses every
+definition after it, and the WARNING names the file AND the line of the first
+error with a count. ⚠⚠ `test_definitions_after_a_stray_close_paren_are_missed_not_fabricated`
+pinned the loss as intended behaviour ("pinned so it is a decision rather than
+an accident") -- Practice 9, the defect written down as the spec -- and asserts
+the definitions are found now. An unterminated string inside a form leaves the
+form's INTERNAL define inside the ERROR rather than beside it, which is the
+fabrication tree-sitter's recovery produced (measured on a real `unit` body);
+and an EXTRA `)` folds the indented forms it leaked back into the ERROR.
+
+⚠⚠ **No `PARSER_GENERATION` bump.** The reader changes what unchanged `.rkt`
+bytes yield (at-exp bodies, error handling), and the incremental path never
+re-reads unchanged content -- so `racket_reader.READER_GENERATION` is stamped
+on every local index holding Racket files beside the config digest, under the
+same rule: absent means tree-sitter parsed it. A mismatch forces one full
+re-parse with its own reason, `racket_reader_changed`, and reaches exactly the
+indexes that hold `.rkt` files instead of every language for everybody -- the
+#556 argument, applied to the reader. ⚠ The shared parse cache key carries
+`INDEX_VERSION`, not `PARSER_GENERATION`, so without the generation in the key
+a `.rkt` parsed by tree-sitter last week would have been served after the swap;
+`:rr<generation>` is in the Racket key now, and a test bumps the constant and
+asserts the key moves.
+
+### Added - a Racket reader in Python, measured against Racket's reader
+
+`parser/racket_reader.py` reads Racket source -- the default reader of the
+Racket reference's "Reader" chapter, and the at-exp extension exactly as
+`scribble/reader` implements it -- into a tree shaped like tree-sitter-racket's,
+so the symbol walker can consume it unchanged. Nothing routes to it yet; that
+is the next entry. ⚠⚠ **It exists because a `#lang` line selects a READER, and
+a grammar cannot follow it.** 1.108.303 worked around that with a byte-blanking
+pre-pass over `{...}` bodies and an ERROR-skipping rule; both treated the
+symptoms of reading Racket with the wrong reader.
+
+⚠⚠ **Measured, not asserted: `benchmarks/racket_fidelity/run_reader_fidelity.py`
+compares the tree against `read-syntax` node for node.** `reader_oracle.rkt`
+reads each file with the reader its own `#lang` selects and emits every syntax
+object as (type, byte start, byte span); `only_racket`, `only_ours` and
+`our_only_error` gate at 0. On the whole `collects` tree plus every
+`#lang at-exp` file in the distribution -- 725 files, 761,009 nodes, 3,622
+at-forms -- all three are 0. On 152 conscript files with the lang promoted to
+at-exp: 53,269 nodes, 3,283 at-forms, 0, 0, 0. ⚠ What it does NOT compare is
+stated in the results file: strings inside an at-exp body (the form's span is
+compared; the walker never reads inside one), comments, `#hash`/`#s` contents
+(Racket does not position their keys), and the datum after `#reader <module>`,
+which is read by THAT module's reader.
+
+⚠ A differential against tree-sitter over 2,089 files agreed on all 1.8M nodes
+except where Racket sided with the reader: `#cs` is a case-fold switch, not a
+symbol; `#<< eos` (a terminator with a leading space) is a here string; `#\SPACE`
+is a character. ⚠⚠ Three of the harness's own defects were found by the harness
+before any of the reader's: the oracle spliced a dotted tail's syntax object
+into its parent (`(a . ,b)` showed a bare `,` symbol), it emitted a sized
+vector's repeated element three times (`#3(a)` fills by repetition -- the same
+object, `eq?`), and its `#lang` detection had the block-comment gap above.
+**An oracle is code too, and the first thing a new one measures is itself.**
+
+⚠ **Errors resynchronise instead of recovering.** tree-sitter re-parents on
+error, which is how a `unit` body's internal define became a module-level
+binding. The reader emits an ERROR node from the broken form to the next
+column-0 opener and reads on, so a missing `)` costs its own form and never the
+rest of the file (Racket rejects the whole file). ⚠⚠ An EXTRA `)` closes a form
+early and leaves its remaining internal definitions to be read as top-level
+forms -- exactly the fabrication tree-sitter's recovery produced -- so on an
+unexpected closer every indented top-level form read since the last column-0
+form is folded back into the ERROR. Unit-tested, because Racket has no opinion
+on what happens after an error.
+
+⚠ `@` is NEVER inferred from the text: in the default reader it is a symbol
+constituent and `(define @foo 1)` binds `@foo`. The at-exp mode is switched by
+the caller (the `#lang` tier), as `#lang at-exp` does; the command character is
+a parameter, because `make-at-readtable` takes one and Pollen uses `◊`.
+Performance: 17.3 MB of Racket in 1.71 s against tree-sitter's 0.61 s -- 2.8x
+slower and ~10 MB/s, far under the walker's own cost.
+
+Also: `tests/fixtures/racket/` gains `reader.rkt` (one instance of every
+default-reader form) and `atexp-syntax.rkt` (the Scribble documentation's own
+`@`-syntax examples, quoted so the file still expands), and a second frozen
+oracle, `racket_reader_oracle.json`, gates the reader in CI without Racket the
+way `racket_oracle.json` gates the extractor. ⚠ `test_racket_fidelity.py` listed
+its fixture names as a literal -- the `.303` Rust lesson, in the Racket test
+that taught it -- and reads them off disk now. ⚠ The frozen oracle is BYTE
+positions, so `.gitattributes` pins the fixtures to LF: a CRLF checkout moved
+every position after line 1 and failed all seven gate cases on Windows, the
+reader's first CI run, with diffs nothing explained. A dedicated test names
+the cause if the rule is ever lost.
+
+### Fixed - a `#| |#` block comment above `#lang` hid the lang from the gate
+
+`#lang` may follow "comment forms". The `#lang` gate (1.108.303) allowed `;`
+lines and `#!` shebangs before it but not a `#| |#` block. `openssl/mzssl.rkt`
+opens with a 900-byte block comment; its `#lang racket/base` was invisible, so
+the file read as a `#lang`-less module -- harmless there, because the default
+reader is what a `#lang`-less file gets anyway. ⚠ The other direction is not
+harmless: a Scribble or Pollen document behind a licence block would have been
+read as S-expressions, which is the fabrication class the gate exists to stop.
+One level of block comment; a regex cannot nest, and a nested block above a
+`#lang` line has not been seen. Found by the reader-fidelity harness (next
+entry), which compared 725 files against Racket's own reader and could not
+account for six nodes in one file.
+
+### Changed - CLAUDE.md's Key Files split along the derivable/not-derivable line
+
+Key Files was **61,593 chars, 44.4% of a 140,000-char session budget**, and the
+file sat at 139,531 with 469 characters of room. Maintenance Practice 5 had
+named it the next lever and said the answer was a split rather than another
+budget raise.
+
+The axis is the reusable part: **what is DERIVABLE leaves, what is not stays.**
+jcodemunch answers "what is this module" live, so the descriptive half moved to
+`KEY-FILES.md`, which no session loads. Nothing answers "this cache is
+evicted on every write, so it is not a cache", so every invariant stayed.
+**76 entries moved, 44 stayed; CLAUDE.md 138,719 -> 122,210 (87.3%).**
+
+⚠⚠ **The `⚠` marker is a proxy for load-bearing, and it over-cut by 15.**
+`producers.py`, `receipts.py`, `runtime/confidence.py` and twelve others state a
+prohibition, a constraint whose violation causes a defect, or a rationale with
+no marker on it. They are named in `RATIONALE_ENTRIES`, and adding a name there
+to buy budget is what the split exists to stop.
+
+⚠⚠ **`@path` imports were the obvious answer and they recover nothing** -- they
+expand at launch. Nested `CLAUDE.md` and `.claude/rules/` load on READ, and this
+project routes exploration through MCP tools, so the purpose-built mechanism
+would have loaded nothing here. Verified against the docs before choosing.
+
+⚠⚠ **The split target must be TRACKED, and `docs/` is not** -- `.gitignore:83`
+is `docs/*`. The first version wrote `docs/KEY-FILES.md`, which would have made
+76 entries machine-local: not in git, not in CI, gone on a fresh checkout. It
+surfaced only because `git status` did not list the new file. The map lives at
+the repo root and `ALLOWED_ROOT_FILES` names it.
+
+⚠ `tests/test_key_files_split.py` asserts every entry lives in exactly one file.
+Its first run caught its own defect: keying by BASENAME collapsed
+`runtime/redact.py` with `redact.py`, and `runtime/confidence.py` with
+`retrieval/confidence.py`, reporting a duplication that did not exist. **A name
+is not an identity** -- the Rust-fidelity lesson, inside the guard written to
+prevent drift.
+
+## [1.108.309] - 2026-08-29 - A mean hides the tail, and a default invents a comparison
+
+### Fixed - `analyze_perf` differenced latency against a baseline that never measured it
+
+`_diff_baseline` read `float(b.get("p50_ms", 0.0))`. **The only baseline that
+ships, `benchmarks/token_baselines/v1.108.163.json`, carries `tokens_saved` for
+its three tools and no latency keys at all**, so the zero stood in for a
+measurement nobody took and the subtraction was published as `p50_delta_ms` --
+a name asserting a comparison happened. Measured against that file: a tool at
+p95 900 ms reported `p95_delta_ms: 900.0`, read by any human as a 900 ms
+regression against a release that never timed it. `calls_delta` did the same.
+
+⚠⚠ **The test could not see it because its fixture was richer than the
+artifact.** `test_baseline_diff_with_synthetic_baseline` builds a baseline
+carrying `calls`, `p50_ms` and `p95_ms` -- keys the real file has for no tool --
+so the fabricated-delta path was structurally invisible to the test written
+about that exact code path. The replacement reads every baseline off disk.
+
+An absent measurement now yields `None` plus a `not_comparable` entry naming
+which side could not answer (`absent_in_baseline` / `absent_in_current` /
+`absent_in_both`), and `baseline_meta.tools_not_fully_comparable` carries the
+count so a caller reading only the header sees it. ⚠ Calls and tokens keep
+their meaningful zero on the CURRENT side -- a tool nobody called really did
+save nothing and really was called zero times. Latency has no such zero, and
+inventing one is the same defect from the other end.
+
+### Added - `heaviest_by_total_ms`: where the time actually went
+
+`slowest_by_p95` ranks how slow ONE call is, and it was the only ranking. Where
+the time went is `count x latency`, and the two orderings disagree whenever a
+fast tool is called often: a tool at p95 900 ms called 4,000 times consumes 100x
+one at p95 12,000 ms called three times, and the report put the second first.
+An external audit of 14,680 agent runs (Revenium, 2026-08) put 46% of spend in
+the top 1% of runs; a per-call ranking cannot see a distribution like that.
+
+`totals` carries the grand total and `measurable`; each row carries `total_ms`,
+`share`, `count`. ⚠⚠ A share over a zero total REFUSES rather than dividing,
+the same rule as the inflation concentration above.
+
+⚠⚠ **A ring-capped tool's share is a LOWER BOUND, and the cap bites hardest on
+the busiest tool** -- the one this ranking exists to surface. The in-memory ring
+holds 512 calls per tool, so capped tools are named in `totals.ring_capped_tools`
+and flagged per row.
+
+### Changed - one producer for the per-tool latency shape
+
+`token_tracker.latency_bucket` is now the only place that shape is built;
+`analyze_perf` held the second copy and the two agreed digit for digit, which is
+what makes a later divergence invisible. Its local `_percentile` is deleted
+rather than kept as a wrapper -- an unused copy is what regrows. The bucket
+gains `total_ms` and a measured `p95_is_max` flag: the percentile index
+collapses to the last element for every n <= 20, so two published fields carried
+one sample with nothing saying so. ⚠ The flag compares the computed values
+rather than the sample count, so it stays correct if the percentile changes.
+
+### Added - retrieval inflation reports where the excess sits, not just its mean
+
+`analyze_regret`'s `inflation` block gains a `concentration` sub-block:
+`top_need_share`, a `head_share` over the worst tenth of information needs
+(rounded up), and the `needs_with_excess` / `head_needs` counts those shares are
+computed against. Basis is `excess_calls`.
+
+⚠⚠ **`ratio` is a mean, and a mean cannot see the tail it is averaging.** An
+external audit of 14,680 agent runs (Revenium, 2026-08) measured the top 1% of
+runs carrying 46% of spend and the top 5% carrying 77%, with one unattended
+session at 4,819 calls over four days. That distribution reports a comfortable
+number here: one need burning 400 calls inside a corpus of 1,000 comes out at
+1.4x. `worst` already NAMED the offenders, so the data was never missing --
+what was missing is the statement that they hold the excess, which is the
+difference between "retrieval is a bit lossy everywhere" and "go look at this
+one query".
+
+⚠⚠ **The digest one-liner is where that mean reached a human**, so it carries
+the share now: two ledgers with an identical 1.4x -- one runaway query versus
+four ordinary ones -- used to render the same briefing.
+`test_the_digest_distinguishes_two_ledgers_the_ratio_cannot` is the record that
+they must not.
+
+⚠ The share is over `excess_calls`, never over calls: every need costs one call
+by definition, so a share over calls is diluted by the floor and the runaway
+query above reads 0.357 instead of 1.0.
+
+⚠⚠ **A concentration over zero excess is UNDEFINED, not diffuse.** `0.0` would
+read as "the waste is spread evenly" -- the strongest available claim assembled
+from there being no waste at all, the `dead_code_pct: 0.0` shape. It refuses
+with `no_excess_calls` instead, and `concentration` is absent from every shape
+that has no ratio.
+
+⚠ `head_needs` and `needs_with_excess` are disclosed beside the shares because
+the head is a tenth ROUNDED UP -- at the five-need floor it is one need of five,
+not one of ten, and "100% in the worst 10" means something different when only
+two needs were ever re-asked.
+
+## [1.108.308] - 2026-08-29 - Ownership and freshness are different properties
+
+### Added - `install-status` reports whether the running code matches its tree
+
+⚠⚠ **Measured 2026-08-29: this box ran 1.108.293 against a 1.108.307 tree --
+fourteen releases and six days.** We develop jcodemunch using jcodemunch, so
+every tool call in that window exercised six-day-old code. It happened because
+the package was installed as a regular (copied) distribution and **the release
+checklist's eight steps never touch the dev box**: the process is complete with
+respect to users and silent with respect to us.
+
+⚠⚠ **`verify_package_integrity()` cannot see this and is not meant to.** It asks
+whether the running module belongs to the OFFICIAL distribution -- a
+supply-chain question -- and would certify a fourteen-release-old official
+install without complaint. **Ownership and freshness are different properties**,
+and having a startup check that inspects the distribution made it feel covered.
+
+⚠⚠ **The subtler tell was not the version gap.** With the dogfood that stale,
+every fix that week was verified with `PYTHONPATH=src` rather than through the
+server -- **the verification path routed AROUND the product, and nobody decided
+that.** Each individual choice was right; the pattern was the finding.
+
+`source_drift` is tri-state and `drifted: None` means COULD NOT ESTABLISH --
+never `False`. Reporting "not drifted" for a comparison that was never made is
+precisely the defect this project keeps finding in its own instruments (.305's
+churn axis, .306's test axis, a dead-code refusal published as a zero). It is
+UNKNOWN under `PYTHONPATH=src`, which is how the suite and CI both run.
+
+⚠ Maintenance Practice 11 records the process half. All five suite packages are
+editable now, so tree-vs-install drift is no longer possible -- only the restart
+is, because a running server keeps serving what it loaded at startup.
+`scripts/repair-munch-installs.ps1` repairs an interpreter and refuses while any
+server is running.
+
+
+## [1.108.307] - 2026-08-29 - A phase boundary drawn at the wrong place
+
+### Fixed - tsconfig discovery walked Rust's build tree on every watcher event (#557, @Ticki84)
+
+⚠⚠ **`_TSCONFIG_SKIP_DIRS` was the FOURTH copy of a skip list in this tree, and
+the only one that derived from nothing.** `security._SKIP_DIRECTORY_NAMES` is the
+authority -- CLAUDE.md says so, and `SKIP_DIRECTORIES` and `SKIP_PATTERNS` already
+derive from it -- but this set was hand-maintained beside it and had never heard
+of Rust's `target`. So `_walk_tsconfigs` descended into a Tauri project's build
+directory on **every watcher event**.
+
+The reporter cloned the repo and instrumented his own long-running `watch-all`
+process: **13.58s of a 13.75s reindex, against 0.27s once `target` was
+excluded.** It fired even when the watcher reported `no indexable changes`, which
+rules out parsing and persistence.
+
+⚠⚠ **Adding `"target"` here was the reported fix and would have been the wrong
+one** -- "fix the call site, leave the mechanism", our own standing lesson. The
+set derives from the authority now, so every build-tree spelling it already knows
+(`target`, `_build`, `.gradle`, `DerivedData`, the eight dotted framework trees)
+arrived at once and the next one needs no edit here. ⚠ **UNION, never
+replacement:** `out` is deliberately absent from the authority (it names a real
+source directory for the INDEXING walk) but has been skipped for tsconfig
+discovery for this function's whole life, and removing a skip is the one
+direction this change must not take.
+
+⚠⚠ **Second half: `index_folder` evicted the alias-map cache UNCONDITIONALLY**,
+so every watcher-driven single-file re-index paid the discovery walk again.
+`_load_tsconfig_aliases` has a module-level cache whose entire purpose is to make
+that walk once. **A cache invalidated on every write is not a cache**, and it hid
+behind the walk's own cost rather than showing up as one. A targeted run knows
+which files it touched and now keeps the map unless one of them is a
+tsconfig/jsconfig; a full run cannot know and still evicts, unchanged.
+
+⚠⚠ **This corrects our own instrument, and that is the part worth keeping.** The
+v1.108.304 phase breakdown blamed `save=9.906s` and we believed it -- but `save`
+includes rebuilding the in-memory `CodeIndex` after the SQLite transaction, and
+that reconstruction is what triggered the walk. **A phase boundary drawn at the
+wrong place names the wrong subsystem confidently**, which is worse than no
+breakdown at all: it sent us hunting lock contention that was never there.
+
+⚠ Measured here on a synthetic Rust `target/` (9,200 entries): **0.617s -> 0.003s**,
+aliases intact. That is a lower bound, not his number -- his is the real one.
+
+
+## [1.108.306] - 2026-08-28 - A count taken after the page, and a field nobody read
+
+### Fixed - a count taken after the page was cut (#559, @lilubot)
+
+`get_untested_symbols` computed `untested_count = len(symbols)` **after** the
+`max_results` slice, and derived `reached_pct` from it. `get_repo_health` calls
+it with `max_results=1` under the comment *"we only need the count"*.
+
+⚠⚠ **So the published health/radar test axis read one untested symbol on every
+repository that had any, and scored ~100% reach.** Measured by the reporter:
+**4,893 untested of 6,352 non-test functions (23.0% reached), published as
+100** -- with the contradiction visible inside a single payload, since the same
+response carried `_meta.truncated`. The axis feeds `radar`, so it reached the
+grade and the observatory.
+
+The count and the rate are now measured over the corpus; the page length is
+reported under its own name, `returned_count`.
+
+⚠⚠ **The sweep for other instances found none, and that is the finding.**
+`find_importers`, `find_references` and `get_dead_code_v2` all count before
+slicing -- `find_references` carries a comment explaining why the two lists must
+stay separate. `tests/test_counts_survive_truncation.py` holds the property
+across all four: **a defect like this is invisible to any single call, because
+one call's number is self-consistent. Only two page sizes over the same repo
+can see it.**
+
+⚠⚠ **Three consumers were reading keys their producers have never emitted, and
+two of them are in one renderer.** `hook-taskcomplete` asked
+`get_untested_symbols` for `untested_symbols` and `assemble_task_context` asked
+for `untested`/`results`, where the response says `symbols` -- both fell through
+to `[]`, so the post-task untested diagnostic and the `audit` intent's untested
+stage **were dark for their whole lives**. The same renderer's orphan block read
+`name` and `line` off `find_dead_code` rows, which carry `symbol_id`/`file`/
+`kind`/`confidence`/`reason` and neither of those -- printing ``- `?`
+(src/a.py:0)`` for every orphan, a diagnostic naming nothing beside a line
+number that was always a lie rather than a miss.
+
+⚠⚠ **The test guarding the first one was the reason nobody noticed.** Its mock
+returned `{"untested_symbols": [...]}` -- **the invented key**. A fabricated
+producer makes an absent-key defect structurally invisible to a test written
+about that exact code path: the standing "a mock broad enough to satisfy an
+assertion can bypass what the assertion is about" lesson at its sharpest, since
+the mock did not paper over the check, it asserted a contract the producer does
+not have. `tests/test_taskcomplete_real_contract.py` mocks no producer at all.
+
+⚠ **And the first version of that unmocked test passed against the reintroduced
+defect.** It asserted `"session_sym" in message`, and the name appears in three
+sections, so `Unreferenced:` satisfied it while the untested block rendered
+nothing. It now asserts *within* the block each producer fills. **An assertion
+that does not name which producer put the string there proves nothing about that
+producer.**
+
+### Fixed - framework entry points, declared at index time and read by nobody (#561, #562, @lilubot)
+
+`detect_framework` runs during indexing and `profile_to_meta` persists the
+profile's `entry_point_patterns` into `context_metadata`. For Next.js that is
+exactly `src/app/**/route.ts`, `page.tsx`, `layout.tsx` and `middleware.ts`.
+
+⚠⚠ **A tree-wide search found that key written in one place and read in none.**
+Every consumer answered "is this file a root?" from
+`find_dead_code._ENTRY_POINT_FILENAMES`, which is `main.py`, `app.py`,
+`__main__.py` and eleven other Python names -- **no JS entry in it at all.** So
+on a Next.js repo:
+
+- `get_dead_code_v2` detected zero entry points, signal 1 fired on every symbol,
+  all three signals were ruled non-discriminating, and it returned
+  `dead_symbols: []`. The warning beside it advised passing
+  `entry_point_patterns` -- **asking the user to hand-type a list the index was
+  already carrying.**
+- the coupling axis counted route handlers as unstable modules. `Ca` is 0 by
+  construction (the framework invokes them over HTTP; nothing imports them), so
+  `I` is 1.0 with no code-health content. Measured on the reporting repo:
+  **203 of 366 unstable files were route handlers, 126 with zero importers.**
+
+`tools/_entry_points.py` is the read half of that write. The rule it applies to
+route handlers is the one `_count_unstable_modules` already applied to tests,
+whose comment says they have "Ca=0 by construction" and so "trivially meet the
+instability > 0.7 threshold".
+
+⚠⚠ **Excluded from the coupling denominator as well as the numerator, and that
+is the load-bearing half.** Numerator-only would shrink a count without
+shrinking what it is a fraction of -- a silent, self-flattering adjustment, the
+same sign error that took a tree from 84.0 B to 88.8 B against a truth of
+77.3 C in 1.108.305. An entry point with a real `Ce` problem is therefore not
+graded by this axis at all, so the excluded count and the profile name are
+disclosed on the response.
+
+⚠⚠ **The Flask and FastAPI profiles shipped `"*.py"` in their entry-point lists
+for their whole lives, and consuming it naively would have been far worse than
+the defect.** Under `fnmatch` a `*` crosses `/`, so the first reader would have
+declared **every Python file in a Flask repo a live root** -- switching
+dead-code detection off across a whole ecosystem, silently, and emptying those
+repos' coupling denominators. Harmless only while nothing read the field; the
+NestJS profile carries a comment saying exactly that. The catch-alls are removed
+at the source **and** refused by the reader, because a profile is a list of
+literals anyone can extend and the failure is invisible from the edit: adding
+`"*.ts"` looks like widening coverage and is actually turning a subsystem off.
+
+⚠ Only the DETECTED profile excludes. Widening to `_ENTRY_POINT_FILENAMES` would
+move the published coupling score of every Python repository we have graded,
+including the observatory's baselines, on a heuristic rather than a detection.
+That is a separate decision with its own before/after measurement.
+
+### Fixed - a manifest cannot be dead, and a refusal is not a zero (#562, @lilubot)
+
+JSON, YAML and TOML are indexed as source, and **nothing imports a lockfile by
+design** -- so `zero_importers` fired on every one and `find_dead_code` reported
+`pnpm-lock.yaml`, `tsconfig.json` and `package.json` as dead files. ⚠⚠ The last
+is the sharpest: `_package_json_entries` **reads** `package.json` to discover
+the repo's entry points, and the same run reported it dead. Excluded by NAME,
+never by extension -- an orphaned `data/fixtures.json` is a real finding and is
+still reported.
+
+⚠⚠ **`get_repo_health` turned v2's honest refusal into `dead_code_pct: 0.0` and
+a dead_code axis of 100** -- the strongest possible claim, built from an explicit
+admission that nothing was established. It now withholds the composite and the
+grade through 1.108.305's `unmeasurable_axes` mechanism rather than adding a
+second one. The number is still reported; `dead_code_measurable` and
+`dead_code_signal_warning` say what it is worth.
+
+### Verified - TypeScript type-only imports are indexed like value imports (#560, @lilubot)
+
+Not reproduced, and nothing changed. `import type { X } from`, inline
+`import { type X, value }`, the multi-line `import type { ... } from` form and
+the `export type { X } from` barrel all resolve, in both `find_references` and
+`find_importers`.
+
+⚠ `tests/test_ts_type_only_imports.py` exists because the claim previously
+rested on nothing: no test named the syntax, so removing the optional
+`type` group from `_JS_IMPORT_FROM`, or the `type` strip in `_clean_names`,
+would have left every suite green. Its deliberate negative -- a global
+`declare type` in a `.d.ts` used with no import, correctly invisible -- is the
+most likely explanation for an audit seeing a type reference it expected, since
+the documented scope is import sites rather than every textual usage.
+
 ## [1.108.305] - 2026-08-28 - Only the reader was never fixed
 
 ### Fixed - the release checklist's CI-environment reproduce never built it

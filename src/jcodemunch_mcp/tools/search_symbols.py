@@ -485,6 +485,11 @@ def _row_summary(sym: dict) -> str:
     return summary
 
 
+def _heap_tiebreak(symbol_id: str) -> bytes:
+    """Inverted id bytes: smaller id -> larger key, so a min-heap keeps it on a tie."""
+    return bytes(255 - b for b in symbol_id.encode("utf-8", "surrogatepass"))
+
+
 def search_symbols(
     repo: str,
     query: str,
@@ -853,7 +858,14 @@ def search_symbols(
         candidates = [index.symbols[i] for i in sorted(candidate_indices)]
     else:
         candidates = index.symbols
-    heap: list[tuple[float, int, dict]] = []  # (score, candidates_scored, entry)
+    # (score, tiebreak, entry). The tiebreak is the symbol id with its bytes
+    # INVERTED, so among equal scores the min-heap evicts the LARGER id and the
+    # top-K keeps the smallest ids regardless of encounter order. Before
+    # 2026-09-03 the second slot was the encounter counter, i.e. os.walk order,
+    # which is directory order on NTFS and hash order on ext4: the same corpus
+    # returned different tied symbols on Windows and on CI (harness F-13; gin
+    # "context bind" has five candidates at exactly 10.202).
+    heap: list[tuple[float, bytes, dict]] = []
     candidates_scored = 0
     max_bm25_score = 0.0
 
@@ -912,13 +924,14 @@ def search_symbols(
             entry["score_breakdown"] = _bm25_breakdown(sym, query_terms, idf, avgdl, raw_query=query)
 
         # Bounded heap: O(N log K) instead of O(N log N)
+        tiebreak = _heap_tiebreak(entry.get("id", ""))
         if len(heap) < effective_limit:
-            heapq.heappush(heap, (heap_score, candidates_scored, entry))
-        elif heap_score > heap[0][0]:
-            heapq.heapreplace(heap, (heap_score, candidates_scored, entry))
+            heapq.heappush(heap, (heap_score, tiebreak, entry))
+        elif (heap_score, tiebreak) > (heap[0][0], heap[0][1]):
+            heapq.heapreplace(heap, (heap_score, tiebreak, entry))
 
-    # Extract results sorted by score descending
-    _sorted_heap = sorted(heap, key=lambda x: x[0], reverse=True)
+    # Extract results sorted by score descending, ties by symbol id ascending
+    _sorted_heap = sorted(heap, key=lambda x: (-x[0], x[2].get("id", "")))
     scored_results = [entry for _, _, entry in _sorted_heap]
     # Real ranking scores (top-first) for confidence/ledger — kept separate from
     # the response entries so _meta.confidence grades on real gap/strength instead
@@ -1290,6 +1303,11 @@ def _search_symbols_semantic(
     embedded_ids = matrix.id_set if matrix is not None else set()
 
     missing = [s for s in index.symbols if s["id"] not in embedded_ids]
+    # CF-66: a failed top-up batch left its symbols scored lexically only, with
+    # the cause in the log and nothing in the response. Same loop as
+    # embed_repo's, same ledger; disclosed as the body field `semantic_topup`.
+    from ..embeddings.failures import FailureLedger
+    topup_failures = FailureLedger()
     if missing:
         new_emb: dict[str, list[float]] = {}
         for bi in range(0, len(missing), EMBED_BATCH_SIZE):
@@ -1303,6 +1321,7 @@ def _search_symbols_semantic(
                     new_emb[sym["id"]] = vecs[j]
             except Exception as exc:
                 _logger.warning("semantic: embedding batch %d failed: %s", bi // EMBED_BATCH_SIZE, exc)
+                topup_failures.record(exc, items=len(batch))
         if new_emb:
             if emb_store.get_dimension() is None:
                 dim = len(next(iter(new_emb.values())))
@@ -1489,6 +1508,19 @@ def _search_symbols_semantic(
         "results": scored_results,
         "_meta": meta,
     }
+    if topup_failures:
+        # The symbols in a failed batch were scored WITHOUT the semantic
+        # channel; say how many and why, or a hybrid answer that is lexical for
+        # part of the corpus reads like a full one. In the BODY, not `_meta`:
+        # `meta_fields: []` is the shipped default and the dispatcher deletes
+        # `_meta` under it (Standing lesson 08-30), so a disclosure there
+        # reaches only those who already opted in.
+        topup: dict = {
+            "symbols_unscored": topup_failures.items,
+            "batches_failed": topup_failures.batches,
+        }
+        topup_failures.disclose(topup)
+        result["semantic_topup"] = topup
     from ..retrieval.confidence import attach_confidence as _attach_confidence
     from ..retrieval.confidence import extract_ledger_features as _ledger_feats
     from ..retrieval.freshness import FreshnessProbe as _FreshnessProbe

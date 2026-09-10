@@ -45,6 +45,8 @@ EXCLUDED_DIRS = [
     ".claude",
     "vscode-extension/node_modules",
     "vscode-extension/out",
+    "docs/competitive",
+    "benchmarks/competitive",
 ]
 
 # Paths that must SURVIVE the build. Without these the test would pass on a
@@ -55,6 +57,7 @@ REQUIRED_PATHS = [
     "src/jcodemunch_mcp/server.py",
     "vscode-extension/package.json",
     "vscode-extension/src/extension.ts",
+    "benchmarks/tasks.json",
 ]
 
 
@@ -221,7 +224,9 @@ ALLOWED_ROOT_FILES = frozenset({
     "README.md", "CHANGELOG.md", "QUICKSTART.md", "USER_GUIDE.md",
     "ARCHITECTURE.md", "CAPABILITIES.md", "CLIENTS.md", "CONFIGURATION.md",
     "CONTEXT_PROVIDERS.md", "GROQ.md", "HEADLESS.md", "INSTALL_FROM_SOURCE.md",
-    "ISSUE-HISTORY.md", "LANGUAGE_SUPPORT.md", "RELEASE_RESTORE.md",
+    "CLI-AND-ENV.md",
+    "ISSUE-HISTORY.md", "KEY-FILES.md", "LANGUAGE_SUPPORT.md",
+    "RELEASE_RESTORE.md",
     "ROADMAP.md", "SCIP.md", "SPEC.md", "SPEC_MUNCH.md", "TOKEN_SAVINGS.md",
     "TROUBLESHOOTING.md", "TWEAKCC.md", "UNDER_THE_HOOD.md", "badge-kit.md",
     "jcodemunch_whitepaper.pdf",

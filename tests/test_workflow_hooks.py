@@ -1,0 +1,341 @@
+"""The workflow hooks refuse what they exist to refuse (docs/workflows/DESIGN.md section 4).
+
+Each hook is driven with a hook-JSON payload built in code and run as a
+subprocess, the way Claude Code runs it. The payloads never travel through a
+shell line, because the hooks are LIVE in this repo and a shell command that
+contains `gh pr create` would be blocked by the hook under test (FINDINGS
+W-8). Every case has a red arm: the same hook with the harmless input passes.
+Nothing here runs the harness; H1's fast-tier path is exercised in
+VERIFICATION.md, not in the suite (it would run pytest inside pytest).
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+HOOKS = ROOT / ".claude" / "hooks"
+
+
+def run_hook(name: str, payload: dict, cwd: Path = ROOT) -> tuple[int, str, str]:
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / name)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=cwd,
+        timeout=60,
+    )
+    return r.returncode, r.stdout, r.stderr
+
+
+def _working_tree_hooks(clone: Path) -> Path:
+    """The clone is of HEAD; the hooks under test are the WORKING TREE's (an uncommitted fix must be what runs)."""
+    dst = clone / ".claude" / "hooks"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(HOOKS, dst, ignore=shutil.ignore_patterns("__pycache__"))
+    return dst
+
+
+def bash(command: str) -> dict:
+    return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+
+def edit(path: Path) -> dict:
+    return {"tool_name": "Edit", "tool_input": {"file_path": str(path)}}
+
+
+@pytest.mark.parametrize(
+    "command,expect_block",
+    [
+        ("git " + "tag v9.9.9", True),
+        ("git " + "tag --list", False),
+        ("git push --force origin main", True),
+        ("git push origin feat/x", False),
+        ("gh " + "release create v9", True),
+        ("gh " + "workflow run release.yml -f version=1", True),
+        ("gh pr " + "merge 1", True),
+        ("gh pr view 1", False),
+        # W-40: posting is the session's; only the irreversible acts are refused
+        ("gh pr comment 1 --body x", False),
+        ("gh pr edit 1 --body-file x.md", False),
+        ("gh pr close 1", False),
+        ("gh issue comment 1 --body x", False),
+        ("gh issue close 1", False),
+        ("gh issue " + "delete 1", True),
+        ("gh api repos/x/y", False),
+        ("gh api -X PATCH repos/x/y/code-scanning/alerts/5 -f state=dismissed", False),
+        ("gh api --method POST repos/x/y/hooks/1/deliveries/2/attempts", False),
+        ("gh api --method PUT repos/x/y/pulls/7/" + "merge", True),
+        ("gh api -X POST repos/x/y/" + "releases -f tag_name=v1", True),
+        ("gh api --method POST repos/x/y/actions/workflows/release.yml/" + "dispatches", True),
+        ("gh api -X POST repos/x/y/git/refs -f ref=refs/" + "tags/v1", True),
+        ("gh api --method DELETE repos/x/y/issues/comments/1", True),
+        ("uvx --from " + "twine twine upload dist/*", True),
+        ('"C:\\Users\\j\\mcp-' + 'publisher.exe" publish', True),
+        # W-41: a GraphQL mutation reaches the same irreversible acts with no
+        # --method on the line, and `gh repo delete` was in neither list.
+        ("gh api graphql -f query='mutation { " + "mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { " + "deleteIssue(input: {issueId: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { " + "deleteRef(input: {refId: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { createRef(input: {name: \"refs/" + "tags/v1\", oid: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { createRef(input: {name: \"refs/heads/feat\", oid: \"x\"}) { clientMutationId } }'", False),
+        ("gh api graphql -f query='query { repository(owner: \"x\", name: \"y\") { id } }'", False),
+        ("gh api graphql -f query='mutation { addComment(input: {subjectId: \"x\", body: \"hi\"}) { clientMutationId } }'", False),
+        ("gh api graphql -f query='mutation { " + "enablePullRequestAutoMerge(input: {pullRequestId: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { " + "deleteDiscussion(input: {id: \"x\"}) { clientMutationId } }'", True),
+        ("gh api graphql -f query='mutation { " + "deleteProjectV2(input: {projectId: \"x\"}) { clientMutationId } }'", True),
+        # flags between `api` and `graphql` (review round 1: adjacency was a spelling)
+        ("gh api -H 'Accept: application/vnd.github+json' graphql -f query='mutation { " + "mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'", True),
+        ("gh repo " + "delete x/y --yes", True),
+        ("gh repo view x/y", False),
+    ],
+)
+def test_deny_guard_refuses_exactly_the_forbidden_verbs(command, expect_block):
+    rc, _, err = run_hook("deny_guard.py", bash(command))
+    assert (rc == 2) is expect_block, (command, rc, err)
+    if expect_block:
+        assert "deny_guard: refused" in err and "cmd.exe" in err
+
+
+def test_pre_pr_refuses_without_a_stamp_and_passes_unrelated_commands(
+    tmp_path, monkeypatch
+):
+    """H4 keys on the tree id (D5): no stamp, wrong tree, failed run, or an unmet row each refuse."""
+    rc, _, _ = run_hook("pre_pr.py", bash("git status"))
+    assert rc == 0
+    # Drive the hook against a scratch clone so the real .claude/state is untouched.
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(ROOT), str(clone)], check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "-b", "feat/probe"], cwd=clone, check=True)
+    hooks = _working_tree_hooks(clone)
+    state = clone / ".claude" / "state"
+    evidence = state / "evidence"
+    evidence.mkdir(parents=True)
+    create = bash('GITHUB_TOKEN="" gh pr ' + "create --title x")
+
+    def run():
+        r = subprocess.run(
+            [sys.executable, str(hooks / "pre_pr.py")],
+            input=json.dumps(create),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=clone,
+        )
+        return r.returncode, r.stderr
+
+    rc, err = run()
+    assert rc == 2 and "no full-tier stamp" in err
+    tree = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, r'%s'); import _common; print(_common.tree_id())"
+            % hooks,
+        ],
+        capture_output=True,
+        text=True,
+        cwd=clone,
+    ).stdout.strip()
+    (state / "full-tier.json").write_text(
+        json.dumps({"tree": "not-this-tree", "ok": True, "date": "x"}), encoding="utf-8"
+    )
+    rc, err = run()
+    assert rc == 2 and "DIFFERENT tree" in err
+    (state / "full-tier.json").write_text(
+        json.dumps({"tree": tree, "ok": False, "date": "x"}), encoding="utf-8"
+    )
+    rc, err = run()
+    assert rc == 2 and "FAILED" in err
+    (state / "full-tier.json").write_text(
+        json.dumps({"tree": tree, "ok": True, "date": "x"}), encoding="utf-8"
+    )
+    # W-42 remedy (3): the fast summary is read directly, ahead of the checklist,
+    # because a checklist generated before a killed pre_commit can still read 12/12.
+    rc, err = run()
+    assert rc == 2 and "no fast-tier verdict" in err and "killed" not in err
+    (evidence / "fast.md").write_text(
+        "## harness fast: NOT RUN\n\npre_commit started x.\n\nHARNESS FAIL\n", encoding="utf-8"
+    )
+    rc, err = run()
+    assert rc == 2 and "killed before it wrote one" in err
+    (evidence / "fast.md").write_text("## harness fast: FAIL\n\nHARNESS FAIL\n", encoding="utf-8")
+    rc, err = run()
+    assert rc == 2 and "fast tier on this box FAILED" in err
+    (evidence / "fast.md").write_text("## harness fast: PASS\n\nHARNESS PASS\n", encoding="utf-8")
+    rc, err = run()
+    assert rc == 2 and "checklist" in err
+    (evidence / "checklist.md").write_text("| 1 | x | unmet | y |\n", encoding="utf-8")
+    rc, err = run()
+    assert rc == 2 and "unmet" in err
+    (evidence / "checklist.md").write_text("| 1 | x | met | y |\n", encoding="utf-8")
+    rc, err = run()
+    assert rc == 0, err
+    # Rename the probe branch to `main` (a checkout of the real main would drop the hooks on a branch that predates them).
+    subprocess.run(["git", "branch", "-M", "main"], cwd=clone, check=True)
+    rc, err = run()
+    assert rc == 2 and "main" in err
+
+
+def test_test_edit_guard_blocks_a_skip_on_a_load_bearing_test(tmp_path):
+    """H2: a skip mark on a LOAD-BEARING file with no retired.json change blocks; a src/ edit is ignored; the red arm is the same file unweakened."""
+    rc, _, _ = run_hook("test_edit_guard.py", edit(ROOT / "src" / "x.py"))
+    assert rc == 0
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(ROOT), str(clone)], check=True
+    )
+    hooks = _working_tree_hooks(clone)
+    target = clone / "tests" / "test_result_cache.py"
+    original = target.read_text(encoding="utf-8")
+    payload = edit(target)
+
+    def run():
+        r = subprocess.run(
+            [sys.executable, str(hooks / "test_edit_guard.py")],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=clone,
+        )
+        return r.returncode, r.stdout, r.stderr
+
+    rc, out, err = run()
+    assert rc == 0 and not out, "unweakened file must pass silently"
+    target.write_text(
+        "import pytest\npytestmark = pytest.mark.skip(reason='probe')\n" + original,
+        encoding="utf-8",
+    )
+    rc, out, err = run()
+    assert rc == 2 and "LOAD-BEARING" in err and "retired.json" in err, err
+    (clone / "harness" / "retired.json").write_text(
+        (clone / "harness" / "retired.json").read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    rc, out, err = run()
+    assert rc == 0 and "skip/xfail" in out, (
+        "with the ledger touched it warns instead of blocking"
+    )
+
+
+def test_surface_guard_is_silent_when_the_surface_did_not_move():
+    """H3 on an untouched server.py: no surface change, no output. (A moved surface is exercised in VERIFICATION.md.)"""
+    rc, out, err = run_hook(
+        "surface_guard.py", edit(ROOT / "src" / "jcodemunch_mcp" / "server.py")
+    )
+    assert rc == 0, err
+    assert "differs" not in out, out
+
+
+def test_hooks_follow_the_session_cwd_into_a_worktree(tmp_path):
+    """W-30: the MAIN checkout's hook, told the session is in another checkout, reads THAT checkout's state."""
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--no-hardlinks", str(ROOT), str(clone)], check=True
+    )
+    subprocess.run(["git", "checkout", "-q", "-b", "feat/wt"], cwd=clone, check=True)
+    _working_tree_hooks(clone)
+    # The main checkout may carry a valid stamp; the clone has none.
+    payload = bash('GITHUB_TOKEN="" gh pr ' + "create --title x")
+    payload["cwd"] = str(clone)
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / "pre_pr.py")],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=clone,
+    )
+    assert r.returncode == 2 and "no full-tier stamp" in r.stderr, r.stderr
+    # Red arm: with the clone's stamp present and matching, the same hook passes on the clone's checklist.
+    state = clone / ".claude" / "state"
+    (state / "evidence").mkdir(parents=True)
+    tree = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.path.insert(0, r'%s'); import _common; print(_common.tree_id())"
+            % (clone / ".claude" / "hooks"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=clone,
+    ).stdout.strip()
+    (state / "full-tier.json").write_text(
+        json.dumps({"tree": tree, "ok": True, "date": "x"}), encoding="utf-8"
+    )
+    (state / "evidence" / "checklist.md").write_text(
+        "| 1 | x | met | y |\n", encoding="utf-8"
+    )
+    # W-42: pre_pr reads the fast summary too, in the same rebound state dir.
+    (state / "evidence" / "fast.md").write_text(
+        "## harness fast: PASS\n\nHARNESS PASS\n", encoding="utf-8"
+    )
+    r = subprocess.run(
+        [sys.executable, str(HOOKS / "pre_pr.py")],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=clone,
+    )
+    assert r.returncode == 0, r.stderr
+
+
+def test_h1_runs_the_tier_when_claude_md_is_staged_and_stays_free_for_other_docs():
+    """W-39: CLAUDE.md's size is a Floor (`claude_md.max_chars`), so a commit staging it is not a
+    free docs commit; every other docs-only commit still is. The predicate is tested directly
+    because driving the hook would run the whole fast tier."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pre_commit_under_test", HOOKS / "pre_commit.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(HOOKS))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(HOOKS))
+    assert mod.tier_needed(["CLAUDE.md"]) is True
+    assert mod.tier_needed(["docs/competitive/VERIFICATION.md", "CLAUDE.md"]) is True
+    assert mod.tier_needed(["src/jcodemunch_mcp/server.py"]) is True
+    assert mod.tier_needed(["docs/cicd/RUNBOOK.md", "README.md", "CHANGELOG.md"]) is False
+    assert mod.tier_needed([]) is False
+    # the trigger is the file the Floor reads, not every root-level markdown file
+    assert "CLAUDE.md" in mod.TIER_TRIGGERS and "README.md" not in mod.TIER_TRIGGERS
+
+
+def test_h1_triggers_on_every_file_the_harness_reads_for_a_floor():
+    """W-39, the property rather than the spelling: every path literal harness/__main__.py reads
+    from the tree for a Floor (`REPO / "a" / "b"`) is covered by the hook's trigger list, so a
+    commit that regenerates a frozen artifact alone cannot be a free commit with a moved Floor."""
+    import importlib.util
+    import re
+
+    spec = importlib.util.spec_from_file_location("pre_commit_under_test2", HOOKS / "pre_commit.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(HOOKS))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(HOOKS))
+    src = (ROOT / "harness" / "__main__.py").read_text(encoding="utf-8")
+    chains = re.findall(r'REPO((?:\s*/\s*"[^"]+")+)', src)
+    paths = sorted({"/".join(re.findall(r'"([^"]+)"', c)) for c in chains})
+    read_from_tree = [p for p in paths if p not in ("src",)]
+    assert read_from_tree, "the harness reads nothing from the tree? the regex no longer matches"
+    assert any(p == "CLAUDE.md" for p in read_from_tree)
+    # a literal may name a directory (`benchmarks/route_recall`); a file under it must trigger
+    uncovered = [p for p in read_from_tree if not (mod.tier_needed([p]) or mod.tier_needed([p + "/x"]))]
+    assert not uncovered, f"a Floor input the hook does not trigger on: {uncovered}"

@@ -292,9 +292,38 @@ def _extract_python_imports(content: str) -> list[dict]:
         # seen. `from . import a` followed by `from . import b` in one file
         # otherwise loses `b` entirely -- the dedup keys on the specifier, and
         # every bare-dot import in a file shares the same one.
-        if names and set(specifier) == {"."}:
+        #
+        # ⚠⚠ The guard was `set(specifier) == {"."}`, i.e. BARE dots only, so
+        # #550 was fixed for `from . import x` and left standing for
+        # `from ..retrieval import embed_drift` -- the same dependency on a
+        # sibling module, written with the package named. Every reason above
+        # applies to it word for word; only the spelling differs. Measured over
+        # this repo's `src/`: 21 SYNTHESISED edges that resolve, from 18
+        # importer files, reaching 12 modules -- `evidence/producers.py`,
+        # `evidence/receipts.py`, `retrieval/embed_drift.py`,
+        # `storage/embedding_matrix.py`, `storage/token_tracker.py` and seven
+        # more, every one of which `find_importers` reported as having zero
+        # importers while its importer sat at module scope in an indexed, live
+        # file (#566).
+        #
+        # ⚠⚠ The first count written here was 134, and it was wrong the way a
+        # measurement is usually wrong: it counted every edge matching the
+        # SHAPE rather than the ones this change creates. `from .tools.index_repo
+        # import index_repo` -- the convention where a module and its chief
+        # export share a name -- is hand-written, already resolved, and looks
+        # identical to a synthesised edge unless the raw source is consulted.
+        # 113 of the 134 were that. **Compare against the import statements
+        # actually written in the file, never against the specifier's spelling.**
+        #
+        # ⚠ A bare-dot specifier already ends in the separator (`.` + `x` is
+        # `.x`); a named one needs it (`..retrieval` + `embed_drift` is
+        # `..retrieval.embed_drift`). Absolute specifiers take the same path --
+        # `from pkg.storage import matrix` yields `pkg.storage.matrix`, which
+        # the module-path branch of `resolve_specifier` resolves.
+        if names:
+            _prefix = specifier if set(specifier) == {"."} else f"{specifier}."
             for _name in names:
-                _sub = f"{specifier}{_name}"
+                _sub = f"{_prefix}{_name}"
                 if _sub not in seen:
                     seen.add(_sub)
                     edges.append({"specifier": _sub, "names": [_name]})
@@ -712,98 +741,10 @@ def _extract_svelte_imports(content: str) -> list[dict]:
 
 #: `\b` after `require` also matched `(require-syntax ...)` (`-` is a word
 #: boundary), which is a different form; the lookahead demands a delimiter.
-_RACKET_REQUIRE_RE = re.compile(r"\(\s*require(?=[\s()\[\]])")
-
 #: Wrappers that carry the real module path deeper inside.
 _RACKET_REQUIRE_UNWRAP = frozenset({
     "for-syntax", "for-template", "for-label", "for-meta", "combine-in",
 })
-
-
-def _racket_strip_comments(text: str) -> str:
-    """Blank out `;` line comments and `#| |#` blocks, preserving offsets.
-
-    String literals are stepped over so a `;` inside one is not treated as a
-    comment. Offsets are preserved so the caller's paren matching stays valid.
-    """
-    out = list(text)
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == '"':
-            i += 1
-            while i < n and text[i] != '"':
-                if text[i] == "\\":
-                    i += 1
-                i += 1
-            i += 1
-        elif ch == ";":
-            while i < n and text[i] != "\n":
-                out[i] = " "
-                i += 1
-        elif ch == "#" and i + 1 < n and text[i + 1] == "|":
-            depth = 1
-            out[i] = out[i + 1] = " "
-            i += 2
-            while i < n and depth:
-                if text.startswith("|#", i):
-                    depth -= 1
-                    out[i] = out[i + 1] = " "
-                    i += 2
-                elif text.startswith("#|", i):
-                    depth += 1
-                    out[i] = out[i + 1] = " "
-                    i += 2
-                else:
-                    if text[i] != "\n":
-                        out[i] = " "
-                    i += 1
-        else:
-            i += 1
-    return "".join(out)
-
-
-def _racket_read_form(text: str, start: int):
-    """Read one balanced form beginning at `text[start]`; return (node, end).
-
-    `node` is a str for an atom or quoted string, or a list for a form.
-    Returns (None, start + 1) when the character starts nothing readable.
-    """
-    n = len(text)
-    i = start
-    while i < n and text[i].isspace():
-        i += 1
-    if i >= n:
-        return None, n
-    ch = text[i]
-    if ch in "([":
-        close = ")" if ch == "(" else "]"
-        items = []
-        i += 1
-        while i < n:
-            while i < n and text[i].isspace():
-                i += 1
-            if i >= n:
-                break
-            if text[i] in ")]":
-                i += 1
-                break
-            item, i = _racket_read_form(text, i)
-            if item is not None:
-                items.append(item)
-        del close
-        return items, i
-    if ch == '"':
-        j = i + 1
-        while j < n and text[j] != '"':
-            if text[j] == "\\":
-                j += 1
-            j += 1
-        return text[i:j + 1], min(j + 1, n)
-    j = i
-    while j < n and not text[j].isspace() and text[j] not in "()[]":
-        j += 1
-    return text[i:j], j
 
 
 def _racket_atom_specifier(node: str) -> Optional[str]:
@@ -882,29 +823,70 @@ def _racket_edges(node) -> list[tuple[str, list[str]]]:
     return []
 
 
-def _extract_racket_imports(content: str) -> list[dict]:
-    """Extract Racket `(require ...)` edges.
+#: Node types under which a `(require ...)` is DATA, not a require of this
+#: file: quoted and syntax-quoted forms (macro templates, `eval` payloads),
+#: comments (`#;` above all), and a span the reader could not read.
+_RACKET_NOT_CODE = frozenset({
+    "quote", "quasiquote", "syntax", "quasisyntax",
+    "comment", "block_comment", "sexp_comment", "ERROR",
+})
+
+
+def _racket_datum(node):
+    """The nested-list-of-strings view `_racket_edges` consumes: atoms are
+    their source text (a string path keeps its quotes), lists are lists."""
+    if node.type == "list":
+        return [_racket_datum(c) for c in node.children
+                if c.type not in ("comment", "block_comment", "sexp_comment", "dot")]
+    return node.text.decode("utf-8", "replace")
+
+
+def _extract_racket_imports(content: str, repo: Optional[str] = None) -> list[dict]:
+    """Extract Racket `(require ...)` edges, read by ``racket_reader.py``.
 
     Handles bare collection paths, string paths, `(submod "file" sub)`, and
     the `only-in` / `rename-in` / `prefix-in` / `except-in` / `for-syntax` /
     `for-meta` / `combine-in` wrappers, each of which may carry several
     module paths. `(submod "." test)` is deliberately skipped -- it names a
     submodule of the same file, not another file.
+
+    ⚠ One reader. This used to carry its own comment-stripper and form reader
+    and find `(require` by regex, which matched inside `#;` comments, `#'`
+    syntax templates, quasiquoted `eval` payloads and here-strings: measured
+    over 2,489 files, 131 "requires" the files do not make and none missed.
+    Now the `#lang` tier decides the reader mode (so a project's own at-exp
+    lang needs `repo`, the same way the walker does), a `require` is a list
+    whose head is that symbol at any depth of CODE, and a document-tier
+    file contributes no edges -- a reader it does not have cannot say where
+    the Racket in it is.
     """
-    text = _racket_strip_comments(content)
+    from .extractor import _racket_command_char, _racket_tier   # lazy: the cycle runs the other way
+    from .racket_reader import read_racket
+
+    source = content.encode("utf-8", "surrogatepass")
+    tier, written = _racket_tier(source, repo)
+    if tier == "text":
+        return []
+    tree = read_racket(source, at_exp=(tier == "at-exp"),
+                       command_char=_racket_command_char(written, repo))
     edges: list[dict] = []
     seen: set[tuple] = set()
-    for m in _RACKET_REQUIRE_RE.finditer(text):
-        form, _ = _racket_read_form(text, m.start())
-        if not isinstance(form, list):
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if node.type in _RACKET_NOT_CODE:
             continue
-        for item in form[1:]:
-            for spec, names in _racket_edges(item):
-                key = (spec, tuple(names))
-                if key in seen:
-                    continue
-                seen.add(key)
-                edges.append({"specifier": spec, "names": names})
+        if node.type == "list":
+            kids = [c for c in node.children if c.type not in ("comment", "block_comment", "sexp_comment")]
+            if kids and kids[0].type == "symbol" and kids[0].text == b"require":
+                for item in kids[1:]:
+                    for spec, names in _racket_edges(_racket_datum(item)):
+                        key = (spec, tuple(names))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        edges.append({"specifier": spec, "names": names})
+        stack.extend(reversed(node.children))
     return edges
 
 
@@ -1053,13 +1035,16 @@ _LANGUAGE_EXTRACTORS = {
 }
 
 
-def extract_imports(content: str, file_path: str, language: str) -> list[dict]:
+def extract_imports(content: str, file_path: str, language: str,
+                    repo: Optional[str] = None) -> list[dict]:
     """Extract import edges from source file content.
 
     Args:
         content: Raw source file text.
         file_path: Path of the file (used for context; not used in extraction).
         language: Language name (must match LANGUAGE_REGISTRY keys).
+        repo: Index source root, for extractors whose reading depends on
+            project config (Racket's `racket_langs`); None where unknown.
 
     Returns:
         List of dicts: [{"specifier": str, "names": list[str]}, ...]
@@ -1085,6 +1070,8 @@ def extract_imports(content: str, file_path: str, language: str) -> list[dict]:
     if extractor is None:
         return []
     try:
+        if language == "racket":
+            return _extract_racket_imports(content, repo=repo)
         return extractor(content)
     except Exception:
         # Practice 2: an extractor that raises loses EVERY edge for this file,
@@ -1398,10 +1385,40 @@ _alias_map_cache: dict[str, dict[str, list[str]]] = {}
 _ALIAS_MAP_LOCK = threading.Lock()
 
 # Directories to skip when walking for tsconfig files.
-_TSCONFIG_SKIP_DIRS = frozenset({
-    "node_modules", ".git", "dist", "build", "out", ".cache",
-    ".next", ".nuxt", ".svelte-kit", ".turbo", ".vercel",
+# ⚠⚠ **The FOURTH copy of a skip list in this tree, and the only one that
+# derived from nothing** (#557, @Ticki84). `security._SKIP_DIRECTORY_NAMES` is
+# the authority -- CLAUDE.md says so, and `SKIP_DIRECTORIES` and `SKIP_PATTERNS`
+# already derive from it -- but this set was hand-maintained beside it and had
+# never heard of Rust's `target`. So `_walk_tsconfigs` descended into a Tauri
+# project's build directory on EVERY watcher event: **13.58s of a 13.75s
+# reindex, measured by the reporter in his own `watch-all` process, against
+# 0.27s once `target` was excluded.**
+#
+# ⚠⚠ Adding `"target"` here was the reported fix and would have been the wrong
+# one -- that is "fix the call site, leave the mechanism", our own standing
+# lesson. Ask the authority instead: every build-tree spelling it already knows
+# (`target`, `_build`, `.gradle`, `DerivedData`, the eight dotted framework
+# trees) arrives at once, and the next one arrives without touching this file.
+#
+# ⚠ **UNION, never replacement.** The extras below are tsconfig-specific and
+# some are deliberately absent from the authority: `out` names a real source
+# directory for the INDEXING walk (CLAUDE.md: "DOTTED ONLY"), but it has been
+# skipped for tsconfig discovery for this function's whole life and removing a
+# skip is the one direction this change must not take. Union can only make the
+# walk cheaper.
+_TSCONFIG_EXTRA_SKIP_DIRS = frozenset({
+    "out", ".cache", ".next", ".nuxt", ".svelte-kit", ".turbo", ".vercel",
 })
+
+
+def _tsconfig_skip_dirs() -> frozenset[str]:
+    """Directory names `_walk_tsconfigs` must not descend into.
+
+    Imported lazily: `security` imports `config`, and resolving it at module
+    scope here would put a parser module in that chain for no benefit.
+    """
+    from ..security import _SKIP_DIRECTORY_NAMES  # noqa: PLC0415
+    return frozenset(_SKIP_DIRECTORY_NAMES) | _TSCONFIG_EXTRA_SKIP_DIRS
 
 
 def _norm_alias_replacement(rep: str, tsconfig_dir_rel: str = "") -> str:
@@ -1526,6 +1543,8 @@ def _load_tsconfig_aliases(source_root: str) -> dict[str, list[str]]:
                 continue  # skip package references like "@tsconfig/recommended"
             _ingest_tsconfig_file(extended)
 
+    skip_dirs = _tsconfig_skip_dirs()
+
     def _walk_tsconfigs(directory: Path, depth: int) -> None:
         # Depth 5 covers layouts up to apps/x/frontend/packages/bar/tsconfig.json.
         if depth > 5:
@@ -1533,7 +1552,7 @@ def _load_tsconfig_aliases(source_root: str) -> dict[str, list[str]]:
         try:
             for entry in sorted(directory.iterdir()):
                 if entry.is_dir():
-                    if entry.name not in _TSCONFIG_SKIP_DIRS and not entry.name.startswith("."):
+                    if entry.name not in skip_dirs and not entry.name.startswith("."):
                         _walk_tsconfigs(entry, depth + 1)
                 elif (
                     entry.is_file()
