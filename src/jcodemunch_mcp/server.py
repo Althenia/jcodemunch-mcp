@@ -10232,7 +10232,7 @@ def main(argv: Optional[list[str]] = None):
     if any(arg in top_level_flags for arg in raw_argv):
         args = parser.parse_args(raw_argv)
     else:
-        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "hook-sessionstart", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "refresh", "health", "file-risk", "observatory", "keyring", "surface"}
+        known_commands = {"serve", "watch", "hook-event", "hook-pretooluse", "hook-posttooluse", "hook-copilot-posttooluse", "hook-precompact", "hook-taskcomplete", "hook-subagent-start", "hook-sessionstart", "watch-claude", "watch-all", "watch-install", "watch-uninstall", "watch-status", "config", "list-repos", "delete-index", "org-report", "org-rollup", "license", "index", "index-file", "import-trace", "import-scip", "claude-md", "init", "install", "install-status", "uninstall", "install-pack", "download-model", "upgrade", "whatsnew", "receipt", "digest", "reflect", "delivery", "parity", "refresh", "health", "file-risk", "observatory", "keyring", "auth", "surface"}
         # MCP-tool-name typos: route to the right CLI verb with a friendly hint.
         # `index_repo` and `index_folder` are MCP tools, not CLI subcommands.
         _CLI_ALIASES = {
