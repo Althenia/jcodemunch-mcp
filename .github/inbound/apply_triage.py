@@ -12,7 +12,13 @@ produces: a plan (labels to add and remove, at most one comment, at most
 refuses:  a result that fails the schema; any action for a `medium` or
           `low` confidence beyond the category label plus needs-human; any
           comment but the duplicate link; any action beyond the label for
-          an item filed by the repository owner (POLICY section 10)
+          an item filed by the repository owner (POLICY section 10); a
+          result whose `issue` is not the one the workflow named
+
+The write target is `--issue`, the number the WORKFLOW is processing, never
+the model's `issue` field (#670): a failed model is exactly the case with no
+number in its output, and reading it from there discarded the escalation
+while the job stayed green and the item was re-triaged every 15 minutes.
 """
 
 from __future__ import annotations
@@ -193,26 +199,50 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--repo", required=True)
     ap.add_argument("--drafts-dir", type=Path, required=True)
     ap.add_argument("--run-id", required=True)
+    ap.add_argument(
+        "--issue",
+        type=int,
+        required=True,
+        help="the item the workflow is processing; the only write target",
+    )
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
     try:
         result = json.loads(args.result.read_text(encoding="utf-8"))
+        if not isinstance(result, dict):
+            raise SchemaError("result is not an object")
+        if "issue" in result and str(result["issue"]) != str(args.issue):
+            # The model's value is deliberately NOT echoed: this text reaches
+            # the public Actions log and the audit ledger.
+            raise SchemaError(
+                f"result names a different issue than the one the workflow processed ({args.issue})"
+            )
         p = plan(result, args.author, args.owner)
-    except (OSError, json.JSONDecodeError, SchemaError) as e:
-        # A malformed result is an escalation, not a guess.
+        if p.get("comment"):
+            p["comment"]["issue_to"] = args.issue
+        if p.get("draft"):
+            p["draft"]["issue"] = args.issue
+            p["draft_path"] = str(write_draft(p["draft"], args.drafts_dir, args.run_id))
+    except Exception as e:  # noqa: BLE001 -- see below
+        # A malformed result is an escalation, not a guess. ⚠ #670: the
+        # escalation is OUR fixed response to the model failing, carries
+        # nothing the model said, and is WRITTEN -- to the issue the workflow
+        # named. Planning it and not applying it left the item queued forever.
+        # ⚠⚠ EVERY exception, not a list of them: a list names the spellings
+        # someone thought of, and `"category": ["x"]` (TypeError), a non-string
+        # draft (AttributeError), invalid UTF-8 and deeply nested JSON
+        # (RecursionError) each escaped the first version of this fix and
+        # left the item queued. Nothing below depends on what raised.
         p = {
             "add": ["inbound:unknown", "needs-human"],
             "remove": [QUEUE_LABEL],
             "comment": None,
             "draft": None,
-            "error": f"{type(e).__name__}: {e}",
+            "error": f"{type(e).__name__}: {e}"[:300],
         }
-        result = {"issue": None}
-    if p.get("draft"):
-        p["draft_path"] = str(write_draft(p["draft"], args.drafts_dir, args.run_id))
     print(json.dumps(p, sort_keys=True))
-    if args.apply and result.get("issue") is not None:
-        apply(p, args.repo, int(result["issue"]))
+    if args.apply:
+        apply(p, args.repo, args.issue)
     return 0
 
 
