@@ -2,6 +2,59 @@
 
 ## [Unreleased]
 
+### Changed - a credential makes an inbound item `security` when it is exposed, not when it is named
+
+The inbound intake scan labels an item `inbound:security` + `needs-human`
+before any model reads it. Its credential clause was a word list:
+`credential`, `token`, `secret`, `api key`, `private key` or `key material`
+anywhere in the text. Over every issue in this repository (321) it fired on
+75. The bare words `token` and `tokens` matched in 50 of those, and were the
+only match in 42, in a project where a token is usually the LLM unit. It labelled #670 security 13 seconds after filing,
+for describing a defect that involves no credential at all. Owner ruling,
+2026-09-13: "mentioning credentials is fine; exposing them is not."
+
+POLICY section 1 rule 1 now says a credential is exposed when a token, key
+or password VALUE appears in the item, or when the item says a credential
+was leaked, logged, printed, committed, shipped, returned or otherwise made
+readable. `.github/inbound/scan.py` matches exactly that: secret-shaped
+values (GitHub, Anthropic, OpenAI, AWS, PyPI and Slack token forms, a PEM
+private-key header, a long `key = value` assignment), or a credential noun
+within four words of an exposure verb or state, in either order. A negation
+inside that span breaks the match ("stores nothing about secrets", "the token
+cannot leak"), while "not only leaked" and a negated safeguard ("the api key
+wasn't redacted and is in the log") do not. After the credential, an aside in
+commas, parentheses or dashes does not break it either ("my api key (the prod
+one) was leaked"). After a verb a comma does, because there it crosses a
+clause: allowing it there flagged #76, #167, #371 and #489, which only mention
+secrets. A negation just before the verb cancels too ("should not log the api
+key", "cannot contain secrets"), read from the same negation list as the gap,
+with only an auxiliary or adverb between ("I cannot believe it leaked my api
+key" still counts).
+"contains" and "shows" count with an owner or a realness word ("shows
+the user's real api key"), or an article before a credential named by kind
+("the wheel contains the .env file"), never before a UI word ("shows the API
+key field"). A bare `token` counts only
+beside a strong exposure word ("pasted my token", "the token is logged") and
+never before an LLM-unit word ("token count"). `Authorization: Bearer`
+values, short `password=` values (not code such as `Path.cwd()`), `*_access_key =` assignments and PGP, npm,
+Hugging Face, Google and temporary-AWS key forms are values too. Every
+repetition is bounded: the scan runs in CI on untrusted text, and the
+first draft of these patterns took 205.53 s on "secret" repeated to 6,000
+characters; the bounded patterns scanned a 600,000-character adversarial
+input in 1.10 s, and the test file checks that twenty adversarial shapes
+grow linearly: four times the text in under ten times the time, measured in
+one process so a loaded CI runner slows both sides alike. Over the same corpus
+it flags 20. Every security-shaped report the audit lists that the word list
+caught is still caught (#444, #448, #508, #509). The other rule-1 triggers
+(vulnerability, exploit, CVE, traversal, cross-repo, arbitrary write, data
+exposure, redaction failure) are untouched.
+
+⚠ The trade-off, accepted with the ruling: a disclosure written only in
+plain words with no credential noun ("the key is in the log") no longer
+trips the scan, and neither does one with more than four words between the
+credential and its exposure (a five-word window flagged mention-only
+sentences). The triage model still reads rule 1.
+
 ### Fixed - a triage result the model cannot produce is escalated, not retried forever (#670)
 
 When the inbound triage model failed, `apply_triage.py` planned exactly the
