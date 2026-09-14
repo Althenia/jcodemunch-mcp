@@ -2,7 +2,7 @@
 version: 2
 model: claude-opus-5
 job: inbound-fix
-policy_sha256: 1e566a4ead520ffc3b5afec45edc270c2331c1c977ec389a66d2527d018b5d3c
+policy_sha256: 7705ea39a454f70d6ea16ea60dc5c1d3c6c36d1b7cfcacdd6d4d4875b030f859
 ---
 <!-- BEGIN policy:preamble -->
 <!-- inbound-preamble v1 -->
