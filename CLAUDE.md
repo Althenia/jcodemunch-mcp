@@ -1,11 +1,11 @@
 # jcodemunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.108.317 — **CI runs the harness on every change; publishing is a dispatched workflow.** Eight workflows are five (`pr-gate.yml`, `main.yml`, `nightly.yml`, `security.yml`, `release.yml`); every PR-gate job is a REQUIRED check on `main` by name; `enforce_admins` and `strict` are ON; a release is `release.yml` dispatched with a version, Test PyPI first, trusted publishing, post-publish smoke on both OSes. ⚠⚠ **The gate caught its own author four times before it merged** (unformatted scripts, a subprocess without `encoding=`, invalid YAML in `release.yml` found by CodeQL, a venv path uv cannot resolve on windows) and the release pre-flight was wrong twice about a MAIN commit (C-13, C-14: the PR gate's jobs live on the PR's merge ref; the witnesses on main are `main.yml`'s). ⚠ Windows runners are 3x this box on the full tier: a platform-scoped Floor `suite.full_seconds_ci_windows`, not a loosening. ⚠ Also in this release: tied `search_symbols` scores rank by symbol id (harness F-13), the token reference is captured on CI, `types.error_max` and `deps.vuln_max` Floors, `SECURITY.md` reporting policy. Forensics: `docs/cicd/`. [[the-cicd-pipeline-lives-in-docs-cicd]]
-- **Prior (1.108.316):** **A display preference edited the data it was displaying** (#572, @rknighton): the shared result cache handed back its stored dict, so `meta_fields` (the SHIPPED default `[]`) and per-call `suppress_meta` rewrote what every later caller was served; fixed in the cache, not at the two call sites. Rules: Key Files `storage/token_tracker.py`; forensics: `ISSUE-HISTORY.md` (rotated 2026-09-04).
-- **Prior (1.108.315):** **A fix for a false positive can install a false negative** (#569, #566): `encoding/schemas/` is enumerated at import time, so twelve live encoders published as dead at confidence 1.0, and the first draft of the fix revived 502 files under `tests/` with every assertion green; `check_delete_safe` certified the deletes regardless. Rules: Key Files `tools/_runtime_discovery.py`, `tools/_corpus_adequacy.py`, `tools/check_delete_safe.py`; forensics: `ISSUE-HISTORY.md` (rotated 2026-09-04).
-- **Older releases (1.108.314 and earlier):** see `CHANGELOG.md` (1.108.303-.310 and 1.108.314 in `ISSUE-HISTORY.md`). The 1.108.182 entry ("a stall has a name and a ceiling", #375) and the 1.108.177-.181 #377 hardening arc are there in full.
-- **Tests:** 9241 passed, 19 skipped, **0 failed** (1.108.317, `uv run pytest -n auto`; the skip count is 19 under `uv run` and 13 under `PYTHONPATH=src python -m pytest`, harness F-05) **+ `uv run ruff check src/` clean**, measured on the settled tree after the bump and the rotation. ⚠ **9260 TOTAL, +86 over the .316 line's 9174**: the CI/CD series' guard tests (`test_workflows_pinned`, `test_harness_summary`, `test_security_md_policy`, `test_release_preflight`, `test_search_symbols_tie_order`) plus the harness build's. ⚠ Prior (1.108.316): 9161 passed, 13 skipped, **0 failed** (9174 total **+ `uv run ruff check src/` clean**, measured on the settled tree after the bump and the rotation. ⚠ **9174 TOTAL, +26 over the .315 line's 9148**, and it reconciles EXACTLY: 11 from this release's `tests/test_result_cache_isolation.py`, 2 from @rknighton's merged #570, 7 from #571's `test_kind_enum_is_derived.py`, 5 from `test_savings_usd_basis.py` and 1 from the holdout-artifact gate — four of those five shipped between the two measurements. ⚠ **A delta is only readable when both ends name the same tree**; three commits sat between these two. ⚠ `ruff check tests/` reports 292 PRE-EXISTING errors and is NOT this project's gate; `src/` is. ⚠⚠ **THE ROTATION IS TWO EDITS, NOT ONE** — moving a release out of Current State also moves the "Older releases (X and earlier)" boundary, and `test_claude_md_rotation.py` fails naming both numbers; it caught .311's settled run at `1 failed`. ⚠⚠ **READ THE SKIP COUNT, NOT JUST THE EXIT CODE AND THE TOTAL** — a .305 reproduce came back exit 0 with the total reconciling exactly while 105 tests silently did not execute. Forensics and the correct command: **Reproducing CI's environment**. ⚠⚠ **Compare TOTALS, never passed counts, and NEVER a skip count ACROSS machines** — CI ubuntu skips 26 and windows 19 where this box skips 13, all pre-existing; **the before/after delta on the SAME job is the only signal**. ⚠⚠ **A BACKGROUND-TASK BANNER SAYING "exit code 0" IS NOT A GREEN SUITE** — one run reported exit 0 having never started pytest (`--timeout` plugin absent), and .306 had a banner say exit 0 over a log whose own `EXIT=` line said 1. **Redirect the exit code INTO the log (`{ pytest; echo "EXIT=$?"; } > log`) and grep that line**; a bare `&` does not survive the shell either. ⚠⚠ **A CONTRIBUTOR PR IS TRIAL-MERGED ONTO `main` AND RUN LOCALLY BEFORE THE MERGE** — branch-green is not merged-green and the merge base moves every release. ⚠⚠ **A reproduce that ERRORS in `tests/test_sdist_exclusions.py` is NOT environmental noise** — that file is the sdist CREDENTIAL-LEAK guard (v0.2.6), and it errors at setup when the scratch venv must fetch the build backend with DNS blocked. Re-run it explicitly; never wave it through. ⚠ Prior (1.108.315): 9135 passed, 13 skipped, **0 failed** (9148 total). ⚠ Prior (1.108.314): 9108 total. ⚠ Two full runs contend on the same `~/.code-index` process-lock scopes, the documented cause of .261's 47m outlier, so the 3.13 reproduce runs AFTER the local suite, never beside it.
+- **Version:** 1.108.319 — **The numbers a competitor published about us were right, and so was the refusal we had shipped over twice.** An external benchmark (`amritessh/scalpel-fse2027-artifact`, reproducible from its own raw data) named two real defects in us. TypeScript and TSX never indexed an `abstract class` at all — the grammar spells it `abstract_class_declaration` and neither spec listed it, so every abstract class was absent and its methods lost their owner (#698). And `search_symbols` cut its page on score alone, so an exact-name match could be evicted OUTRIGHT — not ranked lower, absent — by same-named locals declared inside function bodies (#699); all three cut sites read one `(declaration rank, score)` key now, and locals are demoted, never filtered. ⚠⚠ **That rank needs BOTH a kind and an owner condition, and the first draft shipped the owner probe alone, passed its own suite, and left the reported case byte-for-byte unchanged** — the fixture could not express the other crowding shape, so re-run the REPORTED corpus through the product before calling a fix done. ⚠⚠ **W-16 is FIXED after two releases shipped over its refusal**: every per-repo cell in `README.md` and `benchmarks/README.md` derives from `benchmarks/jcm_reference.json`, and `tests/test_benchmark_tables_mirror_the_reference.py` gates the cells a reader quotes — `test_provenance.py` gated only the grand total, which is the figure everyone remembers to update. Also in the block, in full in `CHANGELOG.md`: `get_tectonic_map` partitions by Louvain instead of one plate holding two-thirds of the tree (#668) and discloses an untrustworthy co-churn signal (#667); changed paths resolve when the index is rooted below the git top level (#685); an unproducible triage result is escalated, not retried forever (#670); committing a tree no longer invalidates the full-tier stamp taken on it (#675); the inbound jobs that bill a model have their own switch and it is OFF. Forensics: `docs/workflows/FINDINGS.md`.
+- **Prior (1.108.318):** **The process is code that cannot skip a step, and the field is measured from result files.** Three layers: the workflows layer (`/feature` · `/fix-issue` · `/release` · `/review` · `/triage-issue` · `/benchmark-compare` · `/competitive-compare`, with hooks that refuse a commit without the fast tier, a PR without a full-tier stamp on THIS tree, and every irreversible verb), the inbound layer (nine headless jobs, OFF until `INBOUND_ENABLED`, the model never holding a write token) and the competitive tier (the nulls, jCodeMunch and nine adapters over pinned corpora in a sandbox, every FINDINGS number script-written from a result file). Forensics: `docs/workflows/FINDINGS.md`, `docs/inbound/FINDINGS.md`, `docs/competitive/FINDINGS.md`.
+- **Prior (1.108.317):** **CI runs the harness on every change; publishing is a dispatched workflow** (five workflows; every PR-gate job a REQUIRED check on `main` by name; `enforce_admins` and `strict` ON; `release.yml` dispatched with a version, Test PyPI first, trusted publishing). ⚠⚠ The gate caught its own author four times before it merged and the pre-flight was wrong twice about a MAIN commit (C-13, C-14: the PR gate's jobs live on the PR's merge ref; main's witnesses are `main.yml`'s). ⚠ Windows runners are 3x this box on the full tier: `suite.full_seconds_ci_windows`, a platform-scoped Floor, not a loosening. Rules: the CI/CD section, `docs/cicd/`; forensics: `ISSUE-HISTORY.md` (rotated 2026-09-11).
+- **Older releases (1.108.316 and earlier):** see `CHANGELOG.md` (1.108.303-.310, 1.108.314-.315 and 1.108.316 in `ISSUE-HISTORY.md`). The 1.108.182 entry ("a stall has a name and a ceiling", #375) and the 1.108.177-.181 #377 hardening arc are there in full.
+- **Tests:** 10521 passed, 24 skipped, **0 failed** (10545 total, +336 over the .318 line's 10209) (1.108.319, `uv run pytest -n auto`, the full tier on the settled tree after the bump and the rotation) **+ `uv run ruff check src/` clean**. ⚠ Prior (1.108.318): 10185 passed, 24 skipped, **0 failed** (10209 total; the skip count is 24 under the full tier, harness F-05). ⚠ Prior (1.108.317): 9241 passed, 19 skipped, **0 failed** (9260 total; the skip count is 19 under `uv run` and 13 under `PYTHONPATH=src python -m pytest`, harness F-05). ⚠ `ruff check tests/` reports 292 PRE-EXISTING errors and is NOT this project's gate; `src/` is. ⚠⚠ **THE ROTATION IS TWO EDITS, NOT ONE** — moving a release out of Current State also moves the "Older releases (X and earlier)" boundary, and `test_claude_md_rotation.py` fails naming both numbers; it caught .311's settled run at `1 failed`. ⚠⚠ **READ THE SKIP COUNT, NOT JUST THE EXIT CODE AND THE TOTAL** — a .305 reproduce came back exit 0 with the total reconciling exactly while 105 tests silently did not execute. Forensics and the correct command: **Reproducing CI's environment**. ⚠⚠ **Compare TOTALS, never passed counts, and NEVER a skip count ACROSS machines** — CI ubuntu skips 26 and windows 19 where this box skips 13, all pre-existing; **the before/after delta on the SAME job is the only signal**. ⚠⚠ **A BACKGROUND-TASK BANNER SAYING "exit code 0" IS NOT A GREEN SUITE** — one run reported exit 0 having never started pytest (`--timeout` plugin absent), and .306 had a banner say exit 0 over a log whose own `EXIT=` line said 1. **Redirect the exit code INTO the log (`{ pytest; echo "EXIT=$?"; } > log`) and grep that line**; a bare `&` does not survive the shell either. ⚠⚠ **A CONTRIBUTOR PR IS TRIAL-MERGED ONTO `main` AND RUN LOCALLY BEFORE THE MERGE** — branch-green is not merged-green and the merge base moves every release. ⚠⚠ **A reproduce that ERRORS in `tests/test_sdist_exclusions.py` is NOT environmental noise** — that file is the sdist CREDENTIAL-LEAK guard (v0.2.6), and it errors at setup when the scratch venv must fetch the build backend with DNS blocked. Re-run it explicitly; never wave it through. ⚠ Two full runs contend on the same `~/.code-index` process-lock scopes, the documented cause of .261's 47m outlier, so the 3.13 reproduce runs AFTER the local suite, never beside it.
 - **Python:** >=3.10
 - **Tool count:** 91 visible in `full` / 94 in catalog (front door hidden; counts verified 2026-07-30 from `jcodemunch-mcp surface`, which is the only place to get them — do NOT hand-type this; +1 v1.108.111 `get_parity_map`, +1 v1.108.112 `get_decorator_census`, +1 v1.108.113 `get_architecture_metrics`); `tool_surface=counter` exposes a 3-tool front door (`order`/`menu`/`route`) instead
 
@@ -37,16 +37,17 @@ TRACKED as of 2026-09-04** except `settings.local.json`, `*.bak` and
 
 **`docs/inbound/POLICY.md` is what a headless job may do; `DESIGN.md` is
 each job; `docs/cicd/RUNBOOK.md` section 9 is what a human does.** Nine
-`inbound-*.yml` workflows (DESIGN names each). ⚠⚠
-**Nothing runs until the variable `INBOUND_ENABLED` reads exactly
-`true`**; absent is OFF, read first and again before every first write.
+`inbound-*.yml` workflows. ⚠⚠
+**Nothing runs until `INBOUND_ENABLED` reads exactly `true`, no model
+job until `INBOUND_MODEL_ENABLED` does** (off since 2026-09-14);
+absent is OFF; the layer switch is re-read before every write.
 ⚠⚠ **The model never holds a token that can write**: model jobs run on
 the read-only `GITHUB_TOKEN` and write a file; a no-model job verifies it
 and writes with the App, to be confined by a ruleset to `inbound/**` and
 `inbound-ledger` (RUNBOOK 9's once-only setup). Nothing headless merges, tags, publishes, closes, or
 touches POLICY 4.4's never-touch list (this file included); every drafted
-reply waits for a human `approved: true`. Open findings (the human setup
-steps IN-3/4/6/8; IN-15): `docs/inbound/FINDINGS.md`.
+reply waits for a human `approved: true`. Open findings:
+`docs/inbound/FINDINGS.md`.
 
 ## Competitive: the tier that measures us against the field (2026-09-06)
 
@@ -66,8 +67,10 @@ only competitor text quoted, as `data`. ⚠ Losses are recorded unsoftened
 adapter asked the import-graph tool for a usage question, a harness
 mapping defect and a real loss at once, since a user reaching for the
 same tool gets the same answer; the adapter asks `check_references`
-since 2026-09-06 and the next recorded run carries it, the product-doc
-half is CF-63). The
+since 2026-09-06 and the next recorded run carries it; the product half,
+CF-63, shipped 2026-09-10 (#658): seven steering surfaces route the usage
+question to `check_references`, and `tests/test_usage_question_routes_to_usage_tool.py`
+scans `src/` so an eighth inherits the rule). The
 three scheduled jobs are OFF until a human sets `COMPETITIVE_POST_ENABLED`
 and creates the four labels (CF-57); nothing here touches marketing.
 Open findings: `docs/competitive/FINDINGS.md`.
@@ -187,6 +190,7 @@ src/jcodemunch_mcp/
   runtime/
     redact.py            # Single chokepoint redact_trace_record(record, source) — strips emails, IPv4, SQL literals/numerics, JSON value blocks, Python locals reprs, plus all secret patterns from ../redact.py
     http_routes.py       # Phase 6 Starlette route handlers: POST /runtime/otel, POST /runtime/sql, POST /runtime/stack. Off by default — gated by runtime_ingest_enabled config + JCODEMUNCH_HTTP_TOKEN bearer auth. Per-repo asyncio.Lock serialises writes against the same SQLite DB. Body cap (default 5 MB) checked separately for on-wire and decompressed sizes (gzip-bomb guard). Repo selection via X-JCM-Repo header or ?repo= query. Mounted on both SSE and streamable-http transports.
+    diagnostics_ingest.py # (2026-09, `docs/prd-compiler-diagnostics.md`) `ingest_diagnostics_file` — parse → redact(`message`) → innermost-span `resolve_to_symbol_id` → REPLACE per tool. ⚠⚠ **A SNAPSHOT, not a `runtime_*` upsert-and-add**: `DELETE WHERE tool=?` then insert, or a fixed type error stays forever on a symbol that is now clean; unmapped rows under `source='diagnostics:<tool>'` are replaced the same way. ⚠⚠ **No INDEX_VERSION bump** — `_SCHEMA_SQL` for new DBs, `ensure_diagnostics_table()` at ingest for old ones; a bump invalidates every user's index for a table that stays empty until they ingest. ⚠ Consumers render NO DATA as absent, never zero; `current` is tri-state. ⚠ Found `resolve.py`'s suffix walk capped at 8 segments (deep Windows paths never mapped); the path bounds it now.
     confidence.py        # Phase 2 RuntimeConfidenceProbe + attach_runtime_confidence (symbol-keyed) + attach_runtime_confidence_by_file (file-keyed). Stamps `_runtime_confidence` ∈ {confirmed, declared_only, unmapped} on result entries; emits `_meta.runtime_freshness` summary. Read-only connections use ?mode=ro&immutable=1 so they never bump WAL mtime and invalidate the CodeIndex LRU cache. Zero-cost when runtime_calls is empty.
   evidence/
     receipts.py          # (v1.108.183) #377 Phase 2 P1: the `jcodemunch.evidence/v1` envelope + session store. evidence_id() hashes EXACTLY (subject, effective_search, snapshot) — full sha256, never 12 hex; build_envelope/record_receipt (fail-closed on id reuse over differing content: an id that ever named two receipts names NEITHER after); lookup() returns (envelope, reason) with reason naming never_recorded/evicted/collision; PROOF_KINDS holds the jdoc/jdata halves too so parity attaches to ONE enum; coverage_fingerprint() is the OPAQUE Phase-5 (#385) extension point; envelope_json() is deterministic so repeated resource reads are byte-identical; _absence_links maps a Phase-3 `absent:` token to its receipt. Session-scoped, in memory, bounded at 500 + an evicted set
@@ -215,7 +219,7 @@ constraint whose violation causes a defect, or a rationale.
 |------------|---------|
 | `uninstall [target]` | (v1.105.1) Reverse `init` / `install`. Preserves user-authored hook rules and content outside our policy region; removes files only when empty after stripping. `--keep-claude-md`, `--keep-hooks`, etc. scope what's reversed |
 | `refresh [path]` | (v1.108.259, #395) Re-parse an INDEXED repo in bounded, resumable slices — `--max-seconds` / `--max-files` / `--pause-ms` / `--batch-size` / `--status` / `--reset` / `--ai-summaries` / `--json`. For fleets where a full re-index is a scheduled maintenance event. ⚠ Does NOT build a first index; refuses with the command that does. ⚠ Stamps `parser_generation` only after VERIFIED full-corpus coverage |
-| `import-trace [--otel <path> \| --sql-log <path> \| --stack-log <path>] [--repo <id>] [--no-redact]` | (Phases 1 + 4 + 5) Ingest a runtime trace file into the runtime_* tables. `--otel` takes JSON / JSON-Lines / .gz and maps spans by `(code.filepath, code.lineno, code.function)`; `--sql-log` takes pg_stat_statements CSV or generic SQL JSON-Lines and maps queries by referenced tables + dbt/SQLMesh column metadata; `--stack-log` takes plain-text app log or JSON-Lines record set with Python / JVM / Node.js tracebacks and writes severity-tagged frame counts to runtime_stack_events. Redacts PII at the chokepoint by default. Pass exactly one source flag. |
+| `import-trace [--otel <path> \| --sql-log <path> \| --stack-log <path> \| --diagnostics <path> [--format mypy\|pyright\|tsc\|ruff\|generic]] [--repo <id>] [--no-redact]` | (Phases 1 + 4 + 5) Ingest a runtime trace file into the runtime_* tables. `--otel` takes JSON / JSON-Lines / .gz and maps spans by `(code.filepath, code.lineno, code.function)`; `--sql-log` takes pg_stat_statements CSV or generic SQL JSON-Lines and maps queries by referenced tables + dbt/SQLMesh column metadata; `--stack-log` takes plain-text app log or JSON-Lines record set with Python / JVM / Node.js tracebacks and writes severity-tagged frame counts to runtime_stack_events. Redacts PII at the chokepoint by default. Pass exactly one source flag. ⚠⚠ **`--diagnostics` (2026-09) REPLACES every `diagnostics` row for its tool** — the rule and its reasons are at Key Files `runtime/diagnostics_ingest.py`. Never runs a checker; detects the format by CONTENT; an EMPTY file is a clean run only with `--format` naming the tool. |
 | `hook-precompact` | PreCompact hook: register transcript root before compaction (reads JSON stdin; snapshot delivery is `hook-sessionstart`) |
 | `hook-sessionstart` | (v1.108.255, #420) SessionStart hook: re-inject the PreCompact snapshot into MODEL context on `compact`/`resume`/`fork`. Silent on `startup`/`clear`, because an unrelated session's journal presents stale files as current focus. Also the earliest point a custom-profile transcript root can be learned (#421), so registration runs BEFORE the source gate |
 | `receipt` | Token-economy ledger from Claude transcripts — modeled tokens-saved + dollar value at Fable/Opus/Sonnet/Haiku rates; `--explain`, `--export csv\|json`, `--days` (rolling), `--model`. v1.108.134: `--since`/`--until` for calendar windows (local dates; `--until` exclusive) + `--by-day` for a per-day series in the JSON export. v1.108.135: `--rates` dumps the model price table as JSON (scans nothing) so consumers price from the one table instead of a drifting copy |
@@ -278,10 +282,10 @@ touch a tool description:
 
 - **`core_compact` has a HARD ceiling of 4,000 tokens** (v2 §10). The drift ratchet
   in `tests/test_schema_budget.py` offers "or update the baseline"; the sibling
-  ceiling tests forbid it. Trim the description instead. Measured 2026-09-02 at **3,998 of 4,000** (#571) --
-  TWO tokens, so the next core-tier description edit breaches it. ⚠ The live
-  gate recomputes from `_build_tools_list()`; the frozen-baseline sibling only
-  fails AFTER a regeneration, i.e. after the breach shipped.
+  ceiling tests forbid it. Trim the description instead. ⚠⚠ **Never transcribe the
+  headroom here — read `core_compact` in `benchmarks/schema_baseline.json`** (F-27).
+  ⚠ The live gate recomputes from `_build_tools_list()`; the frozen sibling fails
+  only AFTER a regeneration, i.e. after the breach shipped.
 - **`tests/test_description_smells.py` gates Purpose and Length.** A new tool with a
   one-line description fails it. Two substantive sentences minimum: what it does and
   returns, plus one boundary or usage cue.
@@ -355,19 +359,7 @@ near its floor, descriptions are untouched ground.
 
 ### Tier-switch pricing (`benchmarks/tier_switch/`)
 
-⚠⚠ **A mid-session tier switch is priced, and one of the three tiers is a
-LOSING destination.** `full` -> `standard` needs **174 requests** to repay the
-cache it invalidates (**864** with 100k of history); `full` -> `core` needs
-**4**. Regenerate with `price_tier_switch.py`; weights are read live from
-`_build_tools_list`, so nothing here is hand-typed. `tier_switch_cost.classify`
-refuses the non-paying narrowing at both switch sites and never refuses a
-widening.
-
-⚠ **This EXTENDS the codex_surface finding below, it does not repeat it.** That
-one says `standard` is not a lever (6.7% of the payload). The addition is that
-as a TRANSITION it is negative, for longer than any session lasts -- and that
-the "fewer tokens is better" intuition is correct uncached and wrong cached,
-which is the whole reason it shipped.
+⚠ Numbers and rule: Key Files `tier_switch_cost.py` + Standing lesson 08-30; prose rotated to `ISSUE-HISTORY.md` 2026-09-12. Regenerate with `price_tier_switch.py`.
 
 ⚠⚠ **The published `counter` surface is BYTE-PINNED** (v1.108.314,
 `tests/test_counter_surface_stability.py`): six tools, **4,184 B**, by name AND
@@ -408,15 +400,13 @@ GITHUB_TOKEN="" gh issue list --state open ; GITHUB_TOKEN="" gh pr list --state 
 
 Each names a date to grep for in `ISSUE-HISTORY.md`.
 
-- **We fix the reported call site and leave the mechanism.** Three times in three
-  days (08-19, #506/#507/#508/#509): a second generator, a second call site, a
-  second derivation. The one-sentence fix each time is *ask the authority instead
-  of reproducing its logic*. ⚠⚠ **09-02 (#572) is the same shape in a cache, and
-  the contributor made the argument for us:** `search_symbols` had fixed
-  return-the-stored-object twice inside its OWN cache (#377 item 3, then #404)
-  and neither fix reached the SHARED one, so a display preference kept editing
-  cached data. **Ask whether the fix belongs one layer down, where the tool
-  written next inherits it.**
+- **We fix the reported call site and leave the mechanism.** 08-19
+  (#506/#507/#508/#509), three times in three days: a second generator, a second
+  call site, a second derivation. The fix each time is *ask the authority
+  instead of reproducing its logic*. ⚠⚠ 09-02 (#572) is the same shape in a
+  cache — `search_symbols` had fixed return-the-stored-object twice inside its
+  OWN cache and neither fix reached the SHARED one. **Ask whether the fix
+  belongs one layer down, where the tool written next inherits it.**
 - **Write the ratchet before concluding the reported list is the list.** 08-18
   #489 reported three sites; a test over the PROPERTY found five. Same at #447
   (three spellings of one path rule) and #491.
@@ -490,62 +480,53 @@ Each names a date to grep for in `ISSUE-HISTORY.md`.
   the least schema scores the highest. The cut was not merely inconclusive, it
   was incapable — and it will be suggested again by the next cache paper.
 - **Dropping an unmeasurable axis is not the same as omitting an inapplicable
-  one, and the difference has a SIGN.** 08-28: gating `churn_surface` on a
-  shallow clone by omitting it — the convention `runtime_coverage` already uses
-  — took the same tree from **84.0 B to 88.8 B** while full-clone truth was
-  **77.3 C**. **Removing a low-scoring axis RAISES a mean**, so the fix moved
-  the published grade further from reality than the defect had. NOT APPLICABLE
-  may be dropped silently; COULD NOT MEASURE must withhold the composite and
-  the grade. ⚠ Ask which direction a "safe" omission moves the number before
-  shipping it. [[a-one-directional-check-certifies-its-blind-side]]
+  one, and the difference has a SIGN.** 08-28: omitting `churn_surface` on a
+  shallow clone took the same tree from **84.0 B to 88.8 B** where full-clone
+  truth was **77.3 C** — **removing a low-scoring axis RAISES a mean**, so the
+  fix moved the published grade further from reality than the defect had. NOT
+  APPLICABLE may be dropped silently; COULD NOT MEASURE must withhold the
+  composite and the grade. ⚠ Ask which direction a "safe" omission moves the
+  number before shipping it. [[a-one-directional-check-certifies-its-blind-side]]
 - **`.get(key, default)` is not a None guard when the key EXISTS.** 08-28:
   `diff_radar`'s `.get("composite", 0.0)` raised the moment a composite was
   legitimately `None` — the default never fires for a present key. ⚠ And the
   0.0 it would have supplied was worse than the crash: a ~77-point regression
   reported against a side nobody measured. Same shape as
   [[a-module-that-imports-clean-has-been-tested-for-nothing]].
-- **The host's timezone can select a test's INPUT FORMAT.** 08-28: git renders
-  a UTC offset as `Z`, which `datetime.fromisoformat` could not parse before
-  3.11 — so a boundary date was unreadable on 3.10, in CI only. Every runner is
-  UTC; this box is CDT and got `-05:00`, which parses everywhere. ⚠⚠ **No local
-  run on any version could reproduce it, `uv run --python 3.13` included** —
-  the version matrix was not the axis that mattered. Pin format-sensitive
-  parsing with a UNIT test over every spelling; an integration test can only
-  observe the one its host emits. [[a-module-that-imports-clean-has-been-tested-for-nothing]]
+- **The host's timezone can select a test's INPUT FORMAT.** 08-28: git renders a
+  UTC offset as `Z`, which `datetime.fromisoformat` could not parse before 3.11,
+  so a boundary date was unreadable on 3.10 in CI only; this box is CDT and got
+  `-05:00`, which parses everywhere. ⚠⚠ **No local run on any version could
+  reproduce it** — the version matrix was not the axis that mattered. Pin
+  format-sensitive parsing with a UNIT test over every spelling; an integration
+  test can only observe the one its host emits.
+  [[a-module-that-imports-clean-has-been-tested-for-nothing]]
 - **A command that does not CREATE its environment is testing whatever was
-  left there.** 08-28: the release checklist's CI-env reproduce ran
-  `uv run --python 3.13 python -m pytest` with no sync and no `--extra watch`,
-  so it inherited `.venv`. It looked right for months because a previous sync's
-  packages survived; switching interpreters cleared them and **105 tests
-  silently stopped executing while the run reported exit 0 and the totals
-  reconciled exactly**. ⚠ Read the SKIP count, not just the exit code and the
-  total. ⚠⚠ The fix is in a GITIGNORED skill file, so the durable copy and its
-  ratchet live in the repo — `tests/test_ci_env_reproduce_command.py` binds
-  CLAUDE.md's command to `pr-gate.yml`'s install line (it was `test.yml` until 2026-09-04).
-  [[pipes-and-missing-xdist-both-report-exit-zero]]
+  left there.** 08-28: the CI-env reproduce ran with no sync and no
+  `--extra watch`, so it inherited `.venv` and looked right for months; when
+  switching interpreters cleared it, **105 tests silently stopped executing
+  while the run reported exit 0 and the totals reconciled exactly**. ⚠ Read the
+  SKIP count, not just the exit code and the total. ⚠⚠ The fix lives in a
+  GITIGNORED skill file, so the durable copy is
+  `tests/test_ci_env_reproduce_command.py`, which binds CLAUDE.md's command to
+  `pr-gate.yml`'s install line. [[pipes-and-missing-xdist-both-report-exit-zero]]
 - **A denylist catches the instance; an allowlist catches the class.** 08-28:
-  `relnotes.md`, a scratch copy of the release notes, was swept up by
-  `git add -A` and shipped inside the published sdist. The sdist canary tests
-  prove NAMED bad paths are absent and could never have seen it — a scratch
-  file has no name to plant a canary under. ⚠ **Build release notes outside the
-  repository**; a `.gitignore` entry protects only the spelling someone
-  remembered. ⚠ Assert the allowlist in BOTH directions — an entry naming a
-  file that no longer ships makes the list stop describing the artifact.
-  ⚠⚠ **It found a SECOND instance minutes later and it was mine**: `suite.log`,
-  the pytest redirect used for every gate run that day, sitting in the repo
-  root. A release cut while one existed ships it, and a pytest log carries
-  absolute paths and usernames. **Redirect gate runs to the scratchpad, never
-  the repo.**
+  `relnotes.md`, a scratch release-notes copy, was swept up by `git add -A` and
+  shipped in the sdist. The canary tests prove NAMED bad paths absent, and a
+  scratch file has no name to plant a canary under. ⚠ **Build release notes
+  outside the repository**; a `.gitignore` entry protects only the spelling
+  someone remembered. ⚠ Assert the allowlist in BOTH directions. ⚠⚠ **Redirect
+  gate runs to the scratchpad, never the repo** — `suite.log` was the second
+  instance, found minutes later, and a pytest log carries absolute paths and
+  usernames.
 - **A field written by nobody's reader is a defect with no symptom.** 08-28
-  (#561/#562): `detect_framework` persisted `entry_point_patterns` into
-  `context_metadata` at index time, and a tree-wide search found that key
-  written in ONE place and read in NONE. Three tools each reproduced their own
-  "is this a root?" answer and every one was Python, so a Next.js repo detected
-  zero entry points. ⚠⚠ **An unconsumed field also rots unnoticed**: Flask and
-  FastAPI carried `"*.py"` there, which under fnmatch declares the whole tree —
-  the first naive reader would have switched dead-code detection off across an
-  ecosystem. **Grep a persisted field for its readers before trusting it, and
-  before adding one.** [[a-module-that-imports-clean-has-been-tested-for-nothing]]
+  (#561/#562): `detect_framework` persisted `entry_point_patterns` and a
+  tree-wide search found that key written in ONE place and read in NONE, so
+  three tools each reproduced their own Python-only answer and a Next.js repo
+  detected zero entry points. ⚠⚠ **An unconsumed field also rots unnoticed** —
+  Flask and FastAPI carried `"*.py"`, which under fnmatch declares the whole
+  tree. **Grep a persisted field for its readers before trusting it, and before
+  adding one.** [[a-module-that-imports-clean-has-been-tested-for-nothing]]
 - **A count taken after the page is cut describes the page.** 08-28 (#559):
   `untested_count = len(symbols)` ran after the `max_results` slice, so
   `get_repo_health`'s `max_results=1` published ~100% test reach on every repo
@@ -555,15 +536,13 @@ Each names a date to grep for in `ISSUE-HISTORY.md`.
   returning `[]` WITH a `signal_warning` became `dead_code_pct: 0.0` and an axis
   of 100. [[a-one-directional-check-certifies-its-blind-side]]
 - **An optimisation has a SWITCHING cost, and the intuition about it inverts
-  once the thing is cached.** 08-30: `set_tool_tier("standard")` narrowed the
-  tool block by 6.7% and cost a full-rate rewrite of the whole cached prefix --
-  **174 requests to break even, 864 with 100k of history**, against 4 for
-  `core`. ⚠⚠ **Uncached the same switch pays back immediately**, which is why a
-  surface built to save tokens shipped a control that spends them: "fewer
-  tokens is better" is true right up to the point the block is stable. **Ask
-  what a saving costs to START, not only what it saves per unit.** ⚠ A
-  *widening* is never refused — it buys a capability, and only a narrowing
-  claims to save. [[a-one-directional-check-certifies-its-blind-side]]
+  once the thing is cached.** 08-30: narrowing the tool block by 6.7% cost a
+  full-rate rewrite of the whole cached prefix — **174 requests to break even,
+  864 with 100k of history**, against 4 for `core`. ⚠⚠ Uncached the same switch
+  pays back immediately, which is how a surface built to save tokens shipped a
+  control that spends them. **Ask what a saving costs to START, not only what it
+  saves per unit.** ⚠ A *widening* is never refused.
+  [[a-one-directional-check-certifies-its-blind-side]]
 - **A reason placed in `_meta` is deleted on a default install.** 08-30:
   `meta_fields` defaults to `[]` and the dispatcher strips `_meta`, so a
   refusal's explanation would have reached most users as a bare verdict, with
@@ -574,39 +553,29 @@ Each names a date to grep for in `ISSUE-HISTORY.md`.
   [[a-module-that-imports-clean-has-been-tested-for-nothing]]
 - **A constant written for a FUTURE date is wrong for the whole interval before
   it, and looks identical to a stale one.** 09-01: the receipt priced `sonnet`
-  at $3 from 2026-06-24, the increase SCHEDULED for 2026-09-01 — cancelled the
-  day before. Sonnet 5 was never $3; the entry was wrong all 69 days, and its
-  dated comment made it look checked. ⚠⚠ **The pin agreed with it** (two literal
-  `3.0`s plus a DERIVED `"$0.09"` a name-search cannot see), so green meant
-  nothing — **re-read the SOURCE when touching a pinned table, never the other
-  copy.** ⚠ Four copies suite-wide; ours was right only in
-  `token_tracker.py`, whose key is `claude_sonnet_4_6`: **a key naming a FAMILY
+  at $3 from 2026-06-24 for an increase scheduled 2026-09-01 and cancelled the
+  day before — wrong all 69 days, with a dated comment that made it look
+  checked. ⚠⚠ The pin AGREED with it, including a derived `"$0.09"` no
+  name-search can see, so green meant nothing: **re-read the SOURCE when
+  touching a pinned table, never the other copy.** ⚠ **A key naming a FAMILY
   inherits whichever member's price someone last looked at.**
 - **A guard written against a SPELLING is fixed for that spelling only.** 09-01
-  (#566): #550 taught that `from . import receipts` depends on `receipts.py`,
-  then gated the fix on `set(specifier) == {"."}`. `from ..retrieval import
-  embed_drift` is the same dependency with the package named, and it kept
-  resolving to `__init__.py` for the whole life of the "fix" — 21 edges over 12
-  modules on our own `src/`, every one of them published by `find_dead_code` at
-  **confidence 1.0**. ⚠ The reported case and the property are different sizes;
-  #550's own comment argued the property and the code implemented the example.
-  ⚠⚠ **And the same error twice more in the fix**: the code comment's first
-  count (134) and the first repo-level ratchet (`built > 90`) both identified a
-  synthesised edge by its SHAPE — "the last segment appears in `names`" — which
-  also matches the hand-written `from .tools.index_repo import index_repo`. This
-  repo has **113** of those, already resolving, so **the ratchet passed against
-  the reintroduced defect and the number was 6x high**. Compare against the
-  import statements actually WRITTEN in the file. [[a-ratchet-can-pass-against-the-defect-it-names]]
+  (#566): #550 gated its fix on `set(specifier) == {"."}`, so the same
+  dependency with the package NAMED kept resolving to `__init__.py` and
+  `find_dead_code` published live modules as dead at confidence 1.0. ⚠ The
+  reported case and the property are different sizes. ⚠⚠ Identify a synthesised
+  edge by the import statements actually WRITTEN in the file, never by its
+  SHAPE — both the comment's count and the first ratchet did the latter, and the
+  ratchet passed against the reintroduced defect.
+  [[a-ratchet-can-pass-against-the-defect-it-names]]
 - **A fix for a false positive can install a false negative, and only the
-  non-vacuity pass sees it.** 09-01 (#569): the runtime-discovery scanner asked
-  whether `__path__` appeared in the enumeration call.
-  `pkgutil.iter_modules(schemas_pkg.__path__)` in a TEST file is ANOTHER
-  package's search path, so the test directory read as self-enumerating and
-  **502 files went live**, suppressing every real finding under `tests/` — with
-  every assertion in the new test file still green. ⚠ **Suppression has no
-  symptom**: the false positives it was written to remove were gone, which is
-  what success looks like. Ask what the fix makes INVISIBLE, and write that test
-  before the one that proves it works. [[a-set-cannot-count]]
+  non-vacuity pass sees it.** 09-01 (#569): the scanner asked whether `__path__`
+  appeared in the enumeration call, but in a TEST file that is ANOTHER package's
+  search path, so the test directory read as self-enumerating and **502 files
+  went live**, suppressing every real finding under `tests/` with every new
+  assertion still green. ⚠ **Suppression has no symptom** — the false positives
+  it removed were gone, which is what success looks like. Ask what the fix makes
+  INVISIBLE and write that test first. [[a-set-cannot-count]]
 - **Capping a report does not cap the tool that ACTS on it.** 09-01 (#566): the
   same absence claim reached `check_delete_safe` down a different branch — its
   "no refs at all" fallback returns `safe_to_delete` **regardless of** the
@@ -616,14 +585,13 @@ Each names a date to grep for in `ISSUE-HISTORY.md`.
   recommendation is the surface that matters, and it was reading a signal it
   also had permission to ignore.
 - **A number that reproduces on one box is reproducible on one box.** 09-03
-  (harness F-13): the token benchmark was deterministic on this machine AND
-  on CI and disagreed by 2.5% between them, for three causes at once — a CRLF
-  checkout, ranking ties broken by `os.walk` order (NTFS vs ext4), and a
-  `_meta` counter read from HOME. **Capture a published reference where the
-  gate runs, and diff per-row, never per-total** — the total hid one cause
-  behind another. ⚠ And `uv run --python X` REBUILDS `.venv` without the
-  extras; the fast tier ran 1055/112-skipped at exit 0 minutes later. The
-  fast tier has a skip ceiling now. [[pipes-and-missing-xdist-both-report-exit-zero]]
+  (harness F-13): the token benchmark was deterministic here AND on CI and
+  disagreed by 2.5% between them, for three causes at once — a CRLF checkout,
+  ranking ties broken by `os.walk` order, and a `_meta` counter read from HOME.
+  **Capture a published reference where the gate runs, and diff per-row, never
+  per-total** — the total hid one cause behind another. ⚠ `uv run --python X`
+  REBUILDS `.venv` without the extras; the fast tier has a skip ceiling now.
+  [[pipes-and-missing-xdist-both-report-exit-zero]]
 - **A competitor's fix list is a free defect probe.** 08-22: a rival's
   `fix(gini): measure a file's lines as its own span, not the sum of every node`
   named our defect precisely enough to confirm in one query —
@@ -631,32 +599,34 @@ Each names a date to grep for in `ISSUE-HISTORY.md`.
   byte mass 33.4% overall and up to 2.28x per file. Read their commit TITLES
   against whatever we built the same way; it is minutes, and it finds what our
   own tests were written not to see. See CHANGELOG `[Unreleased]`.
-- **A frozen version string cannot say whether a running process serves current
-  code.** 08-31 (rotated out of Current State with 1.108.313): `__version__` is
-  `importlib.metadata`, fixed at install time and never read from the tree, so
-  the source-drift verdict **false-alarmed forever on an editable install** (the
-  module IS the tree) and was **blind to the copied install**, which was the
-  actual incident. Every process on a source install reports the same number, so
-  the answer comes from `started_at` vs source mtime instead — it caught that
-  session's own server on the first run. ⚠ **Ownership and freshness are
-  different properties**: `verify_package_integrity()` asks which distribution
-  the running module came from and would certify a fourteen-release-old install.
-  [[grep-a-persisted-field-for-its-readers]]
-- **A gate's exit status is never the left side of a pipe.** 09-04
-  (inbound item 6): `python gate.py ... | tee out; rc=$?` records tee's status
-  under Actions' default `bash -e`, so every decline the pre-flight computed
-  was ignored and the model would have run. The reviewer named one site; the
-  ratchet (`test_no_pipe_hides_a_gate_exit_status`) found four more across
-  the stack. ⚠ **Its first draft matched per PHYSICAL line and stayed green
-  with the pipe back**, because the invocation and `| tee` sat on different
-  `\`-continued lines; normalise the text the way the shell does before
-  scanning it. [[a-trailing-command-hides-pytests-exit-code]]
+- **A frozen version string cannot say whether a running process serves current code.** 08-31: `__version__` is install-time metadata, so the drift verdict false-alarmed on every editable install and was blind to the copied one; `started_at` vs source mtime answers it (Key Files `install_layout.py`). Ownership and freshness are different properties. [[grep-a-persisted-field-for-its-readers]]
+- **A gate's exit status is never the left side of a pipe.** 09-04 (inbound
+  item 6): `python gate.py ... | tee out; rc=$?` records tee's status under
+  Actions' default `bash -e`, so every decline the pre-flight computed was
+  ignored. The reviewer named one site; the ratchet
+  (`test_no_pipe_hides_a_gate_exit_status`) found four more. ⚠ Its first draft
+  matched per PHYSICAL line and stayed green with the pipe back — **normalise
+  the text the way the shell does before scanning it.**
+  [[a-trailing-command-hides-pytests-exit-code]]
 - **A default argument bound at import pins the wrong repo.** 09-04 (inbound
   items 5 and 6): `def f(cwd: Path = ROOT)` captured the module's own
   checkout at `def`, so a test that patched `ROOT` to a scratch repo still
   ran git in `C:\MCPs\jcodemunch-mcp`; bit twice in one afternoon and only
   the end-to-end arm saw it. Default to `None`, resolve at call time.
   [[a-default-argument-bound-at-import-pins-the-wrong-repo]]
+- **A grammar can spell one concept as two node types, and a spec that names one
+  looks complete.** 09-15 (#698): `abstract_class_declaration` was in neither TS
+  spec, so every abstract class was absent and its methods lost their owner —
+  the Rust `qual_mismatch` rule, which had only ever been encoded as a Rust
+  benchmark. ⚠ Probe the owner POSITIVELY; a failed lookup is UNKNOWN, not proof.
+  [[a-guard-written-against-a-spelling]]
+
+- **A fixture that cannot express the reported shape cannot fail on it.** 09-15
+  (#699): the exact-match cut passed its whole suite while the corpus that
+  reported the defect returned byte-identical output, because the fixture held
+  only one of the two crowding shapes. ⚠⚠ **Re-run the reported corpus through
+  the product before calling a fix done.**
+  [[a-fixture-that-cannot-express-the-reported-shape-cannot-fail-on-it]]
 
 ## Issue + release policy (2026-07-28)
 
@@ -969,6 +939,12 @@ and exits 0. [[pipes-and-missing-xdist-both-report-exit-zero]]
    file, where **Key Files was 40.1% (55,643 chars)** and the issue/release
    policy 15.4%. Rotating what I proposed would have recovered almost nothing.
    Split by heading and sort by size first; it is one script and it settles it.
+   ⚠⚠ **REVERSED 2026-09-16 on a re-measurement, and the reason is arithmetic:
+   Standing lessons was 6.4% when that call was made and is 13.0% now, while Key
+   Files has not moved.** The 2026-09-16 pass rotated the dated INCIDENT PROSE
+   out of its twelve newest entries and kept every rule, date and marker --
+   9,312 chars to 7,193. **The section is still not a split candidate**; nothing
+   derives a standing lesson, which is why it stays in the loaded file.
    ⚠ **Key Files at 40% is the NEXT rotation target and the hardest**, because
    it is also the most load-bearing — the per-file ⚠⚠ warnings are what stop a
    defect recurring. Rotate its dated INCIDENT prose, never its rules.

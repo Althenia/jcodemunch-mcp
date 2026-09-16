@@ -3,7 +3,7 @@
 Tectonic Analysis fuses three independent coupling signals — structural
 (import edges), behavioral (shared symbol references), and temporal
 (git co-churn) — into a single weighted file graph, then partitions it
-via label propagation to reveal the *actual* module boundaries hiding
+via Louvain modularity clustering (#668) to reveal the *actual* module boundaries hiding
 inside the codebase.
 
 Every discovered plate includes:
@@ -25,13 +25,13 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 import subprocess
 import time
 from collections import defaultdict
 from typing import Optional
 
 from ..storage import IndexStore
+from ._git_history import churn_is_measurable, history_coverage
 from ._utils import resolve_repo
 from .get_dependency_graph import _build_adjacency
 
@@ -107,17 +107,33 @@ def _temporal_edges(source_root: str, source_files: frozenset, days: int = 90) -
 
     Uses a single `git log --name-only` pass, then counts co-occurrence
     per commit for all file pairs.
+
+    ⚠⚠ (#667) `--format=format:COMMIT_SEP`, never `--format=COMMIT_SEP`: git
+    reads a bare `--format=` value as a pretty-format NAME unless it holds a
+    `%` placeholder, answered `fatal: invalid --pretty format`, and this
+    signal returned `{}` on every repository from the tool's first commit.
+    ⚠ `--relative`: `--name-only` prints paths from the git TOP LEVEL, the
+    index holds them from `source_root`, and an index rooted in a
+    subdirectory would miss every name and return `{}` by a second route.
+    ⚠ A non-zero git is a WARNING with git's stderr: a silent `{}` reads
+    exactly like a repository with no co-changes.
     """
     try:
         r = subprocess.run(
-            ["git", "log", f"--since={days} days ago", "--name-only", "--format=COMMIT_SEP"],
+            ["git", "log", f"--since={days} days ago", "--relative", "--name-only", "--format=format:COMMIT_SEP"],
             cwd=source_root, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=60, stdin=subprocess.DEVNULL,
         )
-        if r.returncode != 0 or not r.stdout.strip():
+        if r.returncode != 0:
+            logger.warning(
+                "tectonic temporal signal unavailable: git log exited %s in %s: %s",
+                r.returncode, source_root, (r.stderr or "").strip()[:500],
+            )
+            return {}
+        if not r.stdout.strip():
             return {}
     except Exception:
-        logger.debug("git co-churn extraction failed", exc_info=True)
+        logger.warning("tectonic temporal signal unavailable: git co-churn extraction failed", exc_info=True)
         return {}
 
     # Parse commits: split on COMMIT_SEP, extract file sets per commit
@@ -171,67 +187,84 @@ def _fuse_signals(
 
 
 # ---------------------------------------------------------------------------
-# Label propagation (community detection)
+# Community detection: Louvain (modularity), deterministic
 # ---------------------------------------------------------------------------
 
-def _label_propagation(
+def _partition(
     nodes: list[str],
     edges: dict[tuple[str, str], float],
-    max_iterations: int = 50,
-    seed: int = 42,
+    resolution: float = 1.0,
+    max_levels: int = 20,
+    max_passes: int = 50,
 ) -> dict[str, int]:
-    """Weighted label propagation. Returns {node: community_id}.
+    """Weighted Louvain (Blondel et al., 2008). Returns {node: community_id}.
 
-    Each node starts with its own label. On each iteration, every node
-    adopts the label with the highest total edge weight among its neighbors.
-    Ties broken randomly. Converges when no node changes label.
+    ⚠⚠ (#668) This replaced label propagation, which adopts the heaviest
+    neighbouring label and so floods a graph through a HUB: a file every
+    module imports links every module to every other. On most of the local
+    corpora it was measured on, one plate held a majority of the graph, and on
+    some all of it (the table is in CHANGELOG and #668; no count is copied here). Louvain moves a node only when it
+    raises modularity, which charges a community for the total degree it
+    absorbs, so a hub cannot pull the modules into one plate.
+    ⚠ Deterministic without a seed: nodes and candidate communities are
+    visited in sorted order, so the same graph gives the same plates in any
+    input order and under any PYTHONHASHSEED. Label propagation's seeded RNG
+    did not make it so: the fused edge dict's order follows string hashing,
+    and one corpus's largest plate moved between runs of the same index.
     """
-    rng = random.Random(seed)
-
-    # Build adjacency with weights
-    adj: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    adj: dict[str, dict[str, float]] = {n: defaultdict(float) for n in nodes}
     for (a, b), w in edges.items():
-        adj[a].append((b, w))
-        adj[b].append((a, w))
-
-    # Initialize: each node gets a unique label
-    labels: dict[str, int] = {n: i for i, n in enumerate(nodes)}
-
-    for _iteration in range(max_iterations):
-        changed = False
-        # Process nodes in random order for stability
-        order = list(nodes)
-        rng.shuffle(order)
-
-        for node in order:
-            neighbors = adj.get(node)
-            if not neighbors:
-                continue
-
-            # Accumulate weight per label
-            label_weights: dict[int, float] = defaultdict(float)
-            for neighbor, weight in neighbors:
-                label_weights[labels[neighbor]] += weight
-
-            if not label_weights:
-                continue
-
-            max_weight = max(label_weights.values())
-            # Collect all labels tied at max weight
-            candidates = [lbl for lbl, w in label_weights.items() if w == max_weight]
-            chosen = rng.choice(candidates)
-
-            if chosen != labels[node]:
-                labels[node] = chosen
-                changed = True
-
-        if not changed:
+        adj.setdefault(a, defaultdict(float))
+        adj.setdefault(b, defaultdict(float))
+        if a == b:
+            adj[a][a] += w
+        else:
+            adj[a][b] += w
+            adj[b][a] += w
+    member: dict[str, str] = {n: n for n in adj}  # original node -> supernode
+    for _level in range(max_levels):
+        m2 = sum(sum(nb.values()) for nb in adj.values())
+        if m2 <= 0:
             break
-
-    # Renumber labels to 0..N-1
-    unique_labels = sorted(set(labels.values()))
-    remap = {old: new for new, old in enumerate(unique_labels)}
-    return {n: remap[lbl] for n, lbl in labels.items()}
+        degree = {n: sum(nb.values()) for n, nb in adj.items()}
+        comm = {n: n for n in adj}
+        total = dict(degree)
+        moved_any = False
+        for _pass in range(max_passes):
+            moved = 0
+            for n in sorted(adj):
+                current = comm[n]
+                links: dict[str, float] = defaultdict(float)
+                for nb, w in adj[n].items():
+                    if nb != n:
+                        links[comm[nb]] += w
+                total[current] -= degree[n]
+                best = current
+                best_gain = links.get(current, 0.0) - resolution * total[current] * degree[n] / m2
+                for c in sorted(links):
+                    gain = links[c] - resolution * total[c] * degree[n] / m2
+                    if gain > best_gain + 1e-12:
+                        best, best_gain = c, gain
+                total[best] = total.get(best, 0.0) + degree[n]
+                if best != current:
+                    comm[n] = best
+                    moved += 1
+            if not moved:
+                break
+            moved_any = True
+        if not moved_any:
+            break
+        aggregated: dict[str, dict[str, float]] = {}
+        for n, nb in adj.items():
+            row = aggregated.setdefault(comm[n], defaultdict(float))
+            for other, w in nb.items():
+                row[comm[other]] += w
+        member = {orig: comm[sup] for orig, sup in member.items()}
+        if len(aggregated) == len(adj):
+            break
+        adj = aggregated
+    ids = {c: i for i, c in enumerate(sorted(set(member.values())))}
+    return {n: ids[member[n]] for n in nodes}
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +399,7 @@ def get_tectonic_map(
 
     Fuses three coupling signals — structural (imports), behavioral
     (shared symbol references), and temporal (git co-churn) — then
-    partitions the weighted file graph via label propagation.
+    partitions the weighted file graph by Louvain modularity clustering.
 
     Args:
         repo:            Repository identifier (owner/repo or bare name).
@@ -394,6 +427,7 @@ def get_tectonic_map(
           }],
           "isolated_files": [str],     # files below min_plate_size
           "signals_used": [str],       # which signals contributed
+          "signals_withheld": {name: {reason, ...}},  # only when a signal could not be trusted (#667)
           "drifter_summary": [{        # top misplaced files across all plates
             "file": str,
             "current_directory": str,
@@ -426,6 +460,7 @@ def get_tectonic_map(
 
     # --- Build the three signals ---
     signals_used = []
+    signals_withheld: dict[str, dict] = {}
 
     # 1. Structural (always available if imports exist)
     fwd = _build_adjacency(index.imports, source_files, alias_map, psr4_map)
@@ -448,9 +483,18 @@ def get_tectonic_map(
                 timeout=5, stdin=subprocess.DEVNULL,
             )
             if r.returncode == 0:
-                temporal = _temporal_edges(index.source_root, source_files, days)
-                if temporal:
-                    signals_used.append("temporal")
+                # ⚠⚠ Ask the authority whether the window is covered BEFORE
+                # trusting it. Each signal is normalised against its own
+                # maximum, so a shallow clone would not weaken co-churn, it
+                # would RESCALE it: one co-change in three commits scores 1.0
+                # like four hundred in full history. Withheld and NAMED in the
+                # answer (never `_meta`, which a default install strips).
+                if churn_is_measurable(index.source_root, days):
+                    temporal = _temporal_edges(index.source_root, source_files, days)
+                    if temporal:
+                        signals_used.append("temporal")
+                else:
+                    signals_withheld["temporal"] = history_coverage(index.source_root, days)
         except Exception:
             logger.debug("git availability check failed for tectonic", exc_info=True)
 
@@ -478,15 +522,16 @@ def get_tectonic_map(
             "plates": [],
             "isolated_files": sorted(source_files),
             "signals_used": signals_used,
+            **({"signals_withheld": signals_withheld} if signals_withheld else {}),
             "drifter_summary": [],
             "_meta": {
                 "timing_ms": round((time.perf_counter() - t0) * 1000, 1),
-                "methodology": "tectonic_label_propagation",
+                "methodology": "tectonic_louvain",
             },
         }
 
-    # --- Label propagation ---
-    labels = _label_propagation(active_nodes, fused)
+    # --- Community detection (Louvain, #668) ---
+    labels = _partition(active_nodes, fused)
 
     # --- Analyze plates ---
     raw_plates = _analyze_plates(labels, fused, fwd)
@@ -550,10 +595,11 @@ def get_tectonic_map(
         "plates": plates,
         "isolated_files": isolated,
         "signals_used": signals_used,
+        **({"signals_withheld": signals_withheld} if signals_withheld else {}),
         "drifter_summary": drifter_summary[:30],  # cap for readability
         "_meta": {
             "timing_ms": round(elapsed, 1),
-            "methodology": "tectonic_label_propagation",
+            "methodology": "tectonic_louvain",
             "signal_weights": {
                 "structural": W_STRUCTURAL,
                 "behavioral": W_BEHAVIORAL,
@@ -561,6 +607,5 @@ def get_tectonic_map(
             },
             "active_files": len(active_nodes),
             "edge_count": len(fused),
-            "label_propagation_seed": 42,
         },
     }

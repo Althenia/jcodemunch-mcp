@@ -2,6 +2,607 @@
 
 ## [Unreleased]
 
+## [1.108.319] - 2026-09-16 - the numbers a competitor published about us were right, and so was the refusal we had shipped over twice
+
+### Fixed - the published benchmark tables are derived from the reference, not from three different runs (W-16)
+
+`/release` step 4 recomputes every published figure and refuses on a
+disagreement. It refused three consecutive releases on the same thing, and the
+first two shipped over it — which is how a refusal becomes ceremony.
+
+The disagreement was real and larger than it had been recorded. Three artifacts
+carried a per-repo jCodeMunch column for one run:
+
+| source | express | fastapi | gin | grand |
+|---|---|---|---|---|
+| `benchmarks/jcm_reference.json` (CI-captured) | 1,007 | 2,149 | 1,537 | 23,467 |
+| `README.md` | 1,017 | 2,218 | 1,573 | 23,467 |
+| `benchmarks/README.md` | 1,002 | 2,271 | 1,577 | **24,249** |
+
+That they describe one run is not an assumption: the reference's per-repo totals
+sum to 23,467, the grand total both files already printed. The rows were never
+regenerated when the reference was recaptured on 2026-09-03.
+
+⚠⚠ **`tests/test_provenance.py` gated the grand total and nothing gated the
+rows.** So the total stayed correct in both files while three sets of per-repo
+numbers drifted underneath it, and the ratchet was green throughout. A guard over
+the figure everyone remembers to update cannot see the figures they forget —
+**gate the cells the reader actually reads.**
+
+Every cell is now computed from `benchmarks/jcm_reference.json`, and
+`tests/test_benchmark_tables_mirror_the_reference.py` fails if either table
+drifts again: the per-repo average against the artifact, the `vs read-all` ratio
+against the published average (so a reader dividing two printed cells gets the
+printed ratio), and the identity that the rows sum to the total.
+
+⚠ The corrected numbers move slightly **in our favour** (15.5x → 15.6x, 38.4x →
+39.7x, 20.3x → 20.8x), which is worth stating plainly: the stale rows were
+under-claiming, so this is not a flattering correction arriving under cover of a
+process fix.
+
+⚠ The per-query spread each file published — 7.3x-79.8x in one, 7.6x-81.2x in the
+other — is derivable from nothing committed, because the reference records totals
+and averages only. It is withheld rather than picked, until
+`run_benchmark.py --reference` records per-query figures.
+
+### Fixed - an exact-name match is no longer evicted from the result page by a same-named local (#699)
+
+`search_symbols` cuts to `max_results` with a bounded heap keyed on BM25 alone,
+so eviction could not tell an exact-name match from a lexical near-miss, or a
+real definition from a local that happens to share the name. Where a name has
+more exact matches than the cap, ranking alone decided which survived — and the
+ones that lost did not appear at a lower rank, they did not appear at all.
+
+Two reproductions, and they do not share a discriminator. On zod, `partial`
+returns ranks 1-4 as real definitions and ranks 5-10 as six `constant` rows in
+test files, pushing `v4/mini/schemas.ts::partial` out; kind separates that one.
+On this repository, `run` returns ten rows that are all `#function`, every one a
+helper nested inside a test function, while `tools/refresh.py::run` and
+`watcher.py::WatcherManager.run` are absent; kind separates nothing there.
+
+The property both share is neither kind nor path: a crowder is declared inside a
+function body and is a local by construction, while a real answer is
+module-level or owned by a type. A path rule would have demoted a genuine
+`ZodObject.partial` declared in a fixture, and a nesting-depth rule would have
+demoted it too. The heap key is now `(declaration rank, score)`, and the final
+sort reads the same key — a row that survives the cut under one rule and is then
+ordered under another ranks below rows it outranked to get there. Locals are
+demoted, never filtered: they remain legitimate answers to "where is this name".
+
+⚠⚠ **The rank has two conditions and each alone leaves half the defect live.**
+A declaring KIND separates zod's case: its crowders are `const partial = ...`
+rows that the TypeScript extractor records with no owner path, so the index sees
+module-level constants and an owner probe scores them exactly like a real method.
+A function-OWNER probe separates this repository's case: `run`'s crowders are
+helpers nested in test functions, all of kind `function`, so kind separates
+nothing. A first draft shipped with the owner probe alone, passed its own tests,
+and left the reported case byte-for-byte unchanged — the fixture had no
+module-level-constant shape in it. Both conditions ship, and both shapes are in
+the fixture now.
+
+⚠ The owner is probed **positively** for being a function, and an owner that
+cannot be resolved is not demoted. Asking the opposite — is the owner a class or
+struct? — reads a failed lookup as proof of a function body, and a Rust `impl`
+block puts the type in another file, so a real method would have been demoted
+below a same-named local in exactly the languages this was not measured against
+(C++ `.cpp`/`.h`, C# partial classes, Swift extensions and Ruby reopened classes
+are the same shape). UNKNOWN is a third bucket, never False.
+
+⚠⚠ **The tool caps its page in three places, and all three now read the same
+rule**: the lexical heap, the similarity sort behind `semantic=True`, and the
+fused sort behind `fusion=True`. Fixing only the heap would have left one tool
+answering the same query two incompatible ways depending on a flag. A source
+ratchet asserts every cut site consults the rank, so a fourth exit inherits it.
+
+Two consequences worth stating rather than discovering. `sort_by="centrality"`
+and `"combined"` now rank an exact-name match above everything else before
+PageRank is consulted; that is the point of the change, and it is a semantics
+change to two documented sort modes. And `_meta.verdict.best_score` is still the
+best score seen during the scan — unchanged — but `results[0]` is no longer
+necessarily the row carrying it, because a promoted definition can sit above a
+higher-scoring local.
+
+The cut is deliberately **not** gated on `is_identifier_query`, which the
+`_meta.exact_match` report is. That gate refuses a single lower-case word with
+no underscore, which is right for deciding whether to attach a report and wrong
+for deciding what to keep: `partial`, `pick` and `run` are all that shape, so a
+cut inheriting the gate would be unfixed for every case that reported the defect.
+
+`_meta.exact_match.exact` was the second reader of the same cut. It counted the
+rows that survived, so a query with 38 exact matches reported `exact: 9` and read
+as complete — #559's rule ("a count taken after the page is cut describes the
+page") in the one place #559's own ratchet did not reach, because its `_CASES`
+roster is a hand-kept literal of four tools. The count is taken during scoring
+now, with `exact_returned` and `exact_truncated` beside it, and `search_symbols`
+has been added to that roster so the property ratchet covers the pair.
+
+⚠ The report stays gated on `is_identifier_query` while the cut does not, so
+`exact_truncated` is attached to `get_user_id` and never to `run`. The visibility
+half therefore does not reach the four names that reported the defect; the
+correctness half does. Ungating the report is a separate judgment about noise on
+prose searches and is not made here.
+
+One older ratchet had to be restated rather than satisfied.
+`test_v1_108_228.py::test_the_semantic_sort_uses_a_total_order` pinned the
+literal string `scored.sort(key=lambda x: (-x[0], x[1]["id"]))`, and adding a
+leading rank component failed it while leaving its invariant — ties broken on the
+symbol id, so the numpy float32 and Python float64 lanes cannot disagree at rank
+0 — entirely intact. It stated the mechanism instead of the outcome (Practice 9).
+It now asserts that the key ends in the symbol id and orders score descending,
+which passes with a further component added and still fails when the id tiebreak
+is removed; that was verified by removing it.
+
+What is impossible now: a cut that silently drops the symbol a caller named, on
+any of the three exits.
+
+Found by the benchmark in
+[amritessh/scalpel-fse2027-artifact](https://github.com/amritessh/scalpel-fse2027-artifact),
+which traced it to `partial`/`pick`/`ZodType` on zod and named the mechanism —
+ranked-and-capped retrieval dropping answers an unranked exact lookup returns
+unconditionally.
+### Fixed - TypeScript and TSX index `abstract class`, and its methods keep their owner (#698)
+
+tree-sitter-typescript gives `abstract class X` its own node type rather than a
+modifier on `class_declaration`, and neither `TYPESCRIPT_SPEC` nor `TSX_SPEC`
+named it. Every abstract class in a `.ts` or `.tsx` file was therefore absent
+from the index, while every concrete class in the same file indexed normally —
+so the symbol a caller most wants, the base class where a hierarchy declares its
+API, was the one that could not be found.
+
+`container_node_types` omitted it too, which is the half with the wider reach.
+The methods inside an abstract class were still extracted, attributed to nobody:
+the id came back as `<file>::parse#method` instead of
+`<file>::ZodType.parse#method`. That is the `qual_mismatch` rule the Rust
+fidelity harness already enforces one language over — the owner is the declaring
+type — encoded there as a benchmark rather than as a property, so TypeScript
+inherited none of it.
+
+Asking the grammar rather than guessing turned up a second node in the same
+family: an abstract member parses as `abstract_method_signature`, so the base
+class's declared contract extracted as nothing while its concrete siblings
+extracted normally. Both nodes are now mapped in both specs. `export`, `declare`
+and `default` are wrappers around the declaration and need no entries of their
+own; all four spellings are parsed in the tests, because "the wrapper does not
+matter" is a claim about the grammar and a wrapper that did hide the declaration
+would look exactly like this fix being complete.
+
+A third reader had to move with it. `_detect_interface_keywords` tags a class
+`abstract` for dispatch resolution by scanning for an `abstract` **modifier**,
+which is how Java and C# spell it — TypeScript spells it as the node type, so
+that scan returned `[]` on a class that plainly is one. Fixing only the spec
+would have made the symbol newly findable and newly mislabelled:
+`abstract class B {}` now yields `keywords=['abstract']` in TypeScript, matching
+Java's long-standing answer for the same declaration.
+
+Measured on zod at `e359f7378fe56d695134701cda1e9055a08892dc`, over the files
+that contain an abstract class:
+
+| measure | before | after |
+|---|---|---|
+| abstract classes found as kind=class | 0 | 7 |
+| methods with no owner in the id | 52 | 13 |
+| symbols extracted from those files | 968 | 977 |
+
+The 13 that remain are not residual defect: three are accessors (`get error()`,
+`get with()`, `set with()`) and ten are methods declared inside an object
+literal, which zod v4 mini uses to build per-instance method bags. Neither has a
+class owner to lose.
+
+What is impossible now: a TypeScript-family spec that knows `class_declaration`
+and not `abstract_class_declaration`. The guard is stated over the property, not
+over the two specs that exist today, so a third one inherits the rule instead of
+reintroducing the defect. Its reach is bounded, and the bound is worth naming:
+the ratchet iterates `LANGUAGE_REGISTRY`, so it cannot see the hand-rolled Vue
+and Svelte `<script>` walkers in `extractor.py`, which match `class_declaration`
+only and still miss an abstract class inside a single-file component. That is
+pre-existing and tracked separately.
+
+Interface members (`method_signature`) remain unindexed on purpose. An interface
+is type structure rather than a class body, and indexing it would move the
+symbol count of every TypeScript repository on a judgment call that needs its own
+measurement.
+
+Found by the benchmark in
+[amritessh/scalpel-fse2027-artifact](https://github.com/amritessh/scalpel-fse2027-artifact),
+which hit the same defect in its own indexer, traced it to zod's `ZodType`, and
+fixed it there first.
+
+### Fixed - get_tectonic_map finds modules instead of one plate that is most of the repository (#668)
+
+`get_tectonic_map` partitioned the fused file graph with label propagation,
+which adopts the heaviest neighbouring label. A hub file that every module
+imports links every module to every other, so one label flooded the graph:
+on this repository the largest plate held 772 of 1,139 indexed files at
+cohesion 0.0024 (#668), and #667's temporal signal made it larger, not
+smaller. The
+partition was also not stable. Its seeded RNG did not fix the order of the
+fused edges, which follows string hashing, so the same index gave a
+different largest plate under a different `PYTHONHASHSEED`.
+
+The partition is now Louvain modularity clustering, deterministic (sorted
+visiting order, no RNG) and pure Python. Measured on the fused graphs of
+seven local indexes, main's label propagation against this branch (a plate's
+share is out of the files in the fused graph, not of all indexed files):
+
+| corpus | files in graph | main: largest plate | main: modularity | branch: largest plate | branch: modularity | branch ms |
+|---|---|---|---|---|---|---|
+| local/jcodemunch-mcp-0394b683 | 958 | 811 (84.7%) | 0.137 | 183 (19.1%) | 0.459 | 59 |
+| local/nestjs-nest-d3d8a6be | 1668 | 1612 (96.6%) | 0.007 | 575 (34.5%) | 0.285 | 356 |
+| fastapi/fastapi | 969 | 556 (57.4%) | 0.358 | 280 (28.9%) | 0.475 | 27 |
+| local/jdocmunch-mcp-6bc87e58 | 330 | 192 (58.2%) | 0.249 | 77 (23.3%) | 0.403 | 16 |
+| local/authlib-cc94e0b7 | 301 | 301 (100.0%) | -0.000 | 64 (21.3%) | 0.421 | 20 |
+| local/jdatamunch-mcp-a1bb3bdc | 184 | 184 (100.0%) | -0.000 | 51 (27.7%) | 0.361 | 9 |
+| expressjs/express | 99 | 42 (42.4%) | 0.468 | 27 (27.3%) | 0.566 | 2 |
+
+Everything downstream of the plates changes with them: anchors, cohesion,
+drifters, nexus alerts, and the plates `assemble_task_context` puts in a
+task capsule. `_meta.methodology` reads `tectonic_louvain`, and
+`_meta.label_propagation_seed` is gone.
+
+### Fixed - git's changed paths match the index when it is rooted below the git top level (#685)
+
+`git log --name-only`, `git diff --name-only` and `git status --porcelain`
+print paths from the git top level. `index_folder(..., identity_mode="local")`
+on a folder below it roots the index at that folder, with folder-relative
+paths, so every name git printed missed. `get_hotspots` scored a file changed
+four times as churn 0, which reads as a cold file rather than an error;
+`winnow_symbols`' churn axis did the same; `get_delivery_metrics` counted
+files outside the index root, and (once paths were relative) listed commits
+that changed nothing under it with an empty file set, which can never be
+reworked and so raised `durable_rate`: it now reads only commits under the
+root (`-- .`), so `commits_total` for a sub-rooted index counts that corpus's
+commits, not the monorepo's; the git-blame context provider attached
+nothing; `get_changed_symbols` reported symbols under paths the index does
+not hold. The working-tree guard behind absence claims failed the other way:
+every dirty path read as unindexed, so an uncommitted file anywhere in the
+monorepo refused absence claims for a corpus that was current.
+
+#667 fixed this in `get_tectonic_map` alone. The issue named four readers; a
+test over the property found five `--name-only` calls without `--relative`,
+and a search for other path-printing git calls found the porcelain probe,
+which `--relative` cannot fix (it scopes to `-- .` and strips the prefix
+`git rev-parse --show-prefix` reports). A failing `git log` in the two churn
+readers is now a WARNING instead of reading as no churn; a repository with no
+commits yet stays silent, because no churn is the right answer there. The test scans `src/`,
+so a new `--name-only` call without `--relative` fails it.
+
+### Changed - the inbound jobs that bill the model have their own switch, and it is off
+
+The inbound layer had one switch, `INBOUND_ENABLED`. It covered jobs that
+cost nothing (intake labels, the stale sweep, the digest's numbers) and
+four that call the model through the owner's Anthropic API key: triage,
+the digest's paragraph, fix and dependency evaluation. Two of them, triage
+and the digest's paragraph, spent $22.14 between 2026-09-07 and 2026-09-12
+that nobody saw, because no audit record carries a cost and the daily
+ceiling counts runs. $13.36 of it was 20 triage runs on #625 on 2026-09-07.
+Turning the switch off to stop the spend also stopped the free jobs.
+
+A second variable, `INBOUND_MODEL_ENABLED`, now gates the part that bills.
+The gate job in front of every model job reads it with the same
+exact-`true` rule, so absent is off, and a model job starts only when both
+switches read `true`. The digest posts its numbers without a paragraph
+when the model switch is off. A test fails any `claude-code-action` job
+whose gate does not feed that read into the output it starts from; against
+`main`'s four workflows it finds one offender each. The owner's ruling is
+that the model switch stays off and issues are triaged by hand.
+
+### Fixed - the inbound digest reports a kill-switch flip only when the switch moved (#690)
+
+The W37 digest (#687) listed 12 kill-switch flips in one week. The switch
+never moved. Every job writes its audit record through `ledger.py write
+--field k=v`, which parses each value as JSON. The shell writers pass a bare
+`kill_switch_state=true`, stored as a boolean; the inline-Python writers pass
+`json.dumps("true")`, stored as a string. The digest compared consecutive
+records with `!=`, and a boolean never equals a string. `item` had the same
+split. The September ledger holds 23 boolean and 53 string switch states, and
+13 integer and 70 string items.
+
+`make_record` now stores both fields as text however the workflow quoted
+them, and the digest reads older switch states through the same helper, so the
+history on the ledger branch needs no rewrite. Replaying that ledger, the
+week reads 71 records and 12 flips through the old digest and 0 through the
+new one. A real flip written in either spelling is still reported. The gate
+was never affected: `killswitch.enabled()` reads the repository variable,
+not the ledger.
+
+### Fixed - `get_tectonic_map`'s git co-churn signal runs, and says when it cannot be trusted (#667)
+
+`get_tectonic_map` documents three fused coupling signals and gives git
+co-churn 30% of the weight. That signal had produced no edges on any
+repository since the tool shipped. It ran `git log --format=COMMIT_SEP`, and
+git reads a bare `--format=` value as the NAME of a pretty format. On this
+repository the call exits 128 with `fatal: invalid --pretty format:
+COMMIT_SEP`. The non-zero branch returned an empty signal and logged nothing,
+so `signals_used` quietly listed two signals. Every test that mentioned
+`"temporal"` handed a hand-written fixture to an encoder, and the producer's
+own test asserted only `"structural"`, which an empty signal satisfies.
+
+The call now uses `--format=format:COMMIT_SEP`. It also passes `--relative`,
+because `--name-only` prints paths from the git top level while the index
+holds them from its own root. Without it, an index rooted in a subdirectory
+would miss every name and lose the signal by a second route. A failing git
+is logged at WARNING with its stderr. On this repository, over 90 days, the
+signal now yields 4655 edges, and `signals_used` lists all three.
+
+A working signal makes a shallow clone matter. Each signal is normalised
+against its own maximum, so a truncated history would rescale co-churn, not
+weaken it: a pair that co-changed once in a three-commit history would score
+the same 1.0 as one that co-changed hundreds of times in the full history. The
+tool asks `churn_is_measurable` first. When the window isn't covered, it
+withholds the signal and names the reason in a new `signals_withheld` field
+in the answer, not in `_meta`, which a default install strips. The field
+survives the compact encoding. A ratchet now fails any git call under `src/`
+that passes a `--format=` or `--pretty=` literal git would read as a name.
+
+### Changed - a credential makes an inbound item `security` when it is exposed, not when it is named
+
+The inbound intake scan labels an item `inbound:security` + `needs-human`
+before any model reads it. Its credential clause was a word list:
+`credential`, `token`, `secret`, `api key`, `private key` or `key material`
+anywhere in the text. Over every issue in this repository (321) it fired on
+75. The bare words `token` and `tokens` matched in 50 of those, and were the
+only match in 42, in a project where a token is usually the LLM unit. It labelled #670 security 13 seconds after filing,
+for describing a defect that involves no credential at all. Owner ruling,
+2026-09-13: "mentioning credentials is fine; exposing them is not."
+
+POLICY section 1 rule 1 now says a credential is exposed when a token, key
+or password VALUE appears in the item, or when the item says a credential
+was leaked, logged, printed, committed, shipped, returned or otherwise made
+readable. `.github/inbound/scan.py` matches exactly that: secret-shaped
+values (GitHub, Anthropic, OpenAI, AWS, PyPI and Slack token forms, a PEM
+private-key header, a long `key = value` assignment), or a credential noun
+within four words of an exposure verb or state, in either order. A negation
+inside that span breaks the match ("stores nothing about secrets", "the token
+cannot leak"), while "not only leaked" and a negated safeguard ("the api key
+wasn't redacted and is in the log") do not. After the credential, an aside in
+commas, parentheses or dashes does not break it either ("my api key (the prod
+one) was leaked"). After a verb a comma does, because there it crosses a
+clause: allowing it there flagged #76, #167, #371 and #489, which only mention
+secrets. A negation just before the verb cancels too ("should not log the api
+key", "cannot contain secrets"), read from the same negation list as the gap,
+with only an auxiliary or adverb between ("I cannot believe it leaked my api
+key" still counts).
+"contains" and "shows" count with an owner or a realness word ("shows
+the user's real api key"), or an article before a credential named by kind
+("the wheel contains the .env file"), never before a UI word ("shows the API
+key field"). A bare `token` counts only
+beside a strong exposure word ("pasted my token", "the token is logged") and
+never before an LLM-unit word ("token count"). `Authorization: Bearer`
+values, short `password=` values (not code such as `Path.cwd()`), `*_access_key =` assignments and PGP, npm,
+Hugging Face, Google and temporary-AWS key forms are values too. Every
+repetition is bounded: the scan runs in CI on untrusted text, and the
+first draft of these patterns took 205.53 s on "secret" repeated to 6,000
+characters; the bounded patterns scanned a 600,000-character adversarial
+input in 1.10 s, and the test file checks that twenty adversarial shapes
+grow linearly: four times the text in under ten times the time, measured in
+one process so a loaded CI runner slows both sides alike. Over the same corpus
+it flags 20. Every security-shaped report the audit lists that the word list
+caught is still caught (#444, #448, #508, #509). The other rule-1 triggers
+(vulnerability, exploit, CVE, traversal, cross-repo, arbitrary write, data
+exposure, redaction failure) are untouched.
+
+⚠ The trade-off, accepted with the ruling: a disclosure written only in
+plain words with no credential noun ("the key is in the log") no longer
+trips the scan, and neither does one with more than four words between the
+credential and its exposure (a five-word window flagged mention-only
+sentences). The triage model still reads rule 1.
+
+### Fixed - a triage result the model cannot produce is escalated, not retried forever (#670)
+
+When the inbound triage model failed, `apply_triage.py` planned exactly the
+right response (`inbound:unknown` + `needs-human`, remove `inbound:queued`)
+and then threw it away: it learned WHICH issue to write to from the model's
+own JSON, which is the one fact missing when the model has failed, so the
+except branch set the target to `None` and `apply` never ran. The job
+reported success, no label moved, and the issue was re-triaged every 15
+minutes. Observed as 14 consecutive `inbound triage` failures on two issues
+(runs 34707967479 to 34719256359, recorded in #670), against POLICY 6.4's
+"the job that escalated it does not run again on it". Reported by
+@jgravelle.
+
+The test for that branch asserted the defect as intent:
+`test_malformed_result_file_escalates_and_applies_nothing` required
+`called == []`. Two rules had been collapsed into one. The model's
+CLASSIFICATION must never reach `gh` on a malformed result, which stays
+true. The escalation is not the model's classification: it is our fixed
+response to the model failing and carries nothing it said.
+
+The workflow now passes the issue it is processing as a required
+`--issue`, and that is the only write target, the duplicate-link comment
+included. A model result naming a different issue is itself malformed and
+escalates the named one, without echoing the model's value into the public
+Actions log. The escalation now fires for ANY exception while reading,
+planning or drafting, not a list of them: the first version of this fix
+caught three exception types, and review found four inputs that escaped
+it and kept the loop. Those were an unhashable category, a non-string draft,
+invalid UTF-8 and deeply nested JSON. The witness test is retired in
+`harness/retired.json`. Its replacement asserts the two exact `gh` calls the
+escalation makes and that no model-derived label is among them. A ratchet
+over every `apply_*.py` on disk asserts that each takes a required
+`--issue`/`--pr` and passes it to every call in `main` that writes through
+`gh`. `apply_depeval.py` always did; triage was the one that diverged.
+`tests/test_retirement_ledger.py` now also accepts a `file::test_name` entry
+and fails if that function is defined again.
+
+⚠ The first red run of the new tests reached the real `gh` with the
+developer's credentials: `test_the_issue_argument_is_required` did not stub
+it, and on the pre-fix script `main` applied to the placeholder repository
+`o/r`, and `gh` answered "Could not resolve to a Repository with the name
+'o/r'" and exited 1, so nothing was written. Every test in the file now runs
+under an autouse stub that fails on an unstubbed `gh` call.
+
+⚠ Not fixed here, and named in #670 as separate: what makes `classify`
+fail (a rejection before any token is spent), and a retry ceiling for any
+future failure that leaves `inbound:queued` in place.
+
+### Fixed - committing a tree no longer invalidates the full-tier stamp taken on it (#675)
+
+`pre_pr` refuses `gh pr create` unless the full tier passed on THIS tree,
+and the stamp names the tree by `_common.tree_id()`. That id hashed
+`git ls-tree HEAD` plus `git diff HEAD` plus the untracked listing, and a
+commit moves a change from the second string into the first: the same
+content, two different strings, a different hash. So the natural order
+(run the tier, commit, open the PR) was refused on a clean working tree
+and paid for a second full tier (218.14 s on #673, as recorded in #675)
+for a result it already had. The docstring had claimed the opposite since W-21, which was
+marked FIXED having implemented only its other half (docs-only commits);
+no test ever ran the sentence.
+
+The id now names content. The working copy under the stamp paths is
+staged into a throwaway index and written as a git tree, so a
+modification, a new file and a deletion each read the same before and
+after they are committed, staged or not, in a worktree too; untracked
+files still count and the real index is never written (git does store
+unreferenced objects for uncommitted content, which `gc` collects). A git
+failure yields an id no stamp can match, so two failed reads cannot
+certify each other, and it names its cause instead of reading as a tree
+that moved during the run.
+
+⚠ The first draft of this fix copied the index with `copyfile`, which
+stamps the copy "now". Git re-reads a file whose stat matches its entry
+only when the entry is as new as the INDEX FILE, so the fresh copy made
+every entry look settled and a same-size edit in that window was trusted
+from the stat cache: 3 of 25 runs named stale content, which is a stamp
+accepted for a tree the tier never saw. `copy2` keeps the mtime (0 of 25),
+and `test_a_racily_clean_edit_is_read_not_trusted_from_the_stat_cache`
+fails 6 of 6 against the `copyfile` draft.
+
+### Added - a checker's own output, mapped to the symbol it names (`import-trace --diagnostics`)
+
+The index has always known where every symbol begins and ends and has
+never seen a compiler error. An agent asking "is the function I am about
+to edit already broken" ran the type checker itself, read the raw output
+and grepped for the name, or skipped the question. What exists now:
+`jcodemunch-mcp import-trace --diagnostics <file>` and
+`import_runtime_signal(source="diagnostics")` read the file a checker
+already wrote (`mypy --output json`, `pyright --outputjson`, `tsc --noEmit
+--pretty false`, `ruff check --output-format json`, or a generic JSON-Lines
+`{file, line, severity, message, code?, tool?}`), detect the format from
+the CONTENT rather than the extension, and attach each finding to the
+innermost indexed symbol containing its line: a `return 42` inside an inner
+`def` lands on the inner function, not its parent or its class. Nothing runs
+a checker; the file comes from the user's CI or pre-commit hook, so there is
+no new process and no new trust boundary. Four existing tools read the
+result and no tool was added (the catalog moratorium holds):
+`check_edit_safe` gains a `pre_existing_diagnostics` blocker that names the
+checker and rule (`mypy arg-type`) and says so in `recommended_action`;
+`get_changed_symbols` annotates each added or changed entry;
+`get_pr_risk_profile` carries a `diagnostics` block over the changed set
+that is REPORTED, NOT SCORED (`basis: reported_not_scored`), because a
+seventh weight moves every published grade and needs its own measurement;
+`get_symbol_provenance` adds a section beside `stack_frequency`. Two rules
+hold everywhere. The `diagnostics` table is a SNAPSHOT: an ingest REPLACES
+every row for the same tool, because a fixed type error must disappear or
+the table lies forever about a symbol that is now clean, which is the one
+place the `runtime_*` upsert-and-add semantics are wrong and why the table
+is not named `runtime_*`. And no data is never zero: a consumer omits its
+block when nothing was ingested and states `diagnostics_data_present:
+false`; a real zero appears only where the checker ran and found nothing.
+Every block reports `as_of` (the HEAD at ingest, `None` when it could not
+be read) and a tri-state `current` against the live HEAD. No
+`INDEX_VERSION` bump: the table is in the schema for new databases and
+created at ingest for old ones, so no user's index is invalidated for a
+table that stays empty until they use it. Fixtures are the real tools'
+output over one deliberately broken sample module
+(`tests/fixtures/diagnostics/REGENERATE.md`), not authored from their
+documentation. Building it found that
+`runtime/resolve.py` capped its path-suffix walk at eight segments, so the
+absolute paths pyright and tsc emit on Windows
+(`C:/Users/<u>/AppData/Local/Temp/...`) never resolved and every such
+finding was unmapped; `resolve.suffix_candidates` is the one walk now,
+bounded by the path itself, and the fix reaches the OTel, stack-log and SCIP
+ingests that share `resolve_to_symbol_id`, and the ingest's own "is this
+file indexed" question, which had grown a second copy of the cap. The
+`import_runtime_signal` description and `source` enum changed and it gains
+an optional `format` argument; `benchmarks/schema_baseline.json` moved
+`full_full` 23682 -> 23848 tokens (the tool is in neither `core` nor the
+Counter, so `core_compact` and the byte-pinned front door did not move).
+PRD: `docs/prd-compiler-diagnostics.md`. Provenance: trace-mcp shipped a
+`get_diagnostics` tool on 2026-09-09 that RUNS the checkers inside its
+server; the shape here is the one this project's read-only charter allows.
+
+### Fixed - `classify_intent`'s docstring named a fallback it never ran (#669)
+
+`counter.classify_intent` documented a catalog-search fallback. Its body runs
+the 35-rule regex loop and nothing else; the lexical fallback lives one level up
+in `_handle_route`. Nothing behaved wrongly -- the description did, which is the
+harder kind to notice, because a reader has no reason to check it.
+
+## [1.108.318] - 2026-09-11 - the process is code that cannot skip a step, and the field is measured from result files
+
+Three layers ship in this block, every one off by default where it can act: the workflows layer (seven Claude Code commands and the hooks that refuse a commit without the fast tier, a PR without a full-tier run on the tree it describes, and every irreversible verb), the inbound layer (nine headless jobs that draft and never post, the model never holding a token that can write) and the competitive tier (the null alternatives, jCodeMunch and nine competitors over pinned corpora in a sandbox, every recorded number written by a script from a result file). Beside them: the usage-site question reaches the tool that answers it (CF-63), a failed embedding batch names its cause (CF-66), the watcher's startup and its deletion reconciliation (#641, #629, @marcelruhf), a notice for installs on tree-sitter-language-pack 1.x (#608, @kecsap), the CodeQL triage's fixes (#628) and an sdist without `.github/`.
+
+### Added - an install on tree-sitter-language-pack 1.x says so, and says what it costs (#608, @kecsap)
+
+The dependency is pinned `<1.0.0` and @kecsap asked for a way to opt into 1.x
+without a fork. An extra cannot do it (an extra adds a requirement, it cannot
+loosen one), but the override already worked and nothing checked it: `pip
+install -U tree-sitter-language-pack`, and the server ran on a pack that
+bundles no grammars and fetches each one over the network into a cache
+directory at first parse, with the extractor's `except Exception: return []`
+turning every grammar it could not load into a file "indexed for text search
+only". No warning anywhere, so an airgapped install on 1.x parsed nothing and
+said nothing, and a user who took the override was left to find the gap
+themselves. What exists now: `parser/grammar_pack.py` derives the pack's
+GENERATION from its version (bundled 0.x, download 1.x, absent) and wraps the
+pack's `get_parser` so a load failure is recorded per grammar, once, before it
+re-raises; the extractor's forty-odd loader sites and `search_ast` all import
+the wrapper (the first draft wired four sites by hand and the review found nim,
+the one language that matters, among the unwired), and a test fails on a bare
+import of the pack's loader anywhere else under `src/`;
+every `index_folder` result on a download or absent pack carries a
+`grammar_pack` block and a warning naming the version, the cache directory and
+each language whose grammar failed; the capability certificate carries
+`grammar_source`; `install-status` prints a `Grammar pack` section. On a 0.x
+pack a result is byte-identical to before. The override and its costs are in
+README under Security and in SECURITY.md's enumeration, before it ships, which
+is the standing rule for a network behaviour a user can opt into. Measured
+against 1.17.0 on 2026-09-11 (the probe is in the PR): 68 grammars fetched in
+16.3 s, no offline switch in the pack's config, `test_nim_parsing` failing as
+#382 recorded it failing on 1.13.3. And a correction to #382's record, found only by exercising the
+new notice on the live pack: `autohotkey`, `ejs` and `verse` are absent from
+the 1.x manifest, but all three are parsed by our own regex extractors and never
+ask tree-sitter for a grammar, so "bumping drops three languages" was a fact
+about the manifest, not about this parser. nim is the one registered language
+1.x loses; the pin's comment in `pyproject.toml` says so now. The pin itself is
+unchanged: dropping it needs the offline story first, which the issue rules out
+of scope.
+
+### Fixed - the question "where is this name used" reaches `check_references` on every surface that steers it, and `find_references` says what it is (FINDINGS CF-51, CF-63)
+
+Our own competitive adapter scored 0 on every reference-finding task of
+the tier's third-party corpora, and it did nothing wrong by the product's
+lights: it asked `find_references` where a name is used, which is what the
+tool's name says, what its description implied, and what the CLAUDE.md
+policy block `jcodemunch-mcp init` writes, the installed skill, the
+PreToolUse steering hook and the Counter's `route` rule all told it to do.
+`find_references` walks the IMPORT graph; a call site is invisible to it,
+and a single-file library has no importers of `map`, so the answer was
+`reference_count 0` with a tip pointing at the tool that would have
+answered. A user reaching for the same tool for the same question got the
+same 0, and the seven surfaces that had sent them there are the defect.
+Names are unchanged (a rename is a wire change with every client's
+transcript behind it). `find_references`' description now leads with who
+imports and hands the usage question to `check_references` or
+`search_text` in the same breath; `check_references` leads with where an
+identifier is used; the policy block, the skill, the steering hook and the
+route rule pair the usage question with `check_references`, and `route`
+gains a who-imports rule so `find_references` stays reachable by the
+question it does answer. What is impossible now: a product surface that
+pairs "used" with `find_references` alone, by any spelling, since the new
+test scans `src/` for the pattern beside the per-surface assertions; the
+scan found the seventh surface (`cli/skills.py`) the spec had listed six
+for. `find_references` is a core-tier tool under the `core_compact`
+ceiling, so its description shrank rather than grew (99 to 97 cl100k
+tokens, `evidence/tokens.txt`); `check_references` is standard-tier.
+`schema_baseline.json` is regenerated, and most of its movement predates
+this change: re-capturing `origin/main`'s own tree on the same box gave
+`core_compact` 3972 against the committed 3885, so the committed baseline
+had been stale within the `schema.drift_tolerance` Floor, and this change is the
+3972 to 3967 of it. The route-recall artifact moved with the rule
+(`route@1` 71.2 to 72.9 on the human corpus; the holdout corpus that
+carries the `route.control_at1` Floor names neither tool and did not move).
+
 ### Fixed - a failed embedding batch names its cause in the response, at both loops that had been swallowing it (FINDINGS CF-66)
 
 A provider failure reached the caller as `symbols_skipped_error: N` and
@@ -30,18 +631,76 @@ the cause half did, twice. What is not changed: each loop still tries every
 batch after a shared failure, which the `batches` count now makes visible
 instead of hiding.
 
-### Fixed - watch mode bounds native registration on symlink-heavy workspaces
+### Fixed - the watcher's startup cost is one recursive registration where the platform gives one, and a moved subtree, a renamed root and an edit under `.github/` all reach the index (#641, @marcelruhf)
 
-`watch` now registers the real, non-skipped directory tree non-recursively
-instead of asking `watchfiles` to traverse directory symlinks before filters
-run. Directory topology changes re-arm the bounded watch set. A child deleted
-or renamed during registration triggers a retry only if the root remains and
-a fresh directory census differs from the failed watch set; missing roots,
-unchanged watch sets, and other errors still propagate. Failed streams close
-before replacements open. Initial registration and each successful re-arm
-request a full incremental reconciliation to cover edits during registration;
-ordinary file edits retain the changed-path fast path. `watch_follow_symlinks`
-still applies to symlinked files -- directory symlinks are not traversed.
+What was wrong: #629 stopped `awatch(recursive=True)` from following a
+workspace's directory-symlink graph (a symlink-heavy tree had grown the
+watcher past 30 GB) by enumerating the real directory tree and registering
+every directory itself, and that made startup cost proportional to the
+directory count on EVERY platform, when only Linux and the polling backend
+needed it: macOS and Windows native watching takes one recursive
+registration and does not walk links the way notify on Linux does. Three
+smaller defects sat beside it. A subtree moved outside the root left its
+descendants indexed, because a native recursive backend reports the
+directory event alone and nothing mapped that to the files under it. A root
+renamed and replaced on Windows kept the watch on the old inode, so the
+replacement was never watched. And an edit under an indexed dot-directory
+such as `.github/` was discarded by a second hidden-path filter in the
+watcher, after discovery had already admitted the file: two authorities for
+one rule, the shape the Standing lessons name. @marcelruhf found all four,
+measured the startup cost on a large directory tree, and fixed them.
+What the fix does: `_safe_awatch` selects the backend (recursive on
+macOS/Windows native, per-directory on Linux and under polling), re-arms
+when the root's identity changes (the root only, never the tree), maps a
+moved-out directory to its indexed descendants through the hash cache (one
+lazy sort per batch, a bisect per unknown deletion, full discovery only when
+that fails), and leaves hidden-path admission to discovery. Linux/polling
+registration re-verifies the directory set before it reconciles the edits
+that arrived during registration. What is impossible now: a startup that
+pays per directory on a platform that offers recursion; a moved-out tree
+whose files stay indexed; a watcher that keeps a renamed root; a filter in
+the watcher that overrules discovery. The two watcher test files were
+reorganised in the process, and `docs/harness/ARCHAEOLOGY.md` records where
+each property went, including the one deliberately inverted (`native
+registration is always non-recursive` was #629's rule and is now false by
+design on macOS/Windows). Symlink configuration is documented in
+[CONFIGURATION.md](CONFIGURATION.md#watcher).
+
+### Fixed - an empty full incremental scan over an existing index reconciles deletions instead of refusing, says so when it removed everything, and never mistakes a read failure for an empty tree (#641, @marcelruhf)
+
+What was wrong: an incremental `index_folder` whose discovery found no
+source files returned `No source files found` and touched nothing, so a
+tree whose files had all moved out kept every stale symbol in the index
+forever, and the watcher's root reconciliation (the unattended caller of
+exactly this shape) could never clear it. Reported and fixed by
+@marcelruhf (#641). What the fix does: a full incremental scan of an
+existing index that finds no eligible file reconciles deletions, including
+the removal of every indexed file; an initial or non-incremental scan of an
+empty folder is still an error. The empty scan is refused, and the index
+preserved, when the emptiness has a cause that is not the tree: an
+unreadable file or directory (now counted as `unreadable`, named in
+`warnings`, and classified as WITHHELD coverage, so a save after it marks
+`complete: false` and absence claims are refused where those trees used to
+claim completeness over files they never read), a `file_limit` truncation
+or a `too_large` exclusion. Binary exclusions are legitimate and still allow
+the reconciliation. Our review added the disclosure: the same empty root is
+also a bare mount point, a checkout mid-switch or a restore in progress,
+and the watcher reaches it unattended, so a scan that removed every indexed
+file now carries `full_deletion: true` and a `full_deletion:` warning naming
+the count and the remedy. The deletion itself stands, deliberately: unlike
+`refresh`'s generation stamp, which cannot be repaired and therefore refuses
+an empty corpus, an index emptied by a transient root is rebuilt in full by
+the next scan over the repopulated root, and the test pins that round trip
+(`tests/test_index_folder_empty_discovery.py`). Also from the review: the
+watcher imported `watchfiles.main._default_force_polling`, a private name of
+a pinned dependency, so a rename in a watchfiles release would have failed
+the watcher at its first `_safe_awatch`; `_force_polling_default` asks
+watchfiles when the name exists and applies its documented rule itself when
+it does not, and `tests/test_watcher_polling_default.py` pins both halves
+against the installed watchfiles for every spelling of
+`WATCHFILES_FORCE_POLLING`. The contract, failure conditions and the
+recovery steps are in [SPEC.md](SPEC.md#expected-error-behaviors).
+
 ### Fixed - a `<script >` closed with a space before the bracket swallowed the markup after it (Razor and Astro)
 
 The Razor and Astro extractors cut `<script>` and `<style>` blocks out of

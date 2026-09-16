@@ -24,7 +24,13 @@ What each test pins, and why (for docs/harness/ARCHAEOLOGY.md):
 - a sandbox timeout KILLS THE CONTAINER (CF-49: subprocess's timeout kills
   the docker client only; two 8 GB containers ran at once and took the host
   down on 2026-09-06), asserted against a live container when docker is
-  present and by the named-container contract otherwise.
+  present and by the named-container contract otherwise;
+- the live-container test asks `sandbox.docker_available()` whether it can
+  run, never a copy (CF-68: a copy that only asked whether `docker info`
+  succeeds ran it on a windows-latest runner whose daemon was in
+  Windows-container mode, and it failed PR #681's gate); a daemon-free test
+  reports a Windows daemon and asserts the skip AND that the daemon was
+  asked, and a ratchet fails any test file that asks `docker info` itself.
 """
 
 from __future__ import annotations
@@ -274,17 +280,6 @@ def test_tools_not_called_names_only_the_silent_tool():
 
 # --- the sandbox's timeout -----------------------------------------------
 
-def _docker_available() -> bool:
-    import shutil
-    import subprocess
-    if not shutil.which("docker"):
-        return False
-    try:
-        return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
-    except Exception:
-        return False
-
-
 def test_sandbox_timeout_kills_the_container(tmp_path):
     """Non-vacuity: a container told to sleep past the timeout is GONE after
     run() returns. Before the fix `docker ps` still listed it."""
@@ -292,7 +287,10 @@ def test_sandbox_timeout_kills_the_container(tmp_path):
 
     import sandbox
 
-    if not _docker_available():
+    # ⚠ Ask the sandbox, never a copy: its check requires a LINUX daemon, and
+    # a copy that only asked whether `docker info` succeeds ran this on a
+    # windows-latest runner in Windows-container mode (PR #681's gate).
+    if not sandbox.docker_available():
         pytest.skip("docker is not available here (the gate's ubuntu legs have a daemon and run this; windows legs and a box with Docker Desktop stopped skip it)")
     (tmp_path / "c").mkdir()
     before = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, encoding="utf-8").stdout.split())
@@ -300,6 +298,55 @@ def test_sandbox_timeout_kills_the_container(tmp_path):
     assert res.timed_out and res.rc == 124
     after = set(subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, encoding="utf-8").stdout.split())
     assert after - before == set(), "the timed-out container is still running"
+
+
+def test_a_windows_container_daemon_skips_the_daemon_test(monkeypatch, tmp_path):
+    """PR #681's gate: a windows-latest runner had a daemon in Windows-container
+    mode, `docker info` succeeded, and the daemon test ran and failed with
+    "read-only mode is not supported for Windows containers". The sandbox
+    cannot run there, so the test must skip, by asking the sandbox's own
+    `docker_available()` rather than a copy of it."""
+    import subprocess
+
+    import sandbox
+
+    asked = []
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["docker", "info"]:
+            asked.append(cmd)
+            out = "windows\n" if "--format" in cmd else "Server: OSType windows\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        raise AssertionError(f"the sandbox ran on a Windows-container daemon: {cmd}")
+
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: "C:/docker/docker.exe")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(pytest.skip.Exception):
+        test_sandbox_timeout_kills_the_container(tmp_path)
+    # the skip came from ASKING the daemon, not from a gate that says no to everything
+    assert asked, "the gate skipped without asking the daemon"
+
+
+def test_no_test_rederives_docker_availability():
+    """The authority is `sandbox.docker_available()` (it requires OSType linux,
+    the one property the sandbox needs). A test that asks `docker info` itself
+    is a second copy, and the first copy here was the narrower one."""
+    # Every spelling of the question, not only the one the first copy used:
+    # a list or tuple naming docker (or `shutil.which("docker")`) then
+    # "info", and one shell string holding both words. A fake that COMPARES
+    # (`cmd[:2] == ["docker", "info"]`) is not a question and is removed first.
+    docker = r"""(?:["']docker(?:\.exe)?["']|(?:[\w.]+\.)?which\(\s*["']docker["']\s*\))"""
+    asks = [
+        re.compile(r"[\[(]\s*" + docker + r"""\s*,\s*["']info["']"""),
+        re.compile(r"""["']docker(?:\.exe)?\s+info\b"""),
+    ]
+    compares = re.compile(r"""==\s*\[\s*["']docker["']\s*,\s*["']info["']\s*\]""")
+    offenders = []
+    for p in sorted((REPO / "tests").rglob("*.py")):
+        text = compares.sub("", p.read_text(encoding="utf-8"))
+        if any(rx.search(text) for rx in asks):
+            offenders.append(str(p.relative_to(REPO)))
+    assert offenders == [], offenders
 
 
 def test_sandbox_names_the_container_and_kills_it_on_timeout(monkeypatch, tmp_path):

@@ -26,7 +26,7 @@ the order written; the first that matches wins.
 
 | # | category | decision rule |
 |---|---|---|
-| 1 | **security** | The title, body, any comment, any attached file name, or any linked diff mentions a vulnerability, exploit, CVE, credential, token, secret, key material, path escape, traversal, arbitrary write, cross-repository access, data exposure, or redaction failure, in any language including inside a code block or an HTML comment. This rule fires on ONE finding inside a multi-finding report and classifies the WHOLE item security. It fires regardless of who filed it, including the maintainer. AUDIT §1.2: #509, #508, #447, #444 are the record. |
+| 1 | **security** | The title, body, any comment, any attached file name, or any linked diff mentions a vulnerability, exploit, CVE, path escape, traversal, arbitrary write, cross-repository access, data exposure, or redaction failure, or EXPOSES a credential, in any language including inside a code block or an HTML comment. A credential is exposed when a token, key or password VALUE appears in the item, or when the item says a credential was leaked, logged, printed, committed, shipped, returned or otherwise made readable; naming a credential is not exposing one (owner ruling 2026-09-13: "mentioning credentials is fine; exposing them is not"; the word list this replaced labelled 75 of 321 issues, #670 among them). This rule fires on ONE finding inside a multi-finding report and classifies the WHOLE item security. It fires regardless of who filed it, including the maintainer. AUDIT §1.2: #509, #508, #447, #444 are the record. |
 | 2 | **dependency update** | A pull request whose author is `dependabot[bot]` (`app/dependabot` in the API) AND which carries the `dependencies` label AND whose diff touches only `uv.lock`, `pyproject.toml` dependency tables, or `.github/workflows/*.yml` `uses:` lines. Any other file in the diff makes it **unknown**. Sub-type: **grammar or parser** if the diff moves `tree-sitter`, `tree-sitter-language-pack`, or any package whose name starts `tree-sitter`; else **major** if any bumped package crosses a major version; else **patch or minor**. A human PR that bumps a dependency is a human PR and is not in this file's scope. |
 | 3 | **duplicate** | An open or closed issue exists whose title or body describes the same tool, the same input shape, and the same wrong output, and the candidate is not the item itself. The agent must quote the matching sentences from both. A match on title words alone is not a duplicate. |
 | 4 | **spam or off-topic** | No reference to this product, its tools, its CLI, its docs, or its repository, OR the body is a listing, advertisement, or link exchange (#481), OR the body is only a pasted output of another tool with no claim about this product. |
@@ -328,6 +328,29 @@ integration`, no `permissions:` scope covers repository variables, and
 `true` two minutes after the flip to `false`). The first draft read with
 `GITHUB_TOKEN` in every job, so no job could ever read `true`, and the
 reader hid the 403 as `value: null`; the reason is in the verdict now.
+
+**Amended 2026-09-14 by the owner: a second switch for the part that
+bills.** Four jobs run the model (`inbound-triage`, the digest's
+paragraph, `inbound-fix`, `inbound-depeval`). Two of them, triage and the
+digest's paragraph, spent $22.14 of the owner's Anthropic API balance
+between 2026-09-07 and 2026-09-12 without the owner seeing it: no audit
+record carries a cost (inbound FINDINGS IN-23), and the section 7 ceiling
+counts runs. Every gate job in front of a model job now also reads the
+repository variable `INBOUND_MODEL_ENABLED`, with the same token, the same
+exact-`true` rule and the same fail-closed reading of absent. A model job
+starts only when both switches read `true`. `INBOUND_ENABLED` alone runs
+the jobs that hold no model: intake labels, the sweep, and the digest's
+numbers and posting. The digest posts without its paragraph when the model
+switch is off. fix-promote and bench-full are not gated by the model switch
+but have nothing to act on without it: they start only from a branch or a
+label a model job produces. Dependency evaluation's model-free `depkind`
+labelling shares the gated job and stops with it. The model switch is read
+at the gate only; the layer switch is still re-read before every write. The owner's ruling is that the
+model switch stays off and issues are triaged by hand in a session;
+setting it is the owner's decision, never a job's.
+`tests/test_inbound_workflows.py::test_every_model_job_starts_only_from_the_model_switch`
+fails a model job whose gate does not feed that read into the output it
+starts from.
 
 Who may flip it: anyone with admin on the repository, through Settings or
 `gh variable set INBOUND_ENABLED --body false`. It is never set by a job.

@@ -489,8 +489,10 @@ _INTENT_RULES: list[tuple[re.Pattern, str, str]] = [
 
     (re.compile(r"\b(who )?calls?\b|\bcallers?\b|\bcall(ed)? by\b|\bcall (graph|hierarchy)\b", re.I),
      "get_call_hierarchy", "Trace callers/callees of a symbol."),
-    (re.compile(r"\bused? (by|where)\b|\breferences?\b|\bwhere is .* used\b", re.I),
-     "find_references", "Find where an identifier is referenced."),
+    (re.compile(r"\bused? (by|where)\b|\breferences?\b|\bwhere is .* used\b|\bis used\b", re.I),
+     "check_references", "Where an identifier is used: import sites plus every content match."),
+    (re.compile(r"\b(who|which files?) imports?\b|\bimported (by|where|or)\b|\bimporters? of\b|\bre-?exported\b", re.I),
+     "find_references", "Who imports an identifier, via the import graph."),
     (re.compile(r"\b(blast|impact|break|breaks?|affect|ripple|what changes)\b", re.I),
      "get_blast_radius", "Show what a change to a symbol would affect."),
     (re.compile(r"\bdead code\b|\bunused\b|\bunreachable\b", re.I),
@@ -589,11 +591,17 @@ _QUERY_ARG: dict[str, str] = {
 
 
 def classify_intent(task: str, catalog_names: Iterable[str]) -> list[dict]:
-    """Return ranked recommended actions for a task.
+    """Return recommended actions for a task from the curated intent rules ONLY.
 
-    Combines the curated intent rules (high precision) with a catalog-search
-    fallback (high recall), de-duplicated, primary first. Each row is
-    ``{"action", "why"}``. Only actions present in the live catalog survive.
+    Walks ``_INTENT_RULES`` in declaration order (which is load-bearing -- see
+    its block comments) and appends one ``{"action", "why"}`` row per matching
+    rule, de-duplicated by action. Only actions present in the live catalog
+    survive. Returns an empty list when no rule matches.
+
+    ⚠ **The catalog-search fallback is NOT here.** ``_handle_route`` in
+    ``server.py`` calls ``search_catalog`` itself, and only when this function
+    returns nothing -- which is why an action a rule preempted was never
+    scored at all (the ``rule_preempted`` miss class named above).
     """
     names = set(catalog_names)
     out: list[dict] = []

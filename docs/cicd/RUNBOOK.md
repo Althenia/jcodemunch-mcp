@@ -65,9 +65,10 @@ then the post-publish smoke from PyPI in a fresh venv
 (`scripts\handshake.py --expect-version X.Y.Z --command <venv>\Scripts\jcodemunch-mcp.exe --fixture testsixtures\pkg_smoke`),
 `gh release create vX.Y.Z dist-ci\* --title ... --notes-file ...` with the
 notes rendered from the CHANGELOG block, and the registry line from
-CLAUDE.md. Re-try the publisher registration on PyPI before each release;
-when it finally lists one, this section is deleted and `~/.pypirc` is
-revoked (§5).
+CLAUDE.md. The publisher is listed on PyPI since 2026-09-11 (FINDINGS C-15);
+the next dispatched run is the proof; if it is refused again, re-enter
+the form before each release. When `release: pypi` passes once, this
+section is deleted and `~/.pypirc` is revoked (§5).
 
 ## 2. Read a failed check
 
@@ -161,7 +162,9 @@ users need (policy 2), and the gate cannot be repaired in the same PR:
 
 ## 7. Weekly results PR and regression issues
 
-- Mondays, `main.yml` opens `harness: weekly bench result (<date>)`. Merge
+- Mondays, `main.yml` opens `harness: weekly bench result (<date>)`, once per
+  date: while an open or merged PR for the date exists, a later Monday push,
+  including this PR's own merge, opens nothing (C-18). Merge
   it when green; it is labeled `no-changelog` on purpose. ⚠ It needs two
   repository settings that were both missing on its first firing (FINDINGS
   C-17, 2026-09-07): the inbound ruleset must exclude `refs/heads/harness-bot/**`
@@ -171,9 +174,11 @@ users need (policy 2), and the gate cannot be repaired in the same PR:
   repository: `github-actions[bot]` must be on the CLA allowlist at
   cla-assistant.io (section 9's setup step names both the App and the bot;
   until 2026-09-07 it named the App alone), or the bot's own PR carries
-  `license/cla: not signed` and cannot merge (#635, #636). If the job fails after the
-  push, open the PR by hand from the branch it pushed with the job's title and
-  body; a second dispatch the same day is rejected as a non-fast-forward.
+  `license/cla: not signed` and cannot merge (#635, #636). If the job finds the
+  branch with no open or merged PR, it exits green with a `::warning::`
+  annotation: open the PR by hand from that branch with the job's title and
+  body, or delete the branch and dispatch. A CLOSED PR for the date does not
+  block a dispatch; an OPEN or MERGED one does (C-18).
   ⚠ A workflow that commits or tags with `GITHUB_TOKEN` does so as
   `github-actions[bot]` (`41898282+github-actions[bot]@users.noreply.github.com`);
   one that pushes with the App token uses the App's own numeric address
@@ -219,6 +224,19 @@ gh variable set INBOUND_ENABLED --body false
 Every job reads it at its first step and again before its first write, so
 a flip stops the layer within one step. Deleting `ANTHROPIC_API_KEY` is
 the coarse stop and is not reversible without the key.
+
+**The model switch (since 2026-09-14).** `INBOUND_MODEL_ENABLED` gates
+the jobs that call the model and bill the API account: triage, the
+digest's paragraph, fix and depeval. Absent is off, and it is off by the
+owner's ruling (POLICY section 8); issues are triaged by hand with
+`/triage-issue`. With `INBOUND_ENABLED=true` and this variable unset,
+intake labels, the sweep and the digest's numbers still run, at no model
+cost.
+
+```
+gh variable set INBOUND_MODEL_ENABLED --body true
+gh variable delete INBOUND_MODEL_ENABLED
+```
 
 **Approve a drafted reply.** Triage and dependency evaluation never post
 prose. A draft is a file under `drafts/` on the `inbound-ledger` branch

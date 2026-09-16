@@ -53,12 +53,12 @@ Measured with `tiktoken cl100k_base` across three public repos pinned to upstrea
 
 | Repository | Files | Symbols | Grep-top-3 baseline | jCodeMunch | vs grep | vs read-all |
 |------------|------:|--------:|--------------------:|-----------:|--------:|------------:|
-| expressjs/express | 186 | 455 | 15,724 avg | 1,017 avg | **15.5x** | 152.0x |
-| fastapi/fastapi | 1,186 | 13,240 | 85,296 avg | 2,218 avg | **38.4x** | 372.0x |
-| gin-gonic/gin | 98 | 1,451 | 31,975 avg | 1,573 avg | **20.3x** | 96.5x |
+| expressjs/express | 186 | 455 | 15,724 avg | 1,007 avg | **15.6x** | 153.5x |
+| fastapi/fastapi | 1,186 | 13,240 | 85,296 avg | 2,149 avg | **39.7x** | 384.1x |
+| gin-gonic/gin | 98 | 1,451 | 31,975 avg | 1,537 avg | **20.8x** | 98.8x |
 | **Grand total (15 task-runs)** | | | **664,975** | **23,467** | **28.3x** | 241.1x |
 
-**Against a grep-and-read agent: 96.5% reduction, 28.3x fewer tokens.** Per-query results range from 7.6x to 81.2x (median 26.1x); no single multiple describes every query. Against read-all the figure is 99.6%, but nobody pays that ceiling. Compact [MUNCH](SPEC_MUNCH.md) wire encoding then trims a median 45.5% more bytes off responses.
+**Against a grep-and-read agent: 96.5% reduction, 28.3x fewer tokens.** No single multiple describes every query; the per-repo rows above are the spread. Against read-all the figure is 99.6%, but nobody pays that ceiling. Compact [MUNCH](SPEC_MUNCH.md) wire encoding then trims a median 45.5% more bytes off responses.
 
 Full methodology, pinned commits, harness, and known caveats: [benchmarks/METHODOLOGY.md](benchmarks/METHODOLOGY.md) · [Reproduce it yourself](benchmarks/REPRODUCING.md) · [TOKEN_SAVINGS.md](TOKEN_SAVINGS.md)
 
@@ -148,8 +148,8 @@ Want to skip initial indexing for popular frameworks? Pre-built **starter packs*
 
 - **Retrieve one symbol instead of loading a file.** `get_symbol_source` returns the exact function body, byte-precise, for the majority of edits that touch one function in a 700-line file (~95% savings on that read).
 - **Assemble a whole task's context in one call.** `assemble_task_context` classifies the task intent, extracts anchor symbols, and runs the right tool sequence under one token budget. `plan_turn` routes the turn before the first read.
-- **Ask structural questions grep can't answer.** `find_importers`, `get_blast_radius`, `get_call_hierarchy`, `find_dead_code`, `get_changed_symbols`, `get_hotspots`, `search_ast` anti-pattern sweeps, and more.
-- **Preflight risky changes, and know when to stop.** `check_edit_safe`, `check_delete_safe`, `get_pr_risk_profile`, and `plan_refactoring` with edit-ready `{old_text, new_text}` blocks. The two safety checks return `stop_rule.terminal`: true means no further jcodemunch call moves the verdict, so re-running `find_importers` or `check_references` to be sure is wasted work. It means final, not safe. False names the specific thing that would change the answer.
+- **Ask structural questions grep can't answer.** `find_importers`, `get_blast_radius`, `get_call_hierarchy`, `find_dead_code`, `get_changed_symbols`, `get_hotspots`, `search_ast` anti-pattern sweeps, and more. Two of them sound alike and are not: `check_references` answers where a name is used (import sites plus every file whose content mentions it), `find_references` answers who imports it, over the import graph alone, so a call site is invisible to it.
+- **Preflight risky changes, and know when to stop.** `check_edit_safe`, `check_delete_safe`, `get_pr_risk_profile`, and `plan_refactoring` with edit-ready `{old_text, new_text}` blocks. The two safety checks return `stop_rule.terminal`: true means no further jcodemunch call moves the verdict, so re-running `find_importers` or `check_references` to be sure is wasted work. It means final, not safe. Hand the server your type checker's own output (`jcodemunch-mcp import-trace --diagnostics <file>`: `mypy --output json`, `pyright --outputjson`, `tsc --pretty false`, `ruff --output-format json`) and `check_edit_safe`, `get_changed_symbols`, `get_pr_risk_profile` and `get_symbol_provenance` say which symbols the checker already flags, as of which commit. Nothing runs a checker for you. False names the specific thing that would change the answer.
 - **Trust the answers.** Calibrated confidence scores, freshness flags, coverage contracts on absence claims, compiler-verified references via SCIP import, and automatic secret redaction before anything reaches the LLM.
 - **Keep the index fresh automatically.** Watch modes, agent hooks, and a VS Code extension close the staleness gap.
 
@@ -158,9 +158,9 @@ That's the highlight reel. The complete tour of 90+ tools, the MUNCH compact wir
 <!-- WHATSNEW:START -->
 #### What's new
 
+- **[v1.108.318](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.318)** (2026-09-11) — the process is code that cannot skip a step, and the field is measured from result files
+- **[v1.108.317](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.317)** (2026-09-04) — CI runs the harness on every change; publishing is a dispatched workflow
 - **[v1.108.316](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.316)** (2026-09-02) — A display preference edited the data it was displaying
-- **[v1.108.315](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.315)** (2026-09-01) — A fix for a false positive can install a false negative
-- **[v1.108.314](https://github.com/jgravelle/jcodemunch-mcp/releases/tag/v1.108.314)** (2026-09-01) — A rate written for a future date is wrong for every day before it
 <!-- WHATSNEW:END -->
 
 ---
@@ -223,6 +223,8 @@ Deferred definitions are excluded from the system-prompt prefix and appended inl
 ## Security, privacy, and background behavior
 
 Local-first by design: indexes live at `~/.code-index/`, and the base package's only default network behavior is an anonymous savings counter (random ID plus aggregate token counts, no code, no paths, no PII; opt out with `share_savings: false`). Everything the server does beyond answering a tool call (file watching, the opt-in login service, license validation, model downloads, org reporting) is opt-in or opt-out, visible, and reversible, and every item is enumerated in **[SECURITY.md](SECURITY.md#background-behavior-fully-disclosed)** alongside the path-traversal, symlink, and secret-redaction controls.
+
+**Grammar pack override (#608).** The dependency `tree-sitter-language-pack` is pinned `<1.0.0` because the 0.x wheels bundle every grammar and parsing stays local. You can override it with `pip install -U tree-sitter-language-pack` after installing; nothing in the code refuses it. What you accept, measured against 1.17.0 on 2026-09-11: the 1.x pack ships no grammars and fetches each one over the network into its cache directory (measured on Windows: `%LOCALAPPDATA%\tree-sitter-language-pack\v<version>\libs`; `jcodemunch-mcp install-status` prints the path on any platform) the first time a language is parsed, so an airgapped install parses nothing, and the `nim` grammar changed upstream, so nim files yield no symbols (the manifest also lacks `autohotkey`, `ejs` and `verse`, which costs nothing here: those three are parsed by jCodeMunch's own extractors, not by tree-sitter). An install on a 1.x pack says so: every `index_folder` result carries a `grammar_pack` block and a warning naming the version, the cache directory and each language whose grammar failed, and `jcodemunch-mcp install-status` prints the same. Dropping the pin is a separate decision that needs the offline story first.
 
 ---
 
