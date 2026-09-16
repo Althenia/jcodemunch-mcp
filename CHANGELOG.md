@@ -2,6 +2,101 @@
 
 ## [Unreleased]
 
+### Fixed - an exact-name match is no longer evicted from the result page by a same-named local (#699)
+
+`search_symbols` cuts to `max_results` with a bounded heap keyed on BM25 alone,
+so eviction could not tell an exact-name match from a lexical near-miss, or a
+real definition from a local that happens to share the name. Where a name has
+more exact matches than the cap, ranking alone decided which survived — and the
+ones that lost did not appear at a lower rank, they did not appear at all.
+
+Two reproductions, and they do not share a discriminator. On zod, `partial`
+returns ranks 1-4 as real definitions and ranks 5-10 as six `constant` rows in
+test files, pushing `v4/mini/schemas.ts::partial` out; kind separates that one.
+On this repository, `run` returns ten rows that are all `#function`, every one a
+helper nested inside a test function, while `tools/refresh.py::run` and
+`watcher.py::WatcherManager.run` are absent; kind separates nothing there.
+
+The property both share is neither kind nor path: a crowder is declared inside a
+function body and is a local by construction, while a real answer is
+module-level or owned by a type. A path rule would have demoted a genuine
+`ZodObject.partial` declared in a fixture, and a nesting-depth rule would have
+demoted it too. The heap key is now `(declaration rank, score)`, and the final
+sort reads the same key — a row that survives the cut under one rule and is then
+ordered under another ranks below rows it outranked to get there. Locals are
+demoted, never filtered: they remain legitimate answers to "where is this name".
+
+⚠⚠ **The rank has two conditions and each alone leaves half the defect live.**
+A declaring KIND separates zod's case: its crowders are `const partial = ...`
+rows that the TypeScript extractor records with no owner path, so the index sees
+module-level constants and an owner probe scores them exactly like a real method.
+A function-OWNER probe separates this repository's case: `run`'s crowders are
+helpers nested in test functions, all of kind `function`, so kind separates
+nothing. A first draft shipped with the owner probe alone, passed its own tests,
+and left the reported case byte-for-byte unchanged — the fixture had no
+module-level-constant shape in it. Both conditions ship, and both shapes are in
+the fixture now.
+
+⚠ The owner is probed **positively** for being a function, and an owner that
+cannot be resolved is not demoted. Asking the opposite — is the owner a class or
+struct? — reads a failed lookup as proof of a function body, and a Rust `impl`
+block puts the type in another file, so a real method would have been demoted
+below a same-named local in exactly the languages this was not measured against
+(C++ `.cpp`/`.h`, C# partial classes, Swift extensions and Ruby reopened classes
+are the same shape). UNKNOWN is a third bucket, never False.
+
+⚠⚠ **The tool caps its page in three places, and all three now read the same
+rule**: the lexical heap, the similarity sort behind `semantic=True`, and the
+fused sort behind `fusion=True`. Fixing only the heap would have left one tool
+answering the same query two incompatible ways depending on a flag. A source
+ratchet asserts every cut site consults the rank, so a fourth exit inherits it.
+
+Two consequences worth stating rather than discovering. `sort_by="centrality"`
+and `"combined"` now rank an exact-name match above everything else before
+PageRank is consulted; that is the point of the change, and it is a semantics
+change to two documented sort modes. And `_meta.verdict.best_score` is still the
+best score seen during the scan — unchanged — but `results[0]` is no longer
+necessarily the row carrying it, because a promoted definition can sit above a
+higher-scoring local.
+
+The cut is deliberately **not** gated on `is_identifier_query`, which the
+`_meta.exact_match` report is. That gate refuses a single lower-case word with
+no underscore, which is right for deciding whether to attach a report and wrong
+for deciding what to keep: `partial`, `pick` and `run` are all that shape, so a
+cut inheriting the gate would be unfixed for every case that reported the defect.
+
+`_meta.exact_match.exact` was the second reader of the same cut. It counted the
+rows that survived, so a query with 38 exact matches reported `exact: 9` and read
+as complete — #559's rule ("a count taken after the page is cut describes the
+page") in the one place #559's own ratchet did not reach, because its `_CASES`
+roster is a hand-kept literal of four tools. The count is taken during scoring
+now, with `exact_returned` and `exact_truncated` beside it, and `search_symbols`
+has been added to that roster so the property ratchet covers the pair.
+
+⚠ The report stays gated on `is_identifier_query` while the cut does not, so
+`exact_truncated` is attached to `get_user_id` and never to `run`. The visibility
+half therefore does not reach the four names that reported the defect; the
+correctness half does. Ungating the report is a separate judgment about noise on
+prose searches and is not made here.
+
+One older ratchet had to be restated rather than satisfied.
+`test_v1_108_228.py::test_the_semantic_sort_uses_a_total_order` pinned the
+literal string `scored.sort(key=lambda x: (-x[0], x[1]["id"]))`, and adding a
+leading rank component failed it while leaving its invariant — ties broken on the
+symbol id, so the numpy float32 and Python float64 lanes cannot disagree at rank
+0 — entirely intact. It stated the mechanism instead of the outcome (Practice 9).
+It now asserts that the key ends in the symbol id and orders score descending,
+which passes with a further component added and still fails when the id tiebreak
+is removed; that was verified by removing it.
+
+What is impossible now: a cut that silently drops the symbol a caller named, on
+any of the three exits.
+
+Found by the benchmark in
+[amritessh/scalpel-fse2027-artifact](https://github.com/amritessh/scalpel-fse2027-artifact),
+which traced it to `partial`/`pick`/`ZodType` on zod and named the mechanism —
+ranked-and-capped retrieval dropping answers an unranked exact lookup returns
+unconditionally.
 ### Fixed - TypeScript and TSX index `abstract class`, and its methods keep their owner (#698)
 
 tree-sitter-typescript gives `abstract class X` its own node type rather than a
